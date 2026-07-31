@@ -32,7 +32,7 @@ tests/                       unit, contract, integration, fixtures
 
 ## Task 1: Bootstrap project tooling
 
-**Files:** Create pyproject.toml, app/__init__.py, tests/__init__.py, .gitignore, .env.example, Dockerfile, docker-compose.yml, README.md, AGENTS.md.
+**Files:** Create pyproject.toml, app/__init__.py, app/main.py, tests/__init__.py, .gitignore, .env.example, Dockerfile, docker-compose.yml, README.md, AGENTS.md.
 
 **Depends on:** none.
 
@@ -41,7 +41,7 @@ tests/                       unit, contract, integration, fixtures
 - [ ] Define only secret names in .env.example; do not insert values.
 - [ ] Add Docker build instructions without embedding credentials or invoking a worker by default.
 - [ ] Write a failing smoke test that imports app.main; run pytest for that test and observe failure.
-- [ ] Add the minimal importable application package; rerun the smoke test and expect pass.
+- [ ] Add the minimal importable application package and an empty application factory in app/main.py; rerun the smoke test and expect pass. Task 10 extends this file rather than creating it.
 - [ ] Commit with message chore: bootstrap foundation tooling.
 
 **Acceptance:** New checkout can create an environment, run pytest, ruff check, ruff format check, and mypy without external services. **Tests:** tests/unit/test_imports.py.
@@ -66,13 +66,14 @@ tests/                       unit, contract, integration, fixtures
 
 **Depends on:** Task 2.
 
-- [ ] Write failing parameterized tests for all seven precedence layers, map recursion, default list replacement, keyed-list schema merge, explicit null, delete directive, incompatible types, and expired runtime override.
-- [ ] Define Pydantic v2 schema metadata for permitted layer fields and list merge strategies.
-- [ ] Implement ConfigurationResolver.resolve returning a validated merged payload, canonical JSON SHA-256 hash, ordered parent versions, creator, creation time, and runtime expiry.
+- [ ] Write failing parameterized tests for LayerPatchSchema versus ResolvedConfigurationSchema, all seven precedence layers, map recursion, default list replacement, keyed-list schema merge, explicit null, delete directive, incompatible types, and expired runtime override.
+- [ ] Define Pydantic v2 LayerPatchSchema models for permitted sparse layer fields and operations, plus separate ResolvedConfigurationSchema models for required executable fields and list merge strategies.
+- [ ] Implement ConfigurationResolver.resolve to validate patches, merge them, validate the final object, and return its payload, ordered parent versions, creator, creation time, runtime expiry, canonical format version, and SHA-256 hash.
+- [ ] Add canonicalization tests for Decimal scale and negative zero, UUID, enum, timezone-equivalent datetime, Unicode NFC, sorted keys, and cross-process output; assert floats, non-finite numbers, naive datetimes, and duplicate normalized keys fail.
 - [ ] Add a test that serializes a resolved snapshot, changes a lower layer, and proves the stored result remains unchanged.
 - [ ] Run configuration tests and commit feat: add versioned configuration resolution.
 
-**Acceptance:** every run can store one complete reproducible snapshot. **Tests:** non-null type conflict raises ConfigurationMergeError before any provider call.
+**Acceptance:** every run can store one complete reproducible snapshot. **Tests:** a non-null type conflict raises ConfigurationMergeError before any provider call, while final required fields are enforced only by ResolvedConfigurationSchema.
 
 ## Task 4: Repository ports and persistence projection
 
@@ -83,11 +84,11 @@ tests/                       unit, contract, integration, fixtures
 - [ ] Write contract tests that fetch by bare identifier fails without authorized AccessContext, global instruments are readable but not user-mutable, and duplicate strategy keys return one run.
 - [ ] Define Protocol methods accepting typed owner/access inputs rather than unscoped IDs.
 - [ ] Implement in-memory repositories and lock provider for M0/M1.
-- [ ] Add separate SQLAlchemy 2 tables, association tables, scope constraints, configuration snapshot columns, and strategy-run idempotency unique constraint.
+- [ ] Add separate SQLAlchemy 2 tables, association tables, scope constraints, configuration snapshot columns, logical scan-run and scan-attempt tables, final strategy-run key constraints, and a partial unique position index applying only when status is OPEN.
 - [ ] Generate an Alembic initial revision from the persistence metadata and test migration metadata against declared tables.
 - [ ] Run contract tests against in-memory adapters; commit feat: add scoped persistence foundation.
 
-**Acceptance:** no domain module imports SQLAlchemy and repository callers cannot cross tenant boundaries. **Tests:** concurrent acquisition of one key permits one winner.
+**Acceptance:** no domain module imports SQLAlchemy and repository callers cannot cross tenant boundaries. **Tests:** concurrent acquisition of one scan-lock key permits one winner and CLOSED position history remains insertable.
 
 ## Task 5: Market calendar and deterministic mock provider
 
@@ -151,13 +152,13 @@ tests/                       unit, contract, integration, fixtures
 
 **Depends on:** Tasks 3 through 8.
 
-- [ ] Write failing transition-table tests and duplicate key tests for API and scheduler callers.
+- [ ] Write failing transition-table tests for pending/notified invalidation, degraded data from every active state, partial-stage halt/recovery, and duplicate scan-lock tests for API and scheduler callers.
 - [ ] Implement a code-defined transition graph whose guards consume validated rules and sizing results.
-- [ ] Implement IdempotencyKeyBuilder from plan, normalized session date/window/interval, configuration hash, and market-data snapshot ID.
-- [ ] Implement RunCoordinator that resolves configuration once, obtains a lock, persists/reuses run evidence, blocks bad data, and does not mutate positions.
+- [ ] Implement ScanLockKeyBuilder from plan, normalized session date/window/interval, and configuration hash; after provider fetch implement StrategyRunKeyBuilder from scan lock, market-data snapshot ID, and market-data content hash.
+- [ ] Implement RunCoordinator that acquires the scan lock before I/O, records incomplete attempts, associates only one completed final run with a logical scan, blocks bad data, and does not mutate positions.
 - [ ] Run state and concurrency tests and commit feat: add idempotent rotation coordinator.
 
-**Acceptance:** one key produces one evaluation; notification does not imply execution. **Tests:** protected source is denied by rule input, sizing, and transition guard.
+**Acceptance:** one scan lock produces one completed evaluation; a changed provider snapshot on a failed retry is auditable and receives a distinct final identity; notification does not imply execution. **Tests:** protected source is denied by rule input, sizing, and transition guard.
 
 ## Task 10: Minimal FastAPI adapters
 

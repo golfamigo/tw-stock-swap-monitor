@@ -47,12 +47,12 @@ tests/                 unit, integration, contract, fixtures
 ## Execution flow
 
 1. An API dry-run or future scheduler supplies a rotation-plan identifier and a run context.
-2. The application service authorizes the caller, loads the plan through a scoped repository, resolves and validates one immutable configuration snapshot, and forms the idempotency key.
-3. LockProvider obtains the key. A duplicate key returns the prior result rather than evaluating again.
-4. MarketDataProvider returns validated mock bars and a market-data snapshot identifier. Missing, stale, or malformed data emits DATA_DEGRADED and cannot yield ACTION.
+2. The application service authorizes the caller, loads the plan through a scoped repository, and resolves one immutable configuration snapshot.
+3. Before provider access it builds a scan-lock key from the plan, normalized market session/window/interval, and configuration hash. LockProvider serializes this logical scan. A completed scan returns its recorded strategy-run outcome and does not fetch data again.
+4. The lock owner fetches validated mock bars. The provider returns a snapshot identifier and canonical market-data content hash. Together with the scan-lock key these form the final strategy-run key for the exact reproducible evaluation. Missing, stale, or malformed data emits DATA_DEGRADED and cannot yield ACTION.
 5. The indicator engine aggregates bars, computes indicators, and returns typed metrics. The rule engine evaluates validated DSL expressions and preserves evidence.
 6. The scoring engine ranks only plan-authorized candidates. The sizing engine calculates staged sale and purchase quantities using Decimal, configured costs and lot rules, then re-checks protected-position and funding invariants.
-7. The state machine records a system recommendation state. No notification, decision, or state transition changes actual positions; only a future confirmed-execution workflow may do so.
+7. The state machine records a system recommendation state. It can expire or invalidate a recommendation without changing executed holdings. No notification, decision, or state transition changes actual positions; only a future confirmed-execution workflow may do so.
 
 ## Time and numeric policy
 

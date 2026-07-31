@@ -14,7 +14,7 @@ Portfolio belongs to exactly one User. A repository is always called with an Acc
 
 ## Aggregates and value objects
 
-User owns portfolios. Portfolio owns positions and rotation plans. CandidateGroup is user-scoped and references global Instruments. RotationPlan references source positions, protected positions, candidate groups, and scoped or global profiles. StrategyRun is immutable evidence of one resolved configuration snapshot, market-data snapshot, state transition, and deterministic outputs.
+User owns portfolios. Portfolio owns positions and rotation plans. A portfolio may retain any number of CLOSED historical positions for the same instrument, while at most one OPEN position representation exists for that portfolio/instrument pair. CandidateGroup is user-scoped and references global Instruments. RotationPlan references source positions, protected positions, candidate groups, and scoped or global profiles. StrategyRun is immutable evidence of one resolved configuration snapshot, market-data snapshot, state transition, and deterministic outputs.
 
 Important value objects are InstrumentRef, Money, Quantity, Percentage, MarketSession, ConfigurationSnapshotRef, IdempotencyKey, AccessContext, and PriceZone. Money and Quantity use Decimal; MarketSession requires a timezone-aware open and close. Positions use a role enum: ROTATION_SOURCE, PROTECTED_CORE, NORMAL, or CASH_PROXY.
 

@@ -20,12 +20,14 @@ Fixtures use a fixed IANA timezone, a fixed trading date, a fixed session calend
 4. Scoring produces stable ranking and refuses missing/invalid factor data.
 5. Three configured stages, fees, slippage, lot constraints, reserve, and allocation weights produce valid actual quantities with Decimal.
 6. No sizing or state path may sell a protected position.
-7. Seven-level configuration precedence, recursive maps, replacement lists, explicit null, delete directive, conflicts, and expired runtime overrides have explicit expected outcomes.
+7. LayerPatchSchema and ResolvedConfigurationSchema are tested independently: seven-level precedence, recursive maps, replacement lists, explicit null, delete directive, conflicts, unauthorized patch fields, and expired runtime overrides have explicit expected outcomes.
 8. DSL rejects unknown operators, unknown paths, excessive depth/nodes, invalid types, and missing data without silently coercing.
-9. A duplicate run key and concurrent API/scheduler request yield one strategy outcome, no duplicate LLM intent, and no duplicate notification intent.
+9. A duplicate scan-lock key and concurrent API/scheduler request yield one provider fetch, one completed strategy outcome, no duplicate LLM intent, and no duplicate notification intent. Provider retry with a changed snapshot creates an auditable incomplete attempt and one distinct final strategy-run key.
 10. Cross-tenant access fails closed; global instruments remain shareable but immutable to regular users.
 11. Missing or stale market fields move to DATA_DEGRADED and cannot create ACTION.
 12. A notification does not change execution status or position quantity.
+13. Canonical snapshot hashing is stable across Python processes and equivalent Decimal scale, UUID, enum, timezone-equivalent datetime, and NFC Unicode inputs; naive times, floats, NaN, infinity, duplicate normalized keys, and negative-zero ambiguity are rejected or normalized as specified.
+14. ACTION_PENDING and ACTION_NOTIFIED invalidation expires a recommendation; degraded data from every active recommendation state requires a fresh evaluation; a late confirmation is recorded without reviving a stale recommendation; partial execution halts remaining stages until an explicit authorized resume.
 
 ## Quality gates
 

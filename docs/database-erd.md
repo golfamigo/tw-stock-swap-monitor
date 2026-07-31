@@ -15,6 +15,9 @@ erDiagram
   MARKETS ||--o{ TRADING_CALENDARS : uses
   CONFIGURATION_SNAPSHOTS ||--o{ STRATEGY_RUNS : frozen_for
   ROTATION_PLANS ||--o{ STRATEGY_RUNS : executes
+  ROTATION_PLANS ||--o{ SCAN_RUNS : schedules
+  SCAN_RUNS ||--o{ SCAN_ATTEMPTS : records
+  SCAN_RUNS ||--o| STRATEGY_RUNS : completes_as
   MARKET_DATA_SNAPSHOTS ||--o{ STRATEGY_RUNS : inputs
   STRATEGY_RUNS ||--o{ RULE_EVALUATIONS : produces
   STRATEGY_RUNS ||--o{ CANDIDATE_SCORES : produces
@@ -33,9 +36,11 @@ Users, portfolios, positions, candidate groups, plans, decisions, notifications,
 ## Important constraints
 
 - instruments has a unique market_id and symbol pair.
-- positions has a unique portfolio_id and instrument_id pair for an open position representation.
+- positions permits closed-position history. It has a partial unique index on portfolio_id and instrument_id only where status is OPEN, so at most one current open representation exists while any number of CLOSED historical rows remain valid.
 - rotation-plan source and protected association tables have a unique plan/position pair and reject a pair appearing in both roles.
-- strategy_runs has a unique idempotency_key.
+- scan_runs has a unique scan_lock_key and at most one completed strategy_run_id.
+- scan_attempts records each failed, degraded, or retried provider attempt for a scan run.
+- strategy_runs has a unique strategy_run_key, derived only after an exact market-data snapshot is available.
 - configuration_snapshots has a unique scope, owner, target type, target ID, and config_version tuple, and content_hash is indexed.
 - audit logs are append-only and carry actor, resource type/ID, request ID, and payload hash.
 

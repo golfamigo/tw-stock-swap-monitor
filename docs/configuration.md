@@ -8,7 +8,7 @@ Each snapshot stores:
 
 ~~~text
 config_version       monotonic version for its target resource
-content_hash         SHA-256 of canonical JSON merged_payload
+content_hash         SHA-256 of canonical format version and merged payload
 created_at           timezone-aware timestamp
 created_by           user or system principal
 parent_versions      ordered references and hashes of contributing layers
@@ -17,7 +17,13 @@ scope and owner_id   ownership of the snapshot target
 runtime_expires_at   required for a runtime override; otherwise null
 ~~~
 
-The content hash is calculated only after validation and canonical JSON serialization with deterministic key ordering. A run stores snapshot ID, content hash, parent versions, and the embedded merged payload so a decision remains reproducible after later settings change.
+The content hash is calculated only after final validation and canonical serialization. A run stores snapshot ID, content hash, parent versions, and the embedded merged payload so a decision remains reproducible after later settings change.
+
+## Schema separation
+
+Every input layer uses a LayerPatchSchema. It accepts only keys permitted at that layer; every business field is optional because a layer is intentionally sparse. Its typed patch values may express a supplied value, an explicit null for nullable fields, or a delete directive for optional inherited map fields. Unknown fields and patch operations that are unauthorized for a field fail immediately.
+
+After all patches merge, the result is parsed by a separate ResolvedConfigurationSchema. It has required final fields, final cross-field validation, and no delete directives. This is the only schema that produces a configuration snapshot. A patch can never be mistaken for an executable configuration.
 
 ## Resolution order
 
@@ -25,25 +31,39 @@ The content hash is calculated only after validation and canonical JSON serializ
 SYSTEM < MARKET < STRATEGY < USER < PORTFOLIO < ROTATION_PLAN < RUNTIME_OVERRIDE
 ~~~
 
-Every layer is parsed by the same Pydantic schema before merging and the final payload is validated again. A layer may only contribute fields it owns by schema; it cannot inject arbitrary data.
+Every LayerPatchSchema is validated before merging and the final result is validated by ResolvedConfigurationSchema. A resolver receives AccessContext and rejects a parent layer that is inaccessible to the caller.
 
 ## Deterministic merge rules
 
-1. A missing key inherits the lower-priority key.
+1. A missing patch key inherits the lower-priority key.
 2. Map plus map merges recursively.
 3. Scalar values replace lower-priority scalars.
 4. A list replaces the lower-priority list by default. A schema field may explicitly declare keyed-list merging and the unique key; only such fields merge by key.
-5. A literal null is an explicit empty value and replaces the inherited value only if the target schema permits null. It never means inherit.
-6. Deleting an inherited optional map key requires the explicit delete directive represented in the wire schema as an object containing only a delete marker. The directive is rejected for required fields and is absent from the resolved payload.
+5. A literal null is an explicit empty value and replaces the inherited value only if the final schema permits null. It never means inherit.
+6. Deleting an inherited optional map key requires the explicit typed delete directive. The directive is rejected for required fields and is absent from the resolved payload.
 7. A non-null value with a type incompatible with the inherited value is a ConfigurationMergeError. Lists never merge with maps or scalars.
-8. Runtime overrides are command-local, require a positive expiry no later than the run deadline, are never persisted as a reusable profile, and are discarded after the run. Their maximum TTL is a system safety limit.
+8. Runtime overrides are command-local LayerPatchSchema values, require a positive expiry no later than the run deadline, are never persisted as reusable profiles, and are discarded after the run. Their maximum TTL is a system safety limit.
 
 The schema documents merge behavior field by field. In particular, rules, scoring factors, stages, market sessions, and candidate memberships are lists and replace unless their declared merge strategy says otherwise. This prevents accidental combination of independently valid but incompatible strategies.
 
-## Configuration ownership
+## Canonical snapshot serialization
 
-SYSTEM templates are read-only to ordinary users. USER profiles are available only to their owner and may be referenced by that user's portfolios. PORTFOLIO overrides are visible only through their portfolio. A resolver receives AccessContext and fails closed when any parent layer is inaccessible.
+Canonicalization is versioned and runs over the validated ResolvedConfigurationSchema Python value, never untyped YAML. The payload is UTF-8 JSON with no insignificant whitespace, NFC-normalized strings and map keys, and map keys sorted by normalized UTF-8 bytes. Duplicate map keys created by NFC normalization are rejected. Lists retain declared order because list order is semantic.
 
-## Error handling
+Values normalize as follows:
 
-Invalid YAML, unknown fields, non-JSON-serializable values, expired runtime overrides, cyclic parent references, bad hash data, unavailable parent versions, and merge/type errors all fail the run before provider access. The resulting failure is an auditable non-action result, never a fallback to defaults that were not explicitly resolved.
+| Value | Canonical representation |
+| --- | --- |
+| Decimal | finite base-10 value with trailing fractional zeroes removed, no exponent, and negative zero rendered as 0 |
+| UUID | lower-case hyphenated RFC 4122 string |
+| Enum | its declared stable string value, never its Python name or representation |
+| datetime | aware value converted to UTC and formatted with exactly six fractional digits and Z suffix |
+| date | ISO-8601 calendar date |
+| integer / Boolean / null | JSON primitive; Boolean is never treated as an integer |
+| string | NFC-normalized JSON string encoded without ASCII escaping |
+
+Floats, NaN, positive/negative infinity, sets, bytes, arbitrary objects, and naive datetimes are rejected at canonicalization. Thus numerically equal Decimal values such as 1.0 and 1.00 hash identically. The hash input is UTF-8 bytes of canonical format version, one zero-byte delimiter, and canonical JSON; SHA-256 of those bytes is content_hash. A canonicalization change requires a new format version and never silently re-hashes historical snapshots.
+
+## Configuration ownership and errors
+
+SYSTEM templates are read-only to ordinary users. USER profiles are available only to their owner and may be referenced by that user's portfolios. PORTFOLIO overrides are visible only through their portfolio. Invalid YAML, unknown or unauthorized patch fields, malformed patch operations, expired runtime overrides, cyclic parent references, unavailable parents, canonicalization failures, and merge/type errors fail the run before provider access. The failure is an auditable non-action result, never a fallback to defaults that were not explicitly resolved.
