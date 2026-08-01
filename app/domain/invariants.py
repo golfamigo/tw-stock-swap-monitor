@@ -56,7 +56,7 @@ def ensure_plan_reference_is_authorized(
         return
 
     if isinstance(reference, CandidateGroup):
-        if reference.candidate_group_id != plan.candidate_group_id:
+        if reference.candidate_group_id not in plan.candidate_group_ids:
             raise PlanReferenceUnauthorizedError("candidate group is not attached to the plan")
         if reference.user_id != portfolio_owner_id:
             raise PlanReferenceUnauthorizedError("candidate group belongs to another user")

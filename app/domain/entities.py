@@ -180,19 +180,24 @@ class CandidateGroup:
 
 @dataclass(frozen=True, slots=True)
 class RotationPlan:
-    """A portfolio-scoped plan that names its candidate and position references."""
+    """A portfolio-scoped plan that names candidate groups and position references."""
 
     rotation_plan_id: UUID
     portfolio_id: UUID
-    candidate_group_id: UUID
+    candidate_group_ids: tuple[UUID, ...]
     source_position_ids: tuple[UUID, ...]
     protected_position_ids: tuple[UUID, ...]
     created_at: datetime
 
     def __post_init__(self) -> None:
         require_timezone_aware(self.created_at, field_name="created_at")
+        object.__setattr__(self, "candidate_group_ids", tuple(self.candidate_group_ids))
         object.__setattr__(self, "source_position_ids", tuple(self.source_position_ids))
         object.__setattr__(self, "protected_position_ids", tuple(self.protected_position_ids))
+        if not self.candidate_group_ids:
+            raise ValueError("candidate_group_ids must not be empty")
+        if len(set(self.candidate_group_ids)) != len(self.candidate_group_ids):
+            raise ValueError("candidate_group_ids must be unique")
         if len(set(self.source_position_ids)) != len(self.source_position_ids):
             raise ValueError("source_position_ids must be unique")
         if len(set(self.protected_position_ids)) != len(self.protected_position_ids):

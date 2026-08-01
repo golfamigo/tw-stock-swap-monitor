@@ -45,11 +45,13 @@ def position(
     )
 
 
-def plan(*, portfolio_id: UUID, group_id: UUID, source_position_id: UUID) -> RotationPlan:
+def plan(
+    *, portfolio_id: UUID, group_ids: tuple[UUID, ...], source_position_id: UUID
+) -> RotationPlan:
     return RotationPlan(
         rotation_plan_id=uuid4(),
         portfolio_id=portfolio_id,
-        candidate_group_id=group_id,
+        candidate_group_ids=group_ids,
         source_position_ids=(source_position_id,),
         protected_position_ids=(),
         created_at=aware_at(),
@@ -83,7 +85,7 @@ def test_plan_source_must_belong_to_the_plan_portfolio() -> None:
     group_id = uuid4()
     source = position(portfolio_id=uuid4(), instrument_id=uuid4())
     rotation_plan = plan(
-        portfolio_id=uuid4(), group_id=group_id, source_position_id=source.position_id
+        portfolio_id=uuid4(), group_ids=(group_id,), source_position_id=source.position_id
     )
 
     with pytest.raises(PlanReferenceUnauthorizedError):
@@ -100,7 +102,9 @@ def test_plan_candidate_group_must_be_owned_by_the_portfolio_user() -> None:
         created_at=aware_at(),
     )
     rotation_plan = plan(
-        portfolio_id=portfolio_id, group_id=group.candidate_group_id, source_position_id=uuid4()
+        portfolio_id=portfolio_id,
+        group_ids=(group.candidate_group_id,),
+        source_position_id=uuid4(),
     )
 
     with pytest.raises(PlanReferenceUnauthorizedError):
@@ -118,12 +122,49 @@ def test_candidate_instrument_must_belong_to_the_group_attached_to_the_plan() ->
         created_at=aware_at(),
     )
     rotation_plan = plan(
-        portfolio_id=portfolio_id, group_id=group.candidate_group_id, source_position_id=uuid4()
+        portfolio_id=portfolio_id,
+        group_ids=(group.candidate_group_id,),
+        source_position_id=uuid4(),
     )
 
     with pytest.raises(CandidateInstrumentUnauthorizedError):
         ensure_candidate_instrument_is_authorized(
             rotation_plan, group, InstrumentRef(uuid4()), portfolio_owner_id=owner_id
+        )
+
+
+def test_plan_authorizes_each_attached_candidate_group_and_rejects_unattached_groups() -> None:
+    portfolio_id = uuid4()
+    owner_id = uuid4()
+    first_group = CandidateGroup(
+        candidate_group_id=uuid4(),
+        user_id=owner_id,
+        instruments=(InstrumentRef(uuid4()),),
+        created_at=aware_at(),
+    )
+    second_group = CandidateGroup(
+        candidate_group_id=uuid4(),
+        user_id=owner_id,
+        instruments=(InstrumentRef(uuid4()),),
+        created_at=aware_at(),
+    )
+    unattached_group = CandidateGroup(
+        candidate_group_id=uuid4(),
+        user_id=owner_id,
+        instruments=(InstrumentRef(uuid4()),),
+        created_at=aware_at(),
+    )
+    rotation_plan = plan(
+        portfolio_id=portfolio_id,
+        group_ids=(first_group.candidate_group_id, second_group.candidate_group_id),
+        source_position_id=uuid4(),
+    )
+
+    ensure_plan_reference_is_authorized(rotation_plan, first_group, portfolio_owner_id=owner_id)
+    ensure_plan_reference_is_authorized(rotation_plan, second_group, portfolio_owner_id=owner_id)
+    with pytest.raises(PlanReferenceUnauthorizedError, match="not attached"):
+        ensure_plan_reference_is_authorized(
+            rotation_plan, unattached_group, portfolio_owner_id=owner_id
         )
 
 

@@ -17,7 +17,8 @@ from app.domain.access import AccessContext
 from app.domain.enums import Scope
 from app.domain.errors import NotFoundForActor
 from app.domain.values import Ownership
-from pydantic import ValidationError
+from app.schemas.configuration import ResolvedConfigurationSchema
+from pydantic import Field, ValidationError
 
 NOW = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
 RUN_DEADLINE = NOW + timedelta(minutes=30)
@@ -58,10 +59,12 @@ def _api() -> dict[str, Any]:
         "ConfigurationMergeError": configuration.ConfigurationMergeError,
         "ConfigurationResolver": configuration.ConfigurationResolver,
         "LayerPatchSchema": schemas.LayerPatchSchema,
+        "ListMergeStrategy": schemas.ListMergeStrategy,
         "ResolvedConfigurationSchema": schemas.ResolvedConfigurationSchema,
         "RuntimeOverrideExpiryError": configuration.RuntimeOverrideExpiryError,
         "canonical_content_hash": configuration.canonical_content_hash,
         "canonical_json": configuration.canonical_json,
+        "list_merge_policies_for": schemas.list_merge_policies_for,
     }
 
 
@@ -104,20 +107,32 @@ def _layer(
     expires_at: datetime | None = None,
     ownership: Ownership | None = None,
     portfolio_owner_id: UUID | None = None,
+    content_hash: str | None = None,
+    content_hash_format_version: str | None = None,
 ) -> Any:
     layer_ownership, layer_portfolio_owner_id = _ownership_for(scope)
-    return api["ConfigurationLayer"](
-        scope=scope,
-        patch=api["LayerPatchSchema"].model_validate(patch),
-        reference_id=uuid4(),
-        version=version,
-        content_hash=f"{version:064x}",
-        ownership=ownership if ownership is not None else layer_ownership,
-        portfolio_owner_id=(
+    normalized_patch = api["LayerPatchSchema"].for_scope(scope, patch)
+    hash_format_version = content_hash_format_version or "1"
+    layer_kwargs: dict[str, object] = {
+        "scope": scope,
+        "patch": normalized_patch,
+        "reference_id": uuid4(),
+        "version": version,
+        "content_hash": content_hash
+        if content_hash is not None
+        else api["canonical_content_hash"](
+            normalized_patch.model_dump(mode="python", by_alias=True, exclude_unset=True),
+            format_version=hash_format_version,
+        ),
+        "ownership": ownership if ownership is not None else layer_ownership,
+        "portfolio_owner_id": (
             portfolio_owner_id if portfolio_owner_id is not None else layer_portfolio_owner_id
         ),
-        runtime_expires_at=expires_at,
-    )
+        "runtime_expires_at": expires_at,
+    }
+    if content_hash_format_version is not None:
+        layer_kwargs["content_hash_format_version"] = content_hash_format_version
+    return api["ConfigurationLayer"](**layer_kwargs)
 
 
 def _resolver(api: dict[str, Any]) -> Any:
@@ -293,6 +308,53 @@ def test_resolver_recursively_merges_maps_replaces_normal_lists_and_merges_keyed
     ]
 
 
+def test_list_merge_policies_are_declared_by_resolved_schema_metadata() -> None:
+    api = _api()
+    policies = api["list_merge_policies_for"](api["ResolvedConfigurationSchema"])
+
+    assert policies["rules"].strategy is api["ListMergeStrategy"].REPLACE
+    assert policies["rules"].key is None
+    assert policies["keyed_items"].strategy is api["ListMergeStrategy"].KEYED
+    assert policies["keyed_items"].key == "id"
+
+
+def test_resolver_uses_injected_schema_metadata_for_keyed_list_merging() -> None:
+    api = _api()
+    scope_type = api["ConfigurationLayerScope"]
+
+    class RulesKeyedSchema(ResolvedConfigurationSchema):
+        rules: list[dict[str, object]] = Field(
+            json_schema_extra={"merge_policy": {"strategy": "keyed", "key": "id"}}
+        )
+
+    system_payload = _payload()
+    system_payload["rules"] = [{"id": "first", "from_system": "present"}]
+    resolver = api["ConfigurationResolver"](
+        maximum_runtime_ttl=timedelta(hours=1), resolved_configuration_schema=RulesKeyedSchema
+    )
+
+    snapshot = resolver.resolve(
+        [
+            _layer(api, scope_type.SYSTEM, system_payload, version=1),
+            _layer(
+                api,
+                scope_type.STRATEGY,
+                {"rules": [{"id": "first", "from_strategy": "present"}]},
+                version=2,
+            ),
+        ],
+        access_context=_context(),
+        created_by=ACTOR_ID,
+        created_at=NOW,
+        now=NOW,
+        run_deadline=RUN_DEADLINE,
+    )
+
+    assert list(snapshot.payload["rules"]) == [
+        {"id": "first", "from_system": "present", "from_strategy": "present"}
+    ]
+
+
 def test_nullable_fields_replace_with_null_and_only_extensions_allow_typed_delete() -> None:
     api = _api()
     scope_type = api["ConfigurationLayerScope"]
@@ -380,6 +442,60 @@ def test_resolver_hides_parent_configuration_not_owned_by_the_actor() -> None:
 
     with pytest.raises(NotFoundForActor):
         _resolve(api, [layer])
+
+
+def test_configuration_layer_rejects_a_content_hash_that_does_not_match_its_patch() -> None:
+    api = _api()
+    scope_type = api["ConfigurationLayerScope"]
+
+    with pytest.raises(api["ConfigurationCanonicalizationError"], match="content_hash"):
+        _layer(
+            api,
+            scope_type.SYSTEM,
+            {"settings": {"source": "system"}},
+            version=1,
+            content_hash="0" * 64,
+        )
+
+
+def test_configuration_layer_hashes_the_alias_preserving_sparse_delete_payload() -> None:
+    api = _api()
+    scope_type = api["ConfigurationLayerScope"]
+    layer = _layer(
+        api,
+        scope_type.SYSTEM,
+        {"extensions": {"retired": {"$delete": True}}},
+        version=1,
+    )
+    canonical_patch = layer.patch.model_dump(mode="python", by_alias=True, exclude_unset=True)
+
+    assert api["canonical_json"](canonical_patch) == '{"extensions":{"retired":{"$delete":true}}}'
+    assert layer.content_hash == api["canonical_content_hash"](canonical_patch)
+    assert layer.content_hash == api["canonical_content_hash"](
+        {"extensions": {"retired": {"$delete": True}}}
+    )
+
+
+def test_parent_versions_record_the_hash_format_used_by_each_layer() -> None:
+    api = _api()
+    scope_type = api["ConfigurationLayerScope"]
+    snapshot = _resolve(api, [_layer(api, scope_type.SYSTEM, _payload(), version=1)])
+
+    assert snapshot.parent_versions[0].content_hash_format_version == "1"
+
+
+def test_configuration_layer_rejects_unsupported_hash_format_versions() -> None:
+    api = _api()
+    scope_type = api["ConfigurationLayerScope"]
+
+    with pytest.raises(api["ConfigurationCanonicalizationError"], match="format version"):
+        _layer(
+            api,
+            scope_type.SYSTEM,
+            {"settings": {"source": "system"}},
+            version=1,
+            content_hash_format_version="2",
+        )
 
 
 def test_canonical_json_and_hash_follow_the_versioned_contract() -> None:

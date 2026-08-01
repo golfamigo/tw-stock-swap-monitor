@@ -175,7 +175,7 @@ def test_domain_aggregates_expose_their_ownership_boundaries() -> None:
     plan = RotationPlan(
         rotation_plan_id=plan_id,
         portfolio_id=portfolio_id,
-        candidate_group_id=group_id,
+        candidate_group_ids=(group_id,),
         source_position_ids=(position_id,),
         protected_position_ids=(),
         created_at=aware_at(),
@@ -324,19 +324,36 @@ def test_candidate_group_copies_mutable_instrument_input_to_a_tuple() -> None:
 
 
 def test_rotation_plan_copies_mutable_reference_inputs_to_tuples() -> None:
+    candidate_group_ids = [uuid4()]
     source_ids = [uuid4()]
     protected_ids: list[UUID] = []
     plan = RotationPlan(
         rotation_plan_id=uuid4(),
         portfolio_id=uuid4(),
-        candidate_group_id=uuid4(),
+        candidate_group_ids=candidate_group_ids,  # type: ignore[arg-type]
         source_position_ids=source_ids,  # type: ignore[arg-type]
         protected_position_ids=protected_ids,  # type: ignore[arg-type]
         created_at=aware_at(),
     )
 
+    candidate_group_ids.append(uuid4())
     source_ids.append(uuid4())
     protected_ids.append(uuid4())
 
+    assert plan.candidate_group_ids == (candidate_group_ids[0],)
     assert plan.source_position_ids == (source_ids[0],)
     assert plan.protected_position_ids == ()
+
+
+def test_rotation_plan_rejects_duplicate_candidate_group_ids() -> None:
+    candidate_group_id = uuid4()
+
+    with pytest.raises(ValueError, match="candidate_group_ids must be unique"):
+        RotationPlan(
+            rotation_plan_id=uuid4(),
+            portfolio_id=uuid4(),
+            candidate_group_ids=(candidate_group_id, candidate_group_id),
+            source_position_ids=(uuid4(),),
+            protected_position_ids=(),
+            created_at=aware_at(),
+        )

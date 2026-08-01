@@ -49,3 +49,4 @@ class ParentVersion:
     reference_id: UUID
     version: int
     content_hash: str
+    content_hash_format_version: str

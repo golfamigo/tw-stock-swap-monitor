@@ -11,13 +11,13 @@ config_version       monotonic version for its target resource
 content_hash         SHA-256 of canonical format version and merged payload
 created_at           timezone-aware timestamp
 created_by           user or system principal
-parent_versions      ordered references and hashes of contributing layers
+parent_versions      ordered references, hashes, and hash-format versions of contributing layers
 merged_payload       validated fully resolved configuration
 scope and owner_id   ownership of the snapshot target
 runtime_expires_at   required for a runtime override; otherwise null
 ~~~
 
-The content hash is calculated only after final validation and canonical serialization. A run stores snapshot ID, content hash, parent versions, and the embedded merged payload so a decision remains reproducible after later settings change.
+The content hash is calculated only after final validation and canonical serialization. Before a layer can contribute, its sparse patch is normalized with `mode="python"`, `by_alias=True`, and `exclude_unset=True`; its versioned canonical hash must match the supplied layer hash. Delete directives therefore enter parent evidence only as the stable `$delete` alias. A run stores snapshot ID, content hash, parent versions, and the embedded merged payload so a decision remains reproducible after later settings change.
 
 ## Schema separation
 
@@ -62,7 +62,7 @@ Values normalize as follows:
 | integer / Boolean / null | JSON primitive; Boolean is never treated as an integer |
 | string | NFC-normalized JSON string encoded without ASCII escaping |
 
-Floats, NaN, positive/negative infinity, sets, bytes, arbitrary objects, and naive datetimes are rejected at canonicalization. Thus numerically equal Decimal values such as 1.0 and 1.00 hash identically. The hash input is UTF-8 bytes of canonical format version, one zero-byte delimiter, and canonical JSON; SHA-256 of those bytes is content_hash. A canonicalization change requires a new format version and never silently re-hashes historical snapshots.
+Floats, NaN, positive/negative infinity, sets, bytes, arbitrary objects, and naive datetimes are rejected at canonicalization. Thus numerically equal Decimal values such as 1.0 and 1.00 hash identically. The hash input is UTF-8 bytes of canonical format version, one zero-byte delimiter, and canonical JSON; SHA-256 of those bytes is content_hash. Parent evidence carries the exact hash format version. A resolver rejects an unsupported layer format rather than silently treating it as the current format. A canonicalization change requires a new format version and never silently re-hashes historical snapshots.
 
 ## Configuration ownership and errors
 

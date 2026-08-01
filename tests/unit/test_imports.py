@@ -7,6 +7,29 @@ from pathlib import Path
 from fastapi import FastAPI
 
 
+def _venv_python_path(venv_root: Path, *, platform: str) -> Path:
+    """Return the interpreter path created by Python's venv module for a platform."""
+
+    if platform == "win32":
+        return venv_root / "Scripts" / "python.exe"
+    return venv_root / "bin" / "python"
+
+
+def test_wheel_install_selects_the_venv_interpreter_for_each_supported_platform(
+    tmp_path: Path,
+) -> None:
+    """The wheel smoke test uses the venv interpreter layout of its runner platform."""
+
+    installed_venv = tmp_path / "installed-venv"
+
+    assert _venv_python_path(installed_venv, platform="win32") == (
+        installed_venv / "Scripts" / "python.exe"
+    )
+    assert _venv_python_path(installed_venv, platform="linux") == (
+        installed_venv / "bin" / "python"
+    )
+
+
 def test_application_factory_returns_fastapi_application() -> None:
     """The bootstrap package exposes an importable ASGI application factory."""
     import app.main
@@ -59,7 +82,7 @@ def test_wheel_install_resolves_application_from_its_own_site_packages(tmp_path:
         f"stdout:\n{create_venv.stdout}\nstderr:\n{create_venv.stderr}"
     )
 
-    installed_python = installed_venv / "Scripts" / "python.exe"
+    installed_python = _venv_python_path(installed_venv, platform=sys.platform)
     install = subprocess.run(
         [
             str(installed_python),

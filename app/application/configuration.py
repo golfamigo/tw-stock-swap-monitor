@@ -22,11 +22,16 @@ from app.schemas.common import (
     DeleteDirective,
     ParentVersion,
 )
-from app.schemas.configuration import LayerPatchSchema, ResolvedConfigurationSchema
+from app.schemas.configuration import (
+    LayerPatchSchema,
+    ListMergePolicy,
+    ListMergeStrategy,
+    ResolvedConfigurationSchema,
+    list_merge_policies_for,
+)
 
 CANONICAL_FORMAT_VERSION = "1"
 _PRECEDENCE = {scope: index for index, scope in enumerate(ConfigurationLayerScope)}
-_KEYED_LIST_FIELD = "keyed_items"
 
 
 class ConfigurationError(ValueError):
@@ -55,6 +60,7 @@ class ConfigurationLayer:
     version: int
     content_hash: str
     ownership: Ownership
+    content_hash_format_version: str = CANONICAL_FORMAT_VERSION
     portfolio_owner_id: UUID | None = None
     runtime_expires_at: datetime | None = None
 
@@ -76,10 +82,24 @@ class ConfigurationLayer:
         object.__setattr__(self, "patch", LayerPatchSchema.for_scope(self.scope, self.patch))
         if self.version < 1:
             raise ValueError("configuration layer version must be positive")
-        if len(self.content_hash) != 64 or any(
-            character not in "0123456789abcdef" for character in self.content_hash.lower()
+        if self.content_hash_format_version != CANONICAL_FORMAT_VERSION:
+            raise ConfigurationCanonicalizationError(
+                "unsupported layer content hash format version"
+            )
+        normalized_content_hash = self.content_hash.lower()
+        if len(normalized_content_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized_content_hash
         ):
             raise ValueError("content_hash must be a SHA-256 hexadecimal digest")
+        expected_content_hash = canonical_content_hash(
+            self.patch.model_dump(mode="python", by_alias=True, exclude_unset=True),
+            format_version=self.content_hash_format_version,
+        )
+        if normalized_content_hash != expected_content_hash:
+            raise ConfigurationCanonicalizationError(
+                "content_hash does not match the canonical patch"
+            )
+        object.__setattr__(self, "content_hash", normalized_content_hash)
         if self.runtime_expires_at is not None:
             require_timezone_aware(self.runtime_expires_at, field_name="runtime_expires_at")
 
@@ -237,20 +257,26 @@ def _kind(value: object) -> str:
     return "scalar"
 
 
-def _merge_keyed_list(lower: list[object], higher: list[object], path: str) -> list[object]:
+def _merge_keyed_list(
+    lower: list[object], higher: list[object], path: str, *, key: str
+) -> list[object]:
     result: list[object] = []
     indexes: dict[str, int] = {}
     for item in lower:
-        if not isinstance(item, Mapping) or not isinstance(item.get("id"), str):
-            raise ConfigurationMergeError(f"{path} requires mapping entries with string ids")
-        identifier = item["id"]
+        if not isinstance(item, Mapping) or not isinstance(item.get(key), str):
+            raise ConfigurationMergeError(
+                f"{path} requires mapping entries with string {key} values"
+            )
+        identifier = item[key]
         assert isinstance(identifier, str)
         indexes[identifier] = len(result)
         result.append(_copy_value(item))
     for item in higher:
-        if not isinstance(item, Mapping) or not isinstance(item.get("id"), str):
-            raise ConfigurationMergeError(f"{path} requires mapping entries with string ids")
-        identifier = item["id"]
+        if not isinstance(item, Mapping) or not isinstance(item.get(key), str):
+            raise ConfigurationMergeError(
+                f"{path} requires mapping entries with string {key} values"
+            )
+        identifier = item[key]
         assert isinstance(identifier, str)
         if identifier in indexes:
             lower_item = result[indexes[identifier]]
@@ -261,7 +287,9 @@ def _merge_keyed_list(lower: list[object], higher: list[object], path: str) -> l
     return result
 
 
-def _merge_value(lower: object, higher: object, path: str) -> object:
+def _merge_value(
+    lower: object, higher: object, path: str, *, list_policy: ListMergePolicy | None = None
+) -> object:
     if higher is None:
         return None
     if lower is None:
@@ -284,8 +312,9 @@ def _merge_value(lower: object, higher: object, path: str) -> object:
         return result
     if lower_kind == "list":
         assert isinstance(lower, list | tuple) and isinstance(higher, list | tuple)
-        if path == _KEYED_LIST_FIELD:
-            return _merge_keyed_list(list(lower), list(higher), path)
+        if list_policy is not None and list_policy.strategy is ListMergeStrategy.KEYED:
+            assert list_policy.key is not None
+            return _merge_keyed_list(list(lower), list(higher), path, key=list_policy.key)
         return _copy_value(list(higher))
     if type(lower) is not type(higher):
         raise ConfigurationMergeError(
@@ -317,10 +346,19 @@ def _merge_extensions(lower: object | None, higher: Mapping[str, object]) -> dic
 class ConfigurationResolver:
     """Resolve the fixed seven-layer precedence chain into one immutable snapshot."""
 
-    def __init__(self, *, maximum_runtime_ttl: timedelta) -> None:
+    def __init__(
+        self,
+        *,
+        maximum_runtime_ttl: timedelta,
+        resolved_configuration_schema: type[ResolvedConfigurationSchema] = (
+            ResolvedConfigurationSchema
+        ),
+    ) -> None:
         if maximum_runtime_ttl <= timedelta(0):
             raise ValueError("maximum_runtime_ttl must be positive")
         self._maximum_runtime_ttl = maximum_runtime_ttl
+        self._resolved_configuration_schema = resolved_configuration_schema
+        self._list_merge_policies = list_merge_policies_for(resolved_configuration_schema)
 
     def resolve(
         self,
@@ -367,7 +405,12 @@ class ConfigurationResolver:
                     assert isinstance(higher_value, Mapping)
                     merged[field_name] = _merge_extensions(merged.get(field_name), higher_value)
                 elif field_name in merged:
-                    merged[field_name] = _merge_value(merged[field_name], higher_value, field_name)
+                    merged[field_name] = _merge_value(
+                        merged[field_name],
+                        higher_value,
+                        field_name,
+                        list_policy=self._list_merge_policies.get(field_name),
+                    )
                 else:
                     merged[field_name] = _copy_value(higher_value)
             parent_versions.append(
@@ -376,10 +419,11 @@ class ConfigurationResolver:
                     reference_id=layer.reference_id,
                     version=layer.version,
                     content_hash=layer.content_hash,
+                    content_hash_format_version=layer.content_hash_format_version,
                 )
             )
 
-        resolved = ResolvedConfigurationSchema.model_validate(merged)
+        resolved = self._resolved_configuration_schema.model_validate(merged)
         resolved_payload = resolved.model_dump(mode="python")
         serialized = canonical_json(resolved_payload)
         frozen_payload = _freeze_value(resolved_payload)
