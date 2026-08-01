@@ -1,3 +1,4 @@
+import importlib.metadata
 import tomllib
 from pathlib import Path
 
@@ -59,3 +60,12 @@ def test_setuptools_discovers_application_packages_explicitly() -> None:
         pyproject = tomllib.load(pyproject_file)
 
     assert pyproject["tool"]["setuptools"]["packages"]["find"]["include"] == ["app*"]
+
+
+def test_development_dependencies_provision_the_wheel_builder() -> None:
+    """The wheel-build smoke test declares and receives its wheel build dependency."""
+    with (PROJECT_ROOT / "pyproject.toml").open("rb") as pyproject_file:
+        pyproject = tomllib.load(pyproject_file)
+
+    assert "wheel==0.47.0" in pyproject["project"]["optional-dependencies"]["dev"]
+    assert importlib.metadata.version("wheel") == "0.47.0"
