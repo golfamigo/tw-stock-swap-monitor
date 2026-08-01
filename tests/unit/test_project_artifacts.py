@@ -13,6 +13,8 @@ def test_dockerignore_excludes_credentials_and_local_artifacts() -> None:
     patterns = set(dockerignore.read_text(encoding="utf-8").splitlines())
     assert {
         ".env",
+        ".env.*",
+        "!.env.example",
         ".git",
         ".venv",
         "__pycache__/",
@@ -23,6 +25,24 @@ def test_dockerignore_excludes_credentials_and_local_artifacts() -> None:
         ".ruff_cache/",
         "tests/",
     } <= patterns
+
+
+def test_gitignore_excludes_environment_files_except_the_example() -> None:
+    """Only the committed environment-variable name template remains trackable."""
+    patterns = set((PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines())
+
+    assert {".env", ".env.*", "!.env.example"} <= patterns
+
+
+def test_ignore_files_exclude_wheel_build_artifacts() -> None:
+    """Local wheel builds do not dirty Git status or enter the Docker context."""
+    gitignore_patterns = set((PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines())
+    dockerignore_patterns = set(
+        (PROJECT_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    )
+
+    assert "build/" in gitignore_patterns
+    assert "build/" in dockerignore_patterns
 
 
 def test_container_uses_an_unprivileged_runtime_user() -> None:

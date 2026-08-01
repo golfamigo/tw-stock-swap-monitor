@@ -1,9 +1,12 @@
 .env
+.env.*
+!.env.example
 .git
 .venv
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
 .coverage
 .mypy_cache/
 .pytest_cache/
