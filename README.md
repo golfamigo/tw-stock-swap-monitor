@@ -38,5 +38,8 @@ data provider, or trading integration runs by default.
 
 ## Environment variables
 
-Copy `.env.example` only when later milestones require secret configuration.
-The template lists secret names without values; never commit `.env` or credentials.
+For local development, copy `.env.example` to `.local.env` and add values only to
+that never-tracked file. The template lists secret names without values.
+
+All production keys and passwords must be configured as Zeabur environment variables.
+Never commit local environment files or credentials.

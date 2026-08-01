@@ -15,6 +15,7 @@ def test_dockerignore_excludes_credentials_and_local_artifacts() -> None:
         ".env",
         ".env.*",
         "!.env.example",
+        ".local.env",
         ".git",
         ".venv",
         "__pycache__/",
@@ -31,7 +32,7 @@ def test_gitignore_excludes_environment_files_except_the_example() -> None:
     """Only the committed environment-variable name template remains trackable."""
     patterns = set((PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines())
 
-    assert {".env", ".env.*", "!.env.example"} <= patterns
+    assert {".env", ".env.*", "!.env.example", ".local.env"} <= patterns
 
 
 def test_ignore_files_exclude_wheel_build_artifacts() -> None:
