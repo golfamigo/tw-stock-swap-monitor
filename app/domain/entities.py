@@ -4,10 +4,18 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
+from enum import Enum
 from types import MappingProxyType
 from uuid import UUID
 
-from app.domain.enums import PositionRole, PositionStatus, Scope
+from app.domain.enums import (
+    LogicalScanStatus,
+    PositionRole,
+    PositionStatus,
+    ScanAttemptRecoveryDecision,
+    ScanAttemptStatus,
+    Scope,
+)
 from app.domain.errors import (
     InvalidStrategyRunEvidenceError,
     PositionHistoryError,
@@ -26,6 +34,8 @@ from app.domain.values import (
 def _freeze_evidence(value: object, *, active_container_ids: set[int]) -> object:
     """Recursively convert builtin mutable containers into immutable evidence values."""
 
+    if isinstance(value, Enum):
+        raise InvalidStrategyRunEvidenceError("evidence Enum values are not supported")
     if isinstance(value, Mapping):
         container_id = id(value)
         if container_id in active_container_ids:
@@ -63,7 +73,9 @@ def _freeze_evidence(value: object, *, active_container_ids: set[int]) -> object
         return require_finite_decimal(value, field_name="evidence Decimal")
     if isinstance(value, datetime):
         return require_timezone_aware(value, field_name="evidence datetime")
-    if value is None or isinstance(value, str | int | UUID | bytes):
+    if isinstance(value, bytes):
+        raise InvalidStrategyRunEvidenceError("evidence bytes are not supported")
+    if value is None or isinstance(value, str | int | UUID):
         return value
     raise InvalidStrategyRunEvidenceError("unsupported mutable or non-deterministic evidence value")
 
@@ -240,3 +252,154 @@ class StrategyRun:
     @property
     def ownership(self) -> Ownership:
         return Ownership(Scope.PORTFOLIO, self.portfolio_id)
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalScanRun:
+    """One recoverable scan identity before a market-data snapshot is available."""
+
+    logical_scan_run_id: UUID
+    rotation_plan_id: UUID
+    portfolio_id: UUID
+    market_session_date: str
+    scan_window_start: datetime
+    scan_interval: str
+    scan_lock_key: str
+    status: LogicalScanStatus
+    created_at: datetime
+    completed_at: datetime | None = None
+    final_strategy_run_id: UUID | None = None
+
+    def __post_init__(self) -> None:
+        require_timezone_aware(self.scan_window_start, field_name="scan_window_start")
+        require_timezone_aware(self.created_at, field_name="created_at")
+        if not self.market_session_date.strip() or not self.scan_interval.strip():
+            raise ValueError("logical scan identity fields must not be blank")
+        if not self.scan_lock_key.strip():
+            raise ValueError("scan_lock_key must not be blank")
+        if not isinstance(self.status, LogicalScanStatus):
+            raise TypeError("status must be a LogicalScanStatus")
+        if self.status is LogicalScanStatus.RUNNING:
+            if self.completed_at is not None or self.final_strategy_run_id is not None:
+                raise ValueError("RUNNING logical scans cannot have final result evidence")
+        else:
+            if self.completed_at is None or self.final_strategy_run_id is None:
+                raise ValueError("COMPLETED logical scans require final result evidence")
+            require_timezone_aware(self.completed_at, field_name="completed_at")
+            if self.completed_at < self.created_at:
+                raise ValueError("logical scan completed_at cannot be before created_at")
+
+
+@dataclass(frozen=True, slots=True)
+class ScanAttempt:
+    """Auditable provider attempt retained for a recoverable logical scan."""
+
+    scan_attempt_id: UUID
+    logical_scan_run_id: UUID
+    attempt_number: int
+    status: ScanAttemptStatus
+    configuration_snapshot_hash: str
+    market_data_snapshot_id: str | None
+    market_data_content_hash: str | None
+    trigger_correlation_id: str
+    actor_correlation_id: str
+    started_at: datetime
+    completed_at: datetime | None
+    failure_code: str | None = None
+    failure_detail: str | None = None
+    recovery_of_attempt_id: UUID | None = None
+    duplicate_of_attempt_id: UUID | None = None
+    final_strategy_run_id: UUID | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.attempt_number, bool) or self.attempt_number < 1:
+            raise ValueError("attempt_number must be positive")
+        if not isinstance(self.status, ScanAttemptStatus):
+            raise TypeError("status must be a ScanAttemptStatus")
+        _require_sha256_hash(
+            self.configuration_snapshot_hash, field_name="configuration_snapshot_hash"
+        )
+        if self.market_data_snapshot_id is not None and not self.market_data_snapshot_id.strip():
+            raise ValueError("market_data_snapshot_id must not be blank when supplied")
+        if (self.market_data_snapshot_id is None) != (self.market_data_content_hash is None):
+            raise ValueError(
+                "market_data_snapshot_id and market_data_content_hash must be supplied together"
+            )
+        if self.market_data_content_hash is not None:
+            _require_sha256_hash(
+                self.market_data_content_hash, field_name="market_data_content_hash"
+            )
+        _require_bounded_text(
+            self.trigger_correlation_id, field_name="trigger_correlation_id", maximum_length=256
+        )
+        _require_bounded_text(
+            self.actor_correlation_id, field_name="actor_correlation_id", maximum_length=256
+        )
+        require_timezone_aware(self.started_at, field_name="started_at")
+        if self.completed_at is not None:
+            require_timezone_aware(self.completed_at, field_name="completed_at")
+            if self.completed_at < self.started_at:
+                raise ValueError("attempt completed_at cannot be before started_at")
+        if self.failure_code is not None:
+            _require_bounded_text(self.failure_code, field_name="failure_code", maximum_length=64)
+        if self.failure_detail is not None:
+            _require_bounded_text(
+                self.failure_detail, field_name="failure_detail", maximum_length=1024
+            )
+        if self.recovery_of_attempt_id == self.scan_attempt_id:
+            raise ValueError("recovery_of_attempt_id cannot reference this attempt")
+        if self.duplicate_of_attempt_id == self.scan_attempt_id:
+            raise ValueError("duplicate_of_attempt_id cannot reference this attempt")
+        self._validate_status_evidence()
+
+    def _validate_status_evidence(self) -> None:
+        has_market_data = self.market_data_snapshot_id is not None
+        has_failure = self.failure_code is not None or self.failure_detail is not None
+        if self.status is ScanAttemptStatus.RUNNING:
+            if self.completed_at is not None or has_market_data or has_failure:
+                raise ValueError("RUNNING attempts cannot have completed outcome evidence")
+            if self.duplicate_of_attempt_id is not None or self.final_strategy_run_id is not None:
+                raise ValueError("RUNNING attempts cannot have final or duplicate references")
+            return
+        if self.completed_at is None:
+            raise ValueError("terminal scan attempts require completed_at")
+        if self.status in {ScanAttemptStatus.FAILED, ScanAttemptStatus.DEGRADED}:
+            if self.failure_code is None or self.failure_detail is None:
+                raise ValueError("failure_code and failure_detail are required for failed evidence")
+            if self.final_strategy_run_id is not None:
+                raise ValueError("failed or degraded attempts cannot have a final strategy run")
+            if self.duplicate_of_attempt_id is not None:
+                raise ValueError("failed or degraded attempts cannot be duplicate results")
+            if self.status is ScanAttemptStatus.DEGRADED and not has_market_data:
+                raise ValueError("DEGRADED attempts require market_data evidence")
+            return
+        if has_failure:
+            raise ValueError("SUCCEEDED attempts cannot have failure evidence")
+        if self.duplicate_of_attempt_id is not None:
+            if has_market_data:
+                raise ValueError("duplicate successes cannot repeat market_data evidence")
+            if self.final_strategy_run_id is not None:
+                raise ValueError("duplicate successes cannot create a final strategy run")
+            return
+        if not has_market_data:
+            raise ValueError("SUCCEEDED attempts require market_data evidence")
+
+    @property
+    def recovery_decision(self) -> ScanAttemptRecoveryDecision:
+        """Return the only safe process action implied by immutable attempt evidence."""
+
+        if self.status is ScanAttemptStatus.RUNNING:
+            return ScanAttemptRecoveryDecision.RESUME
+        if self.status in {ScanAttemptStatus.FAILED, ScanAttemptStatus.DEGRADED}:
+            return ScanAttemptRecoveryDecision.RETRY
+        return ScanAttemptRecoveryDecision.FINALIZE
+
+
+def _require_sha256_hash(value: str, *, field_name: str) -> None:
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
+        raise ValueError(f"{field_name} must be a SHA-256 hexadecimal digest")
+
+
+def _require_bounded_text(value: str, *, field_name: str, maximum_length: int) -> None:
+    if not value.strip() or len(value) > maximum_length:
+        raise ValueError(f"{field_name} must be non-blank and at most {maximum_length} characters")

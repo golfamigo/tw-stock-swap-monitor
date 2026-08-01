@@ -59,3 +59,11 @@ class PositionHistoryError(DomainError):
 
 class InvalidStrategyRunEvidenceError(DomainError):
     """Strategy run evidence contained an unsupported mutable or invalid value."""
+
+
+class LogicalScanAlreadyCompletedError(DomainError):
+    """A logical scan already has its single permitted final strategy result."""
+
+
+class IdempotencyConflictError(DomainError):
+    """One idempotency key was reused with a materially different strategy run."""

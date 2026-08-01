@@ -258,6 +258,20 @@ def test_strategy_run_rejects_unsupported_mutable_evidence() -> None:
         )
 
 
+def test_strategy_run_rejects_bytes_evidence_at_the_pure_domain_boundary() -> None:
+    with pytest.raises(InvalidStrategyRunEvidenceError, match="bytes"):
+        StrategyRun(
+            strategy_run_id=uuid4(),
+            rotation_plan_id=uuid4(),
+            portfolio_id=uuid4(),
+            configuration_snapshot=ConfigurationSnapshotRef(uuid4(), "a" * 64, aware_at()),
+            market_data_snapshot_id="market-snapshot",
+            state_transition="PENDING->ACTION_NOTIFIED",
+            outputs={"bytes": b"not-json"},
+            occurred_at=aware_at(),
+        )
+
+
 def test_strategy_run_rejects_unordered_set_evidence() -> None:
     with pytest.raises(InvalidStrategyRunEvidenceError):
         StrategyRun(

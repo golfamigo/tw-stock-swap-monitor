@@ -121,6 +121,54 @@ class ResolvedConfigurationSnapshot:
     canonical_json: str
 
 
+def restore_resolved_configuration_snapshot(
+    *,
+    payload: Mapping[str, object],
+    parent_versions: tuple[ParentVersion, ...],
+    created_by: UUID,
+    created_at: datetime,
+    runtime_expires_at: datetime | None,
+    canonical_format_version: str,
+    content_hash: str,
+    canonical_payload_json: str,
+) -> ResolvedConfigurationSnapshot:
+    """Validate persisted evidence before recreating an immutable configuration snapshot."""
+
+    if canonical_format_version != CANONICAL_FORMAT_VERSION:
+        raise ConfigurationCanonicalizationError(
+            "stored configuration snapshot canonical format is unsupported"
+        )
+    try:
+        resolved = ResolvedConfigurationSchema.model_validate(_thaw_value(payload))
+    except ValueError as error:
+        raise ValueError("stored resolved configuration payload is invalid") from error
+    validated_payload = resolved.model_dump(mode="python")
+    expected_canonical_json = canonical_json(validated_payload)
+    if canonical_payload_json != expected_canonical_json:
+        raise ValueError("stored configuration snapshot canonical_json does not match payload")
+    expected_content_hash = canonical_content_hash(
+        validated_payload, format_version=canonical_format_version
+    )
+    if content_hash != expected_content_hash:
+        raise ValueError("stored configuration snapshot content_hash does not match payload")
+    require_timezone_aware(created_at, field_name="created_at")
+    if runtime_expires_at is not None:
+        require_timezone_aware(runtime_expires_at, field_name="runtime_expires_at")
+    frozen_payload = _freeze_value(validated_payload)
+    if not isinstance(frozen_payload, Mapping):
+        raise ValueError("resolved configuration payload must remain a mapping")
+    return ResolvedConfigurationSnapshot(
+        payload=cast(Mapping[str, FrozenConfigurationValue], frozen_payload),
+        parent_versions=parent_versions,
+        created_by=created_by,
+        created_at=created_at,
+        runtime_expires_at=runtime_expires_at,
+        canonical_format_version=canonical_format_version,
+        content_hash=content_hash,
+        canonical_json=canonical_payload_json,
+    )
+
+
 def _canonical_decimal(value: Decimal) -> str:
     if not value.is_finite():
         raise ConfigurationCanonicalizationError("Decimal values must be finite")
@@ -246,6 +294,16 @@ def _freeze_value(value: object) -> FrozenConfigurationValue:
         )
     if isinstance(value, list | tuple):
         return tuple(_freeze_value(nested_value) for nested_value in value)
+    return value
+
+
+def _thaw_value(value: object) -> object:
+    """Return mutable schema-input containers from a persisted frozen payload."""
+
+    if isinstance(value, Mapping):
+        return {key: _thaw_value(nested_value) for key, nested_value in value.items()}
+    if isinstance(value, list | tuple):
+        return [_thaw_value(item) for item in value]
     return value
 
 

@@ -25,3 +25,27 @@ class PositionStatus(str, Enum):
 
     OPEN = "OPEN"
     CLOSED = "CLOSED"
+
+
+class LogicalScanStatus(str, Enum):
+    """The persisted lifecycle of one pre-market-data logical scan."""
+
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+
+
+class ScanAttemptStatus(str, Enum):
+    """The terminal or in-progress state of one market-data provider attempt."""
+
+    RUNNING = "RUNNING"
+    FAILED = "FAILED"
+    DEGRADED = "DEGRADED"
+    SUCCEEDED = "SUCCEEDED"
+
+
+class ScanAttemptRecoveryDecision(str, Enum):
+    """The deterministic worker action allowed after observing an attempt."""
+
+    RESUME = "RESUME"
+    RETRY = "RETRY"
+    FINALIZE = "FINALIZE"
