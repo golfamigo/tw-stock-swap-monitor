@@ -23,3 +23,8 @@ def test_runtime_database_url_is_the_production_default_and_ci_uses_a_nondev_smo
     assert "runtime-postgres-smoke" in workflow
     assert "python -m pip install ." in workflow
     assert "DATABASE_URL" in workflow
+    assert "with engine.connect() as connection:" in workflow
+    assert "connection.scalar(text(" in workflow
+    assert "SELECT 1" in workflow
+    assert "engine.dispose()" in workflow
+    assert "engine.scalar(" not in workflow

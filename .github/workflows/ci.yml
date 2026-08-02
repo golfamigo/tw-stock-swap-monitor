@@ -102,7 +102,13 @@ jobs:
       - name: Apply migrations through the runtime database URL
         run: python -m alembic upgrade head
       - name: Connect to PostgreSQL through the installed runtime driver
-        run: >-
-          python -c "from sqlalchemy import create_engine, text; from os import environ;
-          engine = create_engine(environ['DATABASE_URL']);
-          assert engine.scalar(text('SELECT 1')) == 1"
+        run: |
+          python - <<'PY'
+          from os import environ
+          from sqlalchemy import create_engine, text
+
+          engine = create_engine(environ["DATABASE_URL"])
+          with engine.connect() as connection:
+              assert connection.scalar(text("SELECT 1")) == 1
+          engine.dispose()
+          PY
