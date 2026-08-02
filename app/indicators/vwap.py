@@ -1,0 +1,106 @@
+"""Session-reset VWAP plugin with Decimal-only strategy-boundary values."""
+
+from dataclasses import dataclass
+from decimal import Decimal, localcontext
+from uuid import UUID
+
+from app.calendar.base import TradingCalendarProvider
+from app.data_sources.models import Bar, MarketDataSnapshot
+from app.indicators.bars import (
+    BarAggregationInputError,
+    SessionLocation,
+    locate_market_session,
+    validate_bars_for_calendar,
+)
+from app.indicators.base import DECIMAL_CONTEXT, IndicatorResult, canonical_decimal
+
+
+@dataclass(frozen=True, slots=True)
+class SessionVwapIndicator:
+    """Calculate VWAP for the latest observed calendar session of one configured instrument."""
+
+    calendar: TradingCalendarProvider
+    market: str
+    instrument_id: UUID
+    key: str = "session_vwap"
+
+    def __post_init__(self) -> None:
+        if not self.market.strip():
+            raise ValueError("market must not be blank")
+        if not self.key.strip():
+            raise ValueError("indicator key must not be blank")
+
+    def calculate(self, market_snapshot: MarketDataSnapshot) -> IndicatorResult:
+        """Return latest-session VWAP or an explicit non-actionable state with evidence."""
+
+        if not market_snapshot.is_actionable:
+            return IndicatorResult.unavailable(
+                key=self.key,
+                reason="snapshot_not_actionable",
+                evidence={"snapshot_id": market_snapshot.snapshot_id},
+            )
+        scoped_bars = tuple(
+            bar for bar in market_snapshot.intraday_bars if bar.instrument_id == self.instrument_id
+        )
+        if not scoped_bars:
+            return IndicatorResult.unavailable(
+                key=self.key,
+                reason="missing_instrument_bars",
+                evidence={"instrument_id": str(self.instrument_id)},
+            )
+        try:
+            validated_bars = validate_bars_for_calendar(
+                scoped_bars, calendar=self.calendar, market=self.market
+            )
+        except BarAggregationInputError as error:
+            return IndicatorResult.unavailable(
+                key=self.key,
+                reason="invalid_source_bars",
+                evidence={
+                    "instrument_id": str(self.instrument_id),
+                    "snapshot_id": market_snapshot.snapshot_id,
+                    "validation_error": str(error),
+                },
+            )
+
+        located = tuple(
+            (bar, locate_market_session(bar, calendar=self.calendar, market=self.market))
+            for bar in validated_bars
+        )
+        latest_bar, latest_location = max(located, key=lambda item: item[0].starts_at)
+        active_bars = tuple(
+            bar
+            for bar, location in located
+            if location.session_date == latest_location.session_date
+            and location.segment == latest_location.segment
+        )
+        total_volume = sum((bar.volume for bar in active_bars), Decimal("0"))
+        evidence = _session_evidence(latest_location)
+        evidence["observed_bars"] = str(len(active_bars))
+        evidence["latest_bar_start"] = latest_bar.starts_at.isoformat()
+        if total_volume.is_zero():
+            return IndicatorResult.unavailable(
+                key=self.key,
+                reason="zero_volume",
+                evidence=evidence,
+            )
+        with localcontext(DECIMAL_CONTEXT):
+            weighted_total = sum(
+                (_weighted_typical_price(bar) for bar in active_bars), Decimal("0")
+            )
+            value = canonical_decimal(weighted_total / total_volume)
+        return IndicatorResult.available(key=self.key, value=value, evidence=evidence)
+
+
+def _weighted_typical_price(bar: Bar) -> Decimal:
+    typical_price = (bar.high + bar.low + bar.close) / Decimal("3")
+    return typical_price * bar.volume
+
+
+def _session_evidence(location: SessionLocation) -> dict[str, str]:
+    return {
+        "session_date": location.session_date.isoformat(),
+        "session_segment": str(location.segment),
+        "session_start": location.session.opens_at.isoformat(),
+        "session_end": location.session.closes_at.isoformat(),
+    }
