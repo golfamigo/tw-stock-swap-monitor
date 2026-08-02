@@ -93,8 +93,8 @@ def test_different_seed_changes_the_generated_snapshot() -> None:
 def test_equal_instants_in_different_aware_timezones_produce_identical_snapshots() -> None:
     request = replace(
         _request(),
-        intraday_start=datetime(2030, 1, 2, 10, 5, tzinfo=UTC),
-        intraday_end=datetime(2030, 1, 2, 10, 35, tzinfo=UTC),
+        intraday_start=datetime(2030, 1, 2, 10, 15, tzinfo=UTC),
+        intraday_end=datetime(2030, 1, 2, 10, 45, tzinfo=UTC),
     )
     alternate_timezone = ZoneInfo("Etc/GMT-8")
     equivalent_request = replace(
@@ -109,6 +109,68 @@ def test_equal_instants_in_different_aware_timezones_produce_identical_snapshots
 
     assert first.intraday_bars == second.intraday_bars
     assert first.snapshot_id == second.snapshot_id
+
+
+def test_mock_provider_rejects_intraday_request_edges_outside_the_session_grid() -> None:
+    request = replace(
+        _request(),
+        intraday_start=datetime(2030, 1, 2, 10, 5, tzinfo=UTC),
+        intraday_end=datetime(2030, 1, 2, 10, 35, tzinfo=UTC),
+    )
+
+    with pytest.raises(ValueError, match="session grid"):
+        _provider(seed=17).get_intraday_bars(request)
+
+
+def test_no_session_intraday_request_marks_snapshot_quality_as_market_closed() -> None:
+    closed_date = date(2030, 1, 3)
+    request = replace(
+        _request(),
+        intraday_start=datetime(2030, 1, 3, 10, 0, tzinfo=UTC),
+        intraday_end=datetime(2030, 1, 3, 11, 0, tzinfo=UTC),
+        daily_start=closed_date,
+        daily_end=closed_date + timedelta(days=1),
+    )
+
+    market_snapshot = _provider(seed=17).get_intraday_bars(request)
+
+    assert market_snapshot.intraday_bars == ()
+    assert market_snapshot.quality.anomalies == ("market_closed",)
+    assert not market_snapshot.quality.is_actionable
+
+
+def test_lunch_break_intraday_request_marks_all_snapshot_paths_as_market_closed() -> None:
+    request = replace(
+        _request(),
+        intraday_start=datetime(2030, 1, 2, 11, 15, tzinfo=UTC),
+        intraday_end=datetime(2030, 1, 2, 11, 45, tzinfo=UTC),
+    )
+    provider = _provider(seed=17)
+
+    intraday_snapshot = provider.get_intraday_bars(request)
+    complete_snapshot = provider.get_market_snapshot(request)
+
+    assert intraday_snapshot.intraday_bars == ()
+    assert intraday_snapshot.quality.anomalies == ("market_closed",)
+    assert not intraday_snapshot.is_actionable
+    assert complete_snapshot.intraday_bars == ()
+    assert complete_snapshot.quality.anomalies == ("market_closed",)
+    assert not complete_snapshot.is_actionable
+
+
+def test_no_session_daily_request_marks_snapshot_quality_as_market_closed() -> None:
+    closed_date = date(2030, 1, 3)
+    request = replace(
+        _request(),
+        daily_start=closed_date,
+        daily_end=closed_date + timedelta(days=1),
+    )
+
+    market_snapshot = _provider(seed=17).get_daily_bars(request)
+
+    assert market_snapshot.daily_bars == ()
+    assert market_snapshot.quality.anomalies == ("market_closed",)
+    assert not market_snapshot.quality.is_actionable
 
 
 def test_data_quality_uses_elapsed_utc_time_across_a_dst_fall_back() -> None:

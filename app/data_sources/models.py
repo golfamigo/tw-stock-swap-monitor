@@ -83,7 +83,11 @@ class MarketDataRequest:
             raise ValueError("daily_end must be after daily_start")
         if self.maximum_data_delay < timedelta():
             raise ValueError("maximum_data_delay must not be negative")
-        object.__setattr__(self, "instruments", instruments)
+        object.__setattr__(
+            self,
+            "instruments",
+            tuple(sorted(instruments, key=lambda instrument: str(instrument.instrument_id))),
+        )
 
     def canonical_payload(self) -> dict[str, object]:
         """Return every request input used to distinguish immutable snapshot evidence."""
@@ -247,9 +251,9 @@ class MarketDataSnapshot:
             raise ValueError("provider must not be blank")
         if self.quality.provider != self.provider:
             raise ValueError("quality provider must match snapshot provider")
-        quotes = tuple(self.quotes)
-        intraday_bars = tuple(self.intraday_bars)
-        daily_bars = tuple(self.daily_bars)
+        quotes = _normalize_quotes(tuple(self.quotes))
+        intraday_bars = _normalize_bars(tuple(self.intraday_bars), collection_name="intraday_bars")
+        daily_bars = _normalize_bars(tuple(self.daily_bars), collection_name="daily_bars")
         requested_ids = {instrument.instrument_id for instrument in self.request.instruments}
         for collection_name, observations in (
             ("quotes", quotes),
@@ -302,6 +306,47 @@ def _instrument_payload(instrument: Instrument) -> dict[str, str]:
         "market": instrument.market,
         "symbol": instrument.symbol,
     }
+
+
+def _normalize_quotes(quotes: tuple[Quote, ...]) -> tuple[Quote, ...]:
+    """Reject duplicate quote identities and sort equivalent evidence deterministically."""
+
+    ordered = tuple(sorted(quotes, key=_quote_identity))
+    _reject_duplicate_identities(
+        tuple(_quote_identity(quote) for quote in ordered), collection_name="quote"
+    )
+    return ordered
+
+
+def _normalize_bars(bars: tuple[Bar, ...], *, collection_name: str) -> tuple[Bar, ...]:
+    """Reject duplicate bar identities and sort one snapshot collection deterministically."""
+
+    ordered = tuple(sorted(bars, key=_bar_identity))
+    _reject_duplicate_identities(
+        tuple(_bar_identity(bar) for bar in ordered), collection_name=collection_name
+    )
+    return ordered
+
+
+def _quote_identity(quote: Quote) -> tuple[str, str]:
+    return (str(quote.instrument_id), canonical_datetime(quote.as_of))
+
+
+def _bar_identity(bar: Bar) -> tuple[str, str, str]:
+    return (
+        str(bar.instrument_id),
+        canonical_datetime(bar.starts_at),
+        canonical_datetime(bar.ends_at),
+    )
+
+
+def _reject_duplicate_identities(
+    identities: tuple[tuple[str, ...], ...], *, collection_name: str
+) -> None:
+    if any(
+        current == previous for previous, current in zip(identities, identities[1:], strict=False)
+    ):
+        raise ValueError(f"duplicate {collection_name} identity")
 
 
 def _normalized_labels(values: tuple[str, ...], *, field_name: str) -> tuple[str, ...]:

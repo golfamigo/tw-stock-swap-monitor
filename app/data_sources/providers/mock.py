@@ -42,35 +42,36 @@ class MockMarketDataProvider:
     def get_intraday_bars(self, request: MarketDataRequest) -> MarketDataSnapshot:
         """Return calendar-bounded bars using left-closed, right-open input semantics."""
 
-        intraday_bars, saw_holiday = self._intraday_bars(request)
+        intraday_bars, saw_closed_market = self._intraday_bars(request)
         return self._snapshot(
             request,
             intraday_bars=intraday_bars,
-            market_closed=not intraday_bars and saw_holiday,
+            market_closed=not intraday_bars and saw_closed_market,
         )
 
     def get_daily_bars(self, request: MarketDataRequest) -> MarketDataSnapshot:
         """Return one daily OHLCV bar for each configured open market date."""
 
-        daily_bars, saw_holiday = self._daily_bars(request)
+        daily_bars, saw_closed_market = self._daily_bars(request)
         return self._snapshot(
             request,
             daily_bars=daily_bars,
-            market_closed=not daily_bars and saw_holiday,
+            market_closed=not daily_bars and saw_closed_market,
         )
 
     def get_market_snapshot(self, request: MarketDataRequest) -> MarketDataSnapshot:
         """Return all deterministic evidence types for one complete request."""
 
-        intraday_bars, intraday_saw_holiday = self._intraday_bars(request)
-        daily_bars, daily_saw_holiday = self._daily_bars(request)
+        intraday_bars, intraday_saw_closed_market = self._intraday_bars(request)
+        daily_bars, daily_saw_closed_market = self._daily_bars(request)
         return self._snapshot(
             request,
             quotes=self._quotes(request),
             intraday_bars=intraday_bars,
             daily_bars=daily_bars,
             market_closed=(
-                not intraday_bars and not daily_bars and (intraday_saw_holiday or daily_saw_holiday)
+                (not intraday_bars and intraday_saw_closed_market)
+                or (not daily_bars and daily_saw_closed_market)
             ),
         )
 
@@ -118,47 +119,66 @@ class MockMarketDataProvider:
 
     def _intraday_bars(self, request: MarketDataRequest) -> tuple[tuple[Bar, ...], bool]:
         bars: list[Bar] = []
-        saw_holiday = False
+        saw_closed_market = False
         for instrument in request.instruments:
+            has_effective_session_overlap = False
             timezone = self.calendar.market_timezone(instrument.market)
             session_date = request.intraday_start.astimezone(timezone).date()
             final_date = request.intraday_end.astimezone(timezone).date()
             while session_date <= final_date:
                 if self.calendar.is_holiday(instrument.market, session_date):
-                    saw_holiday = True
+                    saw_closed_market = True
                     session_date += timedelta(days=1)
                     continue
-                for session in self.calendar.sessions_for(instrument.market, session_date):
+                sessions = self.calendar.sessions_for(instrument.market, session_date)
+                if not sessions:
+                    saw_closed_market = True
+                    session_date += timedelta(days=1)
+                    continue
+                for session in sessions:
                     bar_start = max(session.opens_at, request.intraday_start)
                     bar_limit = min(session.closes_at, request.intraday_end)
+                    if bar_start >= bar_limit:
+                        continue
+                    has_effective_session_overlap = True
+                    _require_session_grid_alignment(
+                        session.opens_at,
+                        bar_start,
+                        bar_limit,
+                        request.intraday_interval,
+                    )
                     while bar_start < bar_limit:
-                        bar_end = min(bar_start + request.intraday_interval, bar_limit)
+                        bar_end = bar_start + request.intraday_interval
                         bars.append(self._bar(instrument, "intraday", bar_start, bar_end))
                         bar_start = bar_end
                 session_date += timedelta(days=1)
-        return tuple(bars), saw_holiday
+            if not has_effective_session_overlap:
+                saw_closed_market = True
+        return tuple(bars), saw_closed_market
 
     def _daily_bars(self, request: MarketDataRequest) -> tuple[tuple[Bar, ...], bool]:
         bars: list[Bar] = []
-        saw_holiday = False
+        saw_closed_market = False
         session_date = request.daily_start
         while session_date < request.daily_end:
             for instrument in request.instruments:
                 if self.calendar.is_holiday(instrument.market, session_date):
-                    saw_holiday = True
+                    saw_closed_market = True
                     continue
                 sessions = self.calendar.sessions_for(instrument.market, session_date)
-                if sessions:
-                    bars.append(
-                        self._bar(
-                            instrument,
-                            "daily",
-                            sessions[0].opens_at,
-                            sessions[-1].closes_at,
-                        )
+                if not sessions:
+                    saw_closed_market = True
+                    continue
+                bars.append(
+                    self._bar(
+                        instrument,
+                        "daily",
+                        sessions[0].opens_at,
+                        sessions[-1].closes_at,
                     )
+                )
             session_date += timedelta(days=1)
-        return tuple(bars), saw_holiday
+        return tuple(bars), saw_closed_market
 
     def _bar(
         self, instrument: Instrument, kind: str, starts_at: datetime, ends_at: datetime
@@ -213,3 +233,15 @@ def _nonnegative_seed(seed: int) -> int:
     """Injectively encode signed Python integers so distinct seeds change every price."""
 
     return seed * 2 if seed >= 0 else -seed * 2 - 1
+
+
+def _require_session_grid_alignment(
+    session_open: datetime,
+    effective_start: datetime,
+    effective_end: datetime,
+    interval: timedelta,
+) -> None:
+    """Reject request edges that would force a short, non-grid source bar."""
+
+    if (effective_start - session_open) % interval or (effective_end - session_open) % interval:
+        raise ValueError("intraday request edges must align to the session grid")

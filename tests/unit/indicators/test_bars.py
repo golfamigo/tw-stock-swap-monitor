@@ -42,6 +42,8 @@ def test_aggregates_three_minute_left_closed_right_open_windows() -> None:
             volume=Decimal("5"),
         ),
         bar(session_date, 9, 3, open_price=Decimal("20"), close=Decimal("21"), volume=Decimal("7")),
+        bar(session_date, 9, 4, open_price=Decimal("21"), close=Decimal("22"), volume=Decimal("8")),
+        bar(session_date, 9, 5, open_price=Decimal("22"), close=Decimal("23"), volume=Decimal("9")),
     )
 
     aggregated = aggregate_bars(
@@ -68,7 +70,10 @@ def test_aggregates_fifteen_minute_windows_from_each_session_open() -> None:
             bar(session_date, 9, minute, duration=timedelta(minutes=3))
             for minute in range(0, 15, 3)
         ),
-        bar(session_date, 9, 15, duration=timedelta(minutes=3), volume=Decimal("2")),
+        *(
+            bar(session_date, 9, minute, duration=timedelta(minutes=3))
+            for minute in range(15, 30, 3)
+        ),
     )
 
     aggregated = aggregate_bars(
@@ -77,7 +82,7 @@ def test_aggregates_fifteen_minute_windows_from_each_session_open() -> None:
 
     assert [(item.starts_at, item.ends_at, item.volume) for item in aggregated] == [
         (at(session_date, 9, 0), at(session_date, 9, 15), Decimal("5")),
-        (at(session_date, 9, 15), at(session_date, 9, 30), Decimal("2")),
+        (at(session_date, 9, 15), at(session_date, 9, 30), Decimal("5")),
     ]
 
 
@@ -85,8 +90,15 @@ def test_resets_alignment_for_each_session_and_never_bridges_lunch_break() -> No
     session_date = date(2030, 1, 2)
     calendar = FixtureCalendar()
     source = (
+        *(
+            bar(session_date, 10, minute, duration=timedelta(minutes=3))
+            for minute in range(45, 57, 3)
+        ),
         bar(session_date, 10, 57, duration=timedelta(minutes=3), volume=Decimal("4")),
-        bar(session_date, 13, 0, duration=timedelta(minutes=3), volume=Decimal("6")),
+        *(
+            bar(session_date, 13, minute, duration=timedelta(minutes=3))
+            for minute in range(0, 15, 3)
+        ),
     )
 
     aggregated = aggregate_bars(
@@ -94,24 +106,27 @@ def test_resets_alignment_for_each_session_and_never_bridges_lunch_break() -> No
     )
 
     assert [(item.starts_at, item.ends_at, item.volume) for item in aggregated] == [
-        (at(session_date, 10, 45), at(session_date, 11, 0), Decimal("4")),
-        (at(session_date, 13, 0), at(session_date, 13, 15), Decimal("6")),
+        (at(session_date, 10, 45), at(session_date, 11, 0), Decimal("8")),
+        (at(session_date, 13, 0), at(session_date, 13, 15), Decimal("5")),
     ]
 
 
-def test_returns_observed_final_partial_interval_closed_at_session_close() -> None:
+def test_returns_fully_covered_final_partial_interval_closed_at_session_close() -> None:
     session_date = date(2030, 1, 2)
     calendar = FixtureCalendar(sessions=((9, 0, 9, 32),))
 
     aggregated = aggregate_bars(
-        (bar(session_date, 9, 30, duration=timedelta(minutes=1), volume=Decimal("8")),),
+        (
+            bar(session_date, 9, 30, duration=timedelta(minutes=1), volume=Decimal("8")),
+            bar(session_date, 9, 31, duration=timedelta(minutes=1), volume=Decimal("9")),
+        ),
         calendar=calendar,
         market=MARKET,
         width=timedelta(minutes=15),
     )
 
     assert [(item.starts_at, item.ends_at, item.volume) for item in aggregated] == [
-        (at(session_date, 9, 30), at(session_date, 9, 32), Decimal("8"))
+        (at(session_date, 9, 30), at(session_date, 9, 32), Decimal("17"))
     ]
 
 
@@ -173,8 +188,10 @@ def test_aggregation_keeps_instruments_separate_within_the_same_window() -> None
         (
             bar(session_date, 9, 0, instrument_id=INSTRUMENT_A, volume=Decimal("2")),
             bar(session_date, 9, 1, instrument_id=INSTRUMENT_A, volume=Decimal("3")),
+            bar(session_date, 9, 2, instrument_id=INSTRUMENT_A, volume=Decimal("4")),
             bar(session_date, 9, 0, instrument_id=INSTRUMENT_B, volume=Decimal("5")),
             bar(session_date, 9, 1, instrument_id=INSTRUMENT_B, volume=Decimal("7")),
+            bar(session_date, 9, 2, instrument_id=INSTRUMENT_B, volume=Decimal("8")),
         ),
         calendar=FixtureCalendar(),
         market=MARKET,
@@ -182,8 +199,8 @@ def test_aggregation_keeps_instruments_separate_within_the_same_window() -> None
     )
 
     assert {(item.instrument_id, item.volume) for item in aggregated} == {
-        (INSTRUMENT_A, Decimal("5")),
-        (INSTRUMENT_B, Decimal("12")),
+        (INSTRUMENT_A, Decimal("9")),
+        (INSTRUMENT_B, Decimal("20")),
     }
 
 
@@ -209,3 +226,23 @@ def test_rejects_mixed_aware_timezones_at_the_aggregation_boundary() -> None:
             market=MARKET,
             width=timedelta(minutes=3),
         )
+
+
+@pytest.mark.parametrize(
+    "source_minutes",
+    ((1, 2), (0, 1), (0, 2)),
+    ids=("leading-gap", "trailing-gap", "interior-gap"),
+)
+def test_drops_aggregate_windows_without_continuous_source_coverage(
+    source_minutes: tuple[int, int],
+) -> None:
+    session_date = date(2030, 1, 2)
+
+    aggregated = aggregate_bars(
+        tuple(bar(session_date, 9, minute) for minute in source_minutes),
+        calendar=FixtureCalendar(),
+        market=MARKET,
+        width=timedelta(minutes=3),
+    )
+
+    assert aggregated == ()

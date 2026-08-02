@@ -1,6 +1,7 @@
 """Session-reset VWAP plugin with Decimal-only strategy-boundary values."""
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, localcontext
 from uuid import UUID
 
@@ -10,6 +11,7 @@ from app.indicators.bars import (
     BarAggregationInputError,
     SessionLocation,
     locate_market_session,
+    requested_session_locations,
     validate_bars_for_calendar,
 )
 from app.indicators.base import DECIMAL_CONTEXT, IndicatorResult, canonical_decimal
@@ -52,6 +54,33 @@ class SessionVwapIndicator:
             validated_bars = validate_bars_for_calendar(
                 scoped_bars, calendar=self.calendar, market=self.market
             )
+            located = tuple(
+                (bar, locate_market_session(bar, calendar=self.calendar, market=self.market))
+                for bar in validated_bars
+            )
+            requested_locations = requested_session_locations(
+                calendar=self.calendar,
+                market=self.market,
+                intraday_start=market_snapshot.request.intraday_start,
+                intraday_end=market_snapshot.request.intraday_end,
+            )
+            if not requested_locations:
+                return IndicatorResult.unavailable(
+                    key=self.key,
+                    reason="requested_range_outside_sessions",
+                    evidence={"snapshot_id": market_snapshot.snapshot_id},
+                )
+            latest_bar, _ = max(located, key=lambda item: item[0].starts_at)
+            latest_location = requested_locations[-1]
+            active_bars = tuple(
+                bar
+                for bar, location in located
+                if location.session_date == latest_location.session_date
+                and location.segment == latest_location.segment
+            )
+            trailing_coverage = _validate_active_session_coverage(
+                active_bars, latest_location, market_snapshot
+            )
         except BarAggregationInputError as error:
             return IndicatorResult.unavailable(
                 key=self.key,
@@ -62,22 +91,20 @@ class SessionVwapIndicator:
                     "validation_error": str(error),
                 },
             )
-
-        located = tuple(
-            (bar, locate_market_session(bar, calendar=self.calendar, market=self.market))
-            for bar in validated_bars
-        )
-        latest_bar, latest_location = max(located, key=lambda item: item[0].starts_at)
-        active_bars = tuple(
-            bar
-            for bar, location in located
-            if location.session_date == latest_location.session_date
-            and location.segment == latest_location.segment
-        )
         total_volume = sum((bar.volume for bar in active_bars), Decimal("0"))
         evidence = _session_evidence(latest_location)
         evidence["observed_bars"] = str(len(active_bars))
         evidence["latest_bar_start"] = latest_bar.starts_at.isoformat()
+        if trailing_coverage is not None:
+            covered_end, required_end = trailing_coverage
+            evidence["coverage_gap"] = "trailing"
+            evidence["covered_end"] = covered_end.isoformat()
+            evidence["required_end"] = required_end.isoformat()
+            return IndicatorResult.unavailable(
+                key=self.key,
+                reason="incomplete_source_coverage",
+                evidence=evidence,
+            )
         if total_volume.is_zero():
             return IndicatorResult.unavailable(
                 key=self.key,
@@ -95,6 +122,37 @@ class SessionVwapIndicator:
 def _weighted_typical_price(bar: Bar) -> Decimal:
     typical_price = (bar.high + bar.low + bar.close) / Decimal("3")
     return typical_price * bar.volume
+
+
+def _validate_active_session_coverage(
+    active_bars: tuple[Bar, ...], location: SessionLocation, market_snapshot: MarketDataSnapshot
+) -> tuple[datetime, datetime] | None:
+    """Require active bars to cover the complete requested interval in their session."""
+
+    session_timezone = location.session.opens_at.tzinfo
+    required_start = max(
+        location.session.opens_at,
+        market_snapshot.request.intraday_start.astimezone(session_timezone),
+    )
+    required_end = min(
+        location.session.closes_at,
+        market_snapshot.request.intraday_end.astimezone(session_timezone),
+    )
+    if required_end <= required_start:
+        raise BarAggregationInputError("active session falls outside the requested range")
+
+    expected_start = required_start
+    for bar in sorted(active_bars, key=lambda item: item.starts_at):
+        local_start = bar.starts_at.astimezone(session_timezone)
+        local_end = bar.ends_at.astimezone(session_timezone)
+        if local_start != expected_start:
+            raise BarAggregationInputError("active session bars have incomplete coverage")
+        if local_end > required_end:
+            raise BarAggregationInputError("active session bars exceed the requested range")
+        expected_start = local_end
+    if expected_start != required_end:
+        return (expected_start, required_end)
+    return None
 
 
 def _session_evidence(location: SessionLocation) -> dict[str, str]:

@@ -9,9 +9,12 @@ from app.calendar.base import TradingCalendarProvider
 from app.data_sources.models import Bar, MarketDataSnapshot
 from app.indicators.bars import (
     BarAggregationInputError,
+    RequestedCoverageGap,
     SessionLocation,
     aggregate_bars,
     locate_market_session,
+    requested_range_coverage_gap,
+    requested_session_locations,
 )
 from app.indicators.base import (
     IndicatorInputError,
@@ -55,13 +58,36 @@ class SameTimeVolumeRatioIndicator:
                 reason="snapshot_not_actionable",
                 evidence={"snapshot_id": market_snapshot.snapshot_id},
             )
+        current_source_bars = tuple(
+            bar for bar in market_snapshot.intraday_bars if bar.instrument_id == self.instrument_id
+        )
         try:
+            requested_locations = requested_session_locations(
+                calendar=self.calendar,
+                market=self.market,
+                intraday_start=market_snapshot.request.intraday_start,
+                intraday_end=market_snapshot.request.intraday_end,
+            )
+            if not requested_locations:
+                return IndicatorResult.unavailable(
+                    key=self.key,
+                    reason="current_request_market_closed",
+                    evidence=_no_effective_session_evidence(
+                        instrument_id=self.instrument_id,
+                        snapshot_id=market_snapshot.snapshot_id,
+                        request=market_snapshot,
+                        status_key="current_market_status",
+                    ),
+                )
+            current_coverage_gap = requested_range_coverage_gap(
+                current_source_bars,
+                calendar=self.calendar,
+                market=self.market,
+                intraday_start=market_snapshot.request.intraday_start,
+                intraday_end=market_snapshot.request.intraday_end,
+            )
             current_bars = aggregate_bars(
-                tuple(
-                    bar
-                    for bar in market_snapshot.intraday_bars
-                    if bar.instrument_id == self.instrument_id
-                ),
+                current_source_bars,
                 calendar=self.calendar,
                 market=self.market,
                 width=self.bar_width,
@@ -76,16 +102,65 @@ class SameTimeVolumeRatioIndicator:
                     "validation_error": str(error),
                 },
             )
+        if current_coverage_gap is not None:
+            return IndicatorResult.unavailable(
+                key=self.key,
+                reason="incomplete_current_source_coverage",
+                evidence=_coverage_evidence(
+                    current_coverage_gap,
+                    instrument_id=self.instrument_id,
+                    snapshot_id=market_snapshot.snapshot_id,
+                ),
+            )
         if not current_bars:
             return IndicatorResult.unavailable(
                 key=self.key,
                 reason="missing_current_bar",
                 evidence={"instrument_id": str(self.instrument_id)},
             )
-        current_bar = max(current_bars, key=lambda bar: bar.starts_at)
-        current_location = locate_market_session(
-            current_bar, calendar=self.calendar, market=self.market
+        current_location = requested_locations[-1]
+        required_current_end = min(
+            current_location.session.closes_at,
+            market_snapshot.request.intraday_end.astimezone(
+                current_location.session.closes_at.tzinfo
+            ),
         )
+        located_current_bars = tuple(
+            (bar, locate_market_session(bar, calendar=self.calendar, market=self.market))
+            for bar in current_bars
+        )
+        target_current_bars = tuple(
+            bar
+            for bar, location in located_current_bars
+            if location.session_date == current_location.session_date
+            and location.segment == current_location.segment
+        )
+        current_bar = next(
+            (
+                bar
+                for bar in target_current_bars
+                if bar.ends_at.astimezone(current_location.session.closes_at.tzinfo)
+                == required_current_end
+            ),
+            None,
+        )
+        if current_bar is None:
+            latest_complete_end = max(
+                (bar.ends_at for bar in target_current_bars),
+                default=current_location.session.opens_at,
+            )
+            return IndicatorResult.unavailable(
+                key=self.key,
+                reason="incomplete_current_source_coverage",
+                evidence={
+                    "instrument_id": str(self.instrument_id),
+                    "latest_complete_end": latest_complete_end.isoformat(),
+                    "required_end": required_current_end.isoformat(),
+                    "session_date": current_location.session_date.isoformat(),
+                    "session_segment": str(current_location.segment),
+                    "snapshot_id": market_snapshot.snapshot_id,
+                },
+            )
         expected_dates = _previous_trading_dates(
             calendar=self.calendar,
             market=self.market,
@@ -133,6 +208,49 @@ class SameTimeVolumeRatioIndicator:
                 mismatched_dates.append(historical_date)
                 continue
             try:
+                historical_requested_locations = requested_session_locations(
+                    calendar=self.calendar,
+                    market=self.market,
+                    intraday_start=historical_snapshot.request.intraday_start,
+                    intraday_end=historical_snapshot.request.intraday_end,
+                )
+                if not historical_requested_locations:
+                    evidence = _no_effective_session_evidence(
+                        instrument_id=self.instrument_id,
+                        snapshot_id=historical_snapshot.snapshot_id,
+                        request=historical_snapshot,
+                        status_key="history_market_status",
+                    )
+                    evidence["ineligible_history_session_dates"] = historical_date.isoformat()
+                    return IndicatorResult.unavailable(
+                        key=self.key,
+                        reason="history_request_market_closed",
+                        evidence=evidence,
+                    )
+                historical_coverage_gap = requested_range_coverage_gap(
+                    tuple(
+                        bar
+                        for bar in historical_snapshot.intraday_bars
+                        if bar.instrument_id == self.instrument_id
+                    ),
+                    calendar=self.calendar,
+                    market=self.market,
+                    intraday_start=historical_snapshot.request.intraday_start,
+                    intraday_end=historical_snapshot.request.intraday_end,
+                )
+                if historical_coverage_gap is not None:
+                    evidence = _coverage_evidence(
+                        historical_coverage_gap,
+                        instrument_id=self.instrument_id,
+                        snapshot_id=historical_snapshot.snapshot_id,
+                    )
+                    evidence["incomplete_history_session_dates"] = historical_date.isoformat()
+                    evidence["history_coverage_gap"] = historical_coverage_gap.kind
+                    return IndicatorResult.unavailable(
+                        key=self.key,
+                        reason="incomplete_history_source_coverage",
+                        evidence=evidence,
+                    )
                 reference_bar, interval_mismatch = _matching_reference_bar(
                     historical_snapshot,
                     calendar=self.calendar,
@@ -348,6 +466,41 @@ def _evidence(
         "session_date": location.session_date.isoformat(),
         "session_offset": canonical_timedelta_microseconds(total_microseconds),
         "session_segment": str(location.segment),
+    }
+
+
+def _coverage_evidence(
+    gap: RequestedCoverageGap, *, instrument_id: UUID, snapshot_id: str
+) -> dict[str, str]:
+    """Serialize calendar-aware source coverage evidence for unavailable results."""
+
+    return {
+        "instrument_id": str(instrument_id),
+        "coverage_gap": gap.kind,
+        "covered_end": gap.covered_end.isoformat(),
+        "required_start": gap.required_start.isoformat(),
+        "required_end": gap.required_end.isoformat(),
+        "session_date": gap.location.session_date.isoformat(),
+        "session_segment": str(gap.location.segment),
+        "snapshot_id": snapshot_id,
+    }
+
+
+def _no_effective_session_evidence(
+    *,
+    instrument_id: UUID,
+    snapshot_id: str,
+    request: MarketDataSnapshot,
+    status_key: str,
+) -> dict[str, str]:
+    """Record that a snapshot request overlaps no configured market session."""
+
+    return {
+        "instrument_id": str(instrument_id),
+        status_key: "no_effective_session",
+        "requested_start": request.request.intraday_start.isoformat(),
+        "requested_end": request.request.intraday_end.isoformat(),
+        "snapshot_id": snapshot_id,
     }
 
 

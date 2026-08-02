@@ -110,6 +110,18 @@ def snapshot(
     """Build complete snapshot evidence for one generic instrument and date."""
 
     requested_at = at(session_date, 15, 0)
+    observed_ends = tuple(
+        bar.ends_at
+        for bar in intraday_bars
+        if bar.starts_at.astimezone(TIMEZONE).date() == session_date
+    )
+    observed_starts = tuple(
+        bar.starts_at
+        for bar in intraday_bars
+        if bar.starts_at.astimezone(TIMEZONE).date() == session_date
+    )
+    intraday_start = min(observed_starts) if observed_starts else at(session_date, 9, 0)
+    intraday_end = max(observed_ends) if observed_ends else at(session_date, 14, 0)
     instrument = Instrument(
         instrument_id=INSTRUMENT_A,
         market=MARKET,
@@ -120,8 +132,8 @@ def snapshot(
         request_id=UUID("00000000-0000-0000-0000-000000000603"),
         instruments=(instrument,),
         requested_at=requested_at,
-        intraday_start=at(session_date, 9, 0),
-        intraday_end=at(session_date, 14, 0),
+        intraday_start=intraday_start,
+        intraday_end=intraday_end,
         intraday_interval=timedelta(minutes=1),
         daily_start=session_date,
         daily_end=session_date + timedelta(days=1),
