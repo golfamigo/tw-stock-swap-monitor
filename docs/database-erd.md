@@ -35,7 +35,7 @@ Users, portfolios, positions, candidate groups, plans, decisions, notifications,
 
 ## Important constraints
 
-- instruments has a unique market_id and symbol pair.
+- instruments has a unique market and symbol pair.
 - positions permits closed-position history. It has a partial unique index on portfolio_id and instrument_id only where status is OPEN, so at most one current open representation exists while any number of CLOSED historical rows remain valid.
 - rotation_plan_candidate_groups is an association table with a unique rotation_plan_id/candidate_group_id pair; it represents the required one-to-many plan attachment without placing a single candidate_group_id on rotation_plans.
 - rotation-plan source and protected association tables have a unique plan/position pair and reject a pair appearing in both roles.

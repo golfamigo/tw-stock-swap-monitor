@@ -11,9 +11,11 @@ from sqlalchemy import engine_from_config, pool
 
 config = context.config
 
+database_url = os.environ.get("DATABASE_URL")
 postgres_test_database_url = os.environ.get("POSTGRES_TEST_DATABASE_URL")
-if postgres_test_database_url is not None:
-    config.set_main_option("sqlalchemy.url", postgres_test_database_url)
+configured_database_url = postgres_test_database_url or database_url
+if configured_database_url is not None:
+    config.set_main_option("sqlalchemy.url", configured_database_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

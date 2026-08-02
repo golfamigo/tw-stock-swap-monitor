@@ -10,7 +10,14 @@ from app.application.configuration import (
     ConfigurationLayer,
     restore_resolved_configuration_snapshot,
 )
-from app.domain.entities import LogicalScanRun, Position, RotationPlan, ScanAttempt, StrategyRun
+from app.domain.entities import (
+    Instrument,
+    LogicalScanRun,
+    Position,
+    RotationPlan,
+    ScanAttempt,
+    StrategyRun,
+)
 from app.domain.enums import (
     LogicalScanStatus,
     PositionRole,
@@ -27,6 +34,7 @@ from app.persistence.evidence import decode_evidence, encode_evidence
 from app.persistence.models import (
     ConfigurationLayerModel,
     ConfigurationSnapshotModel,
+    InstrumentModel,
     LogicalScanRunModel,
     PositionModel,
     RotationPlanModel,
@@ -48,6 +56,28 @@ def _restore_datetime(value: datetime) -> datetime:
     """Restore UTC awareness for dialects such as SQLite that discard tzinfo."""
 
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def instrument_to_model(instrument: Instrument) -> InstrumentModel:
+    """Project a global, market-qualified domain instrument into storage."""
+
+    return InstrumentModel(
+        instrument_id=instrument.instrument_id,
+        market=instrument.market,
+        symbol=instrument.symbol,
+        created_at=_persist_datetime(instrument.created_at),
+    )
+
+
+def instrument_from_model(model: InstrumentModel) -> Instrument:
+    """Restore a validated global instrument from its persistence projection."""
+
+    return Instrument(
+        instrument_id=model.instrument_id,
+        market=model.market,
+        symbol=model.symbol,
+        created_at=_restore_datetime(model.created_at),
+    )
 
 
 def position_to_model(position: Position) -> PositionModel:
@@ -299,6 +329,9 @@ def logical_scan_to_model(scan: LogicalScanRun) -> LogicalScanRunModel:
         market_session_date=scan.market_session_date,
         scan_window_start=_persist_datetime(scan.scan_window_start),
         scan_interval=scan.scan_interval,
+        market_timezone=scan.market_timezone,
+        configuration_snapshot_hash=scan.configuration_snapshot_hash,
+        scan_identity_format_version=scan.scan_identity_format_version,
         scan_lock_key=scan.scan_lock_key,
         status=scan.status.value,
         completed_at=(
@@ -323,6 +356,9 @@ def logical_scan_from_model(
         market_session_date=model.market_session_date,
         scan_window_start=_restore_datetime(model.scan_window_start),
         scan_interval=model.scan_interval,
+        market_timezone=model.market_timezone,
+        configuration_snapshot_hash=model.configuration_snapshot_hash,
+        scan_identity_format_version=model.scan_identity_format_version,
         scan_lock_key=model.scan_lock_key,
         status=LogicalScanStatus(model.status),
         created_at=_restore_datetime(model.created_at),

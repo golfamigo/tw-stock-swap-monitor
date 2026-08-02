@@ -1,7 +1,7 @@
 """Regression contracts for the review-required canonical scan lock identity."""
 
 from datetime import UTC, datetime, timedelta, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from app.domain.entities import RotationPlan
@@ -75,3 +75,38 @@ def test_scan_lock_request_rejects_a_non_sha256_configuration_snapshot_hash() ->
             scan_window_start=datetime(2026, 8, 1, 1, tzinfo=UTC),
             configuration_snapshot_hash="untrusted",
         )
+
+
+def test_scan_lock_request_rejects_a_market_session_date_that_does_not_match_the_window() -> None:
+    with pytest.raises(ValueError, match="market_session_date"):
+        ScanLockRequest(
+            plan=_plan(),
+            market_session_date="2026-07-31",
+            scan_window_start=datetime(2026, 8, 1, 1, tzinfo=UTC),
+            scan_interval="PT3M",
+            market_timezone="Asia/Taipei",
+            configuration_snapshot_hash="a" * 64,
+        )
+
+
+def test_scan_lock_key_has_a_versioned_golden_vector() -> None:
+    plan = RotationPlan(
+        rotation_plan_id=UUID("12345678-1234-5678-1234-567812345678"),
+        portfolio_id=uuid4(),
+        candidate_group_ids=(uuid4(),),
+        source_position_ids=(),
+        protected_position_ids=(),
+        created_at=datetime(2026, 8, 1, 1, tzinfo=UTC),
+    )
+
+    request = ScanLockRequest(
+        plan=plan,
+        market_session_date="2026-08-01",
+        scan_window_start=datetime(2026, 8, 1, 1, tzinfo=UTC),
+        scan_interval="PT3M",
+        market_timezone="Asia/Taipei",
+        configuration_snapshot_hash="a" * 64,
+    )
+
+    assert request.identity.format_version == "1"
+    assert request.key == "3b6c14de6e272e31c6aca2a5c1cfd3d9766f6fb92e8e57b14d54d7fb1e783c45"

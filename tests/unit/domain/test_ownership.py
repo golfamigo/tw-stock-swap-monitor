@@ -156,7 +156,9 @@ def test_domain_aggregates_expose_their_ownership_boundaries() -> None:
     )
     user = User(user_id=user_id, created_at=aware_at())
     portfolio = Portfolio(portfolio_id=portfolio_id, user_id=user_id, created_at=aware_at())
-    instrument = Instrument(instrument_id=instrument_id, symbol="TEST", created_at=aware_at())
+    instrument = Instrument(
+        instrument_id=instrument_id, market="TWSE", symbol="TEST", created_at=aware_at()
+    )
     position = Position(
         position_id=position_id,
         portfolio_id=portfolio_id,

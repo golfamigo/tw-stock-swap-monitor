@@ -33,8 +33,10 @@ def upgrade() -> None:
     op.create_table(
         "instruments",
         sa.Column("instrument_id", _uuid(), primary_key=True),
-        sa.Column("symbol", sa.String(length=64), nullable=False, unique=True),
+        sa.Column("market", sa.String(length=64), nullable=False),
+        sa.Column("symbol", sa.String(length=64), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.UniqueConstraint("market", "symbol", name="uq_instruments_market_symbol"),
     )
     op.create_table(
         "portfolios",
@@ -261,6 +263,9 @@ def upgrade() -> None:
         sa.Column("market_session_date", sa.String(length=10), nullable=False),
         sa.Column("scan_window_start", sa.DateTime(timezone=True), nullable=False),
         sa.Column("scan_interval", sa.String(length=32), nullable=False),
+        sa.Column("market_timezone", sa.String(length=64), nullable=False),
+        sa.Column("configuration_snapshot_hash", sa.String(length=64), nullable=False),
+        sa.Column("scan_identity_format_version", sa.String(length=16), nullable=False),
         sa.Column("scan_lock_key", sa.String(length=256), nullable=False, unique=True),
         sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
@@ -373,7 +378,8 @@ def upgrade() -> None:
             name="ck_scan_attempt_failure_evidence",
         ),
         sa.CheckConstraint(
-            "length(trigger_correlation_id) <= 256 AND length(actor_correlation_id) <= 256 "
+            "length(trigger_correlation_id) > 0 AND length(trigger_correlation_id) <= 256 "
+            "AND length(actor_correlation_id) > 0 AND length(actor_correlation_id) <= 256 "
             "AND (failure_code IS NULL OR length(failure_code) <= 64) "
             "AND (failure_detail IS NULL OR length(failure_detail) <= 1024)",
             name="ck_scan_attempt_evidence_bounds",

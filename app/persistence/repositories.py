@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, insert, or_, select
@@ -383,6 +383,9 @@ class SqlAlchemyLogicalScanRepository(_SqlAlchemyScopedRepository):
             market_session_date=request.market_session_date,
             scan_window_start=request.scan_window_start,
             scan_interval=request.scan_interval,
+            market_timezone=request.identity.market_timezone,
+            configuration_snapshot_hash=request.identity.configuration_snapshot_hash,
+            scan_identity_format_version=request.identity.format_version,
             scan_lock_key=request.key,
             status=LogicalScanStatus.RUNNING,
             created_at=created_at,
@@ -526,11 +529,23 @@ class SqlAlchemyLogicalScanRepository(_SqlAlchemyScopedRepository):
         access_context: AccessContext,
     ) -> LogicalScanRun:
         portfolio_id = self._plan_portfolio_id(model.rotation_plan_id)
+        stored_window_start = model.scan_window_start
+        if stored_window_start.tzinfo is None:
+            stored_window_start = stored_window_start.replace(tzinfo=UTC)
+        else:
+            stored_window_start = stored_window_start.astimezone(UTC)
         if (
             model.rotation_plan_id != request.plan.rotation_plan_id
             or portfolio_id != request.plan.portfolio_id
+            or model.market_session_date != request.identity.market_session_date.isoformat()
+            or stored_window_start != request.identity.scan_window_start
+            or model.scan_interval != request.identity.scan_interval
+            or model.market_timezone != request.identity.market_timezone
+            or model.configuration_snapshot_hash != request.identity.configuration_snapshot_hash
+            or model.scan_identity_format_version != request.identity.format_version
+            or model.scan_lock_key != request.key
         ):
-            raise ValueError("scan lock key resolves to a different rotation plan")
+            raise ValueError("scan lock key resolves to different scan identity components")
         self._require_portfolio_read(portfolio_id, access_context)
         return self._to_domain(model, portfolio_id=portfolio_id)
 

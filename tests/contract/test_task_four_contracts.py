@@ -6,7 +6,7 @@ import importlib
 import importlib.util
 import warnings
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum, IntEnum
 from pathlib import Path
@@ -46,6 +46,7 @@ from app.domain.values import (
     InstrumentRef,
     Ownership,
     Quantity,
+    ScanIdentity,
 )
 from app.repositories.configuration_layers import (
     ConfigurationLayerSelection,
@@ -78,6 +79,17 @@ EXPECTED_FOUNDATION_TABLES = frozenset(
         "strategy_runs",
     }
 )
+
+
+def _scan_identity(plan: RotationPlan) -> ScanIdentity:
+    return ScanIdentity(
+        rotation_plan_id=plan.rotation_plan_id,
+        market_session_date=date(2026, 8, 1),
+        scan_window_start=NOW,
+        scan_interval="PT3M",
+        configuration_snapshot_hash="a" * 64,
+        market_timezone="Asia/Taipei",
+    )
 
 
 class EvidenceStringEnum(str, Enum):
@@ -335,7 +347,7 @@ def test_position_repository_requires_access_context_and_hides_other_users() -> 
 def test_system_instrument_is_readable_but_not_mutable_by_an_ordinary_user() -> None:
     api = _api()
     user_id = uuid4()
-    instrument = Instrument(instrument_id=uuid4(), symbol="TEST", created_at=NOW)
+    instrument = Instrument(instrument_id=uuid4(), market="TWSE", symbol="TEST", created_at=NOW)
     repository = api["InMemoryInstrumentRepository"]()
     repository.add(instrument, access_context=_context(user_id, administrator=True))
 
@@ -743,6 +755,7 @@ def test_sql_rotation_plan_write_rejects_cross_user_groups_and_positions() -> No
                 ),
                 persistence_models.InstrumentModel(
                     instrument_id=instrument_id,
+                    market="TWSE",
                     symbol="CONTRACT",
                     created_at=NOW,
                 ),
@@ -1536,6 +1549,7 @@ def test_sql_strategy_run_rejects_linking_a_logical_scan_from_another_plan() -> 
         snapshot.resolved_snapshot.created_at,
     )
     foreign_scan_id = uuid4()
+    foreign_identity = _scan_identity(first_plan)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     persistence_models.Base.metadata.create_all(engine)
 
@@ -1567,10 +1581,13 @@ def test_sql_strategy_run_rejects_linking_a_logical_scan_from_another_plan() -> 
                 persistence_models.LogicalScanRunModel(
                     logical_scan_run_id=foreign_scan_id,
                     rotation_plan_id=first_plan.rotation_plan_id,
-                    market_session_date="2026-08-01",
+                    market_session_date=foreign_identity.market_session_date.isoformat(),
                     scan_window_start=NOW,
                     scan_interval="PT3M",
-                    scan_lock_key="foreign-plan-scan",
+                    market_timezone=foreign_identity.market_timezone,
+                    configuration_snapshot_hash=foreign_identity.configuration_snapshot_hash,
+                    scan_identity_format_version=foreign_identity.format_version,
+                    scan_lock_key=foreign_identity.key,
                     status="RUNNING",
                     completed_at=None,
                     created_at=NOW,
@@ -1737,6 +1754,7 @@ def test_logical_scan_allows_many_attempts_but_only_one_linked_final_strategy_ru
     first = _run(plan, configuration_snapshot=snapshot_ref)
     second = _run(plan, configuration_snapshot=snapshot_ref)
     scan_id = uuid4()
+    scan_identity = _scan_identity(plan)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     persistence_models.Base.metadata.create_all(engine)
 
@@ -1756,10 +1774,13 @@ def test_logical_scan_allows_many_attempts_but_only_one_linked_final_strategy_ru
                 persistence_models.LogicalScanRunModel(
                     logical_scan_run_id=scan_id,
                     rotation_plan_id=plan.rotation_plan_id,
-                    market_session_date="2026-08-01",
+                    market_session_date=scan_identity.market_session_date.isoformat(),
                     scan_window_start=NOW,
                     scan_interval="PT3M",
-                    scan_lock_key="scan-contract",
+                    market_timezone=scan_identity.market_timezone,
+                    configuration_snapshot_hash=scan_identity.configuration_snapshot_hash,
+                    scan_identity_format_version=scan_identity.format_version,
+                    scan_lock_key=scan_identity.key,
                     status="COMPLETED",
                     completed_at=NOW,
                     created_at=NOW,
@@ -1834,7 +1855,10 @@ def test_sql_position_integrity_errors_are_not_all_reclassified_as_open_duplicat
                     portfolio_id=portfolio.portfolio_id, user_id=owner_id, created_at=NOW
                 ),
                 persistence_models.InstrumentModel(
-                    instrument_id=instrument_id, symbol="INTEGRITY", created_at=NOW
+                    instrument_id=instrument_id,
+                    market="TWSE",
+                    symbol="INTEGRITY",
+                    created_at=NOW,
                 ),
                 persistence_mappers.position_to_model(existing),
             )
@@ -1870,7 +1894,10 @@ def test_sql_position_open_conflict_preserves_unrelated_outer_pending_work() -> 
                     portfolio_id=portfolio.portfolio_id, user_id=owner_id, created_at=NOW
                 ),
                 persistence_models.InstrumentModel(
-                    instrument_id=instrument_id, symbol="EXISTING", created_at=NOW
+                    instrument_id=instrument_id,
+                    market="TWSE",
+                    symbol="EXISTING",
+                    created_at=NOW,
                 ),
                 persistence_mappers.position_to_model(existing),
             )
@@ -1878,7 +1905,10 @@ def test_sql_position_open_conflict_preserves_unrelated_outer_pending_work() -> 
         session.commit()
         session.add(
             persistence_models.InstrumentModel(
-                instrument_id=outer_instrument_id, symbol="OUTER", created_at=NOW
+                instrument_id=outer_instrument_id,
+                market="TWSE",
+                symbol="OUTER",
+                created_at=NOW,
             )
         )
 
@@ -1952,7 +1982,10 @@ def test_sql_strategy_run_idempotency_conflict_preserves_outer_pending_work() ->
         outer_instrument_id = uuid4()
         stale_race_session.add(
             persistence_models.InstrumentModel(
-                instrument_id=outer_instrument_id, symbol="STRATEGY_OUTER", created_at=NOW
+                instrument_id=outer_instrument_id,
+                market="TWSE",
+                symbol="STRATEGY_OUTER",
+                created_at=NOW,
             )
         )
         strategy_run_identity_key = inspect(

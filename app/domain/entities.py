@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from types import MappingProxyType
@@ -18,6 +18,7 @@ from app.domain.enums import (
 )
 from app.domain.errors import (
     InvalidStrategyRunEvidenceError,
+    NonPositivePositionQuantityError,
     PositionHistoryError,
     PositionNotOpenError,
 )
@@ -26,6 +27,7 @@ from app.domain.values import (
     InstrumentRef,
     Ownership,
     Quantity,
+    ScanIdentity,
     require_finite_decimal,
     require_timezone_aware,
 )
@@ -116,11 +118,14 @@ class Instrument:
     """A global instrument definition, mutable only by an administrator."""
 
     instrument_id: UUID
+    market: str
     symbol: str
     created_at: datetime
 
     def __post_init__(self) -> None:
         require_timezone_aware(self.created_at, field_name="created_at")
+        if not self.market.strip():
+            raise ValueError("market must not be blank")
         if not self.symbol.strip():
             raise ValueError("symbol must not be blank")
 
@@ -144,6 +149,8 @@ class Position:
 
     def __post_init__(self) -> None:
         require_timezone_aware(self.opened_at, field_name="opened_at")
+        if self.quantity.value <= Decimal("0"):
+            raise NonPositivePositionQuantityError("position quantity must be positive")
         if not isinstance(self.role, PositionRole):
             raise ValueError("role must be a PositionRole")
         if not isinstance(self.status, PositionStatus):
@@ -264,6 +271,9 @@ class LogicalScanRun:
     market_session_date: str
     scan_window_start: datetime
     scan_interval: str
+    market_timezone: str
+    configuration_snapshot_hash: str
+    scan_identity_format_version: str
     scan_lock_key: str
     status: LogicalScanStatus
     created_at: datetime
@@ -277,6 +287,8 @@ class LogicalScanRun:
             raise ValueError("logical scan identity fields must not be blank")
         if not self.scan_lock_key.strip():
             raise ValueError("scan_lock_key must not be blank")
+        if self.scan_lock_key != self.identity.key:
+            raise ValueError("scan_lock_key must match the scan identity")
         if not isinstance(self.status, LogicalScanStatus):
             raise TypeError("status must be a LogicalScanStatus")
         if self.status is LogicalScanStatus.RUNNING:
@@ -288,6 +300,24 @@ class LogicalScanRun:
             require_timezone_aware(self.completed_at, field_name="completed_at")
             if self.completed_at < self.created_at:
                 raise ValueError("logical scan completed_at cannot be before created_at")
+
+    @property
+    def identity(self) -> ScanIdentity:
+        """Reconstruct the exact versioned lock identity retained for recovery and audit."""
+
+        try:
+            market_session_date = date.fromisoformat(self.market_session_date)
+        except ValueError as error:
+            raise ValueError("market_session_date must be an ISO date") from error
+        return ScanIdentity(
+            rotation_plan_id=self.rotation_plan_id,
+            market_session_date=market_session_date,
+            scan_window_start=self.scan_window_start,
+            scan_interval=self.scan_interval,
+            configuration_snapshot_hash=self.configuration_snapshot_hash,
+            market_timezone=self.market_timezone,
+            format_version=self.scan_identity_format_version,
+        )
 
 
 @dataclass(frozen=True, slots=True)

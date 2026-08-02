@@ -79,6 +79,7 @@ def _seed_portfolio(
             PortfolioModel(portfolio_id=portfolio_id, user_id=user_id, created_at=NOW),
             InstrumentModel(
                 instrument_id=instrument_id,
+                market="TWSE",
                 symbol=f"PG{instrument_id.hex[:20]}",
                 created_at=NOW,
             ),
@@ -137,6 +138,7 @@ def test_sqlite_partial_open_index_keeps_distinct_closed_history_and_outer_work(
         session.add(
             InstrumentModel(
                 instrument_id=outer_instrument_id,
+                market="TWSE",
                 symbol=f"PG{outer_instrument_id.hex[:20]}",
                 created_at=NOW,
             )
@@ -172,6 +174,7 @@ def test_postgres_partial_open_index_keeps_closed_history_and_outer_transaction(
         session.add(
             InstrumentModel(
                 instrument_id=outer_instrument_id,
+                market="TWSE",
                 symbol=f"PG{outer_instrument_id.hex[:20]}",
                 created_at=NOW,
             )

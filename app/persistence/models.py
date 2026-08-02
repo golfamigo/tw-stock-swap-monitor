@@ -141,9 +141,11 @@ class InstrumentModel(Base):
     """Globally readable instrument definition."""
 
     __tablename__ = "instruments"
+    __table_args__ = (UniqueConstraint("market", "symbol", name="uq_instruments_market_symbol"),)
 
     instrument_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
-    symbol: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    market: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
@@ -327,6 +329,9 @@ class LogicalScanRunModel(Base):
     market_session_date: Mapped[str] = mapped_column(String(10), nullable=False)
     scan_window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     scan_interval: Mapped[str] = mapped_column(String(32), nullable=False)
+    market_timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    configuration_snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    scan_identity_format_version: Mapped[str] = mapped_column(String(16), nullable=False)
     scan_lock_key: Mapped[str] = mapped_column(String(256), unique=True, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -377,7 +382,8 @@ class ScanAttemptModel(Base):
             name="ck_scan_attempt_failure_evidence",
         ),
         CheckConstraint(
-            "length(trigger_correlation_id) <= 256 AND length(actor_correlation_id) <= 256 "
+            "length(trigger_correlation_id) > 0 AND length(trigger_correlation_id) <= 256 "
+            "AND length(actor_correlation_id) > 0 AND length(actor_correlation_id) <= 256 "
             "AND (failure_code IS NULL OR length(failure_code) <= 64) "
             "AND (failure_detail IS NULL OR length(failure_detail) <= 1024)",
             name="ck_scan_attempt_evidence_bounds",

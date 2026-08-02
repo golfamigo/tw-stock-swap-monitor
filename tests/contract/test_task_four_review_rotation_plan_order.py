@@ -71,6 +71,7 @@ def test_sql_rotation_plan_round_trip_preserves_each_tuple_ordinal() -> None:
                 *(
                     InstrumentModel(
                         instrument_id=instrument_id,
+                        market="TWSE",
                         symbol=f"ORDER{instrument_id.int}",
                         created_at=NOW,
                     )

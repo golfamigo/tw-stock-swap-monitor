@@ -71,3 +71,38 @@ jobs:
           python -m alembic upgrade head
       - name: Run PostgreSQL persistence contracts
         run: python -m pytest tests/integration/test_postgresql_task_four_contracts.py
+
+  runtime-postgres-smoke:
+    name: Runtime PostgreSQL smoke / Python 3.12
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: tw_stock_swap_monitor_runtime
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tw_stock_swap_monitor_runtime"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/tw_stock_swap_monitor_runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install runtime distribution as the container does
+        run: python -m pip install .
+      - name: Apply migrations through the runtime database URL
+        run: python -m alembic upgrade head
+      - name: Connect to PostgreSQL through the installed runtime driver
+        run: >-
+          python -c "from sqlalchemy import create_engine, text; from os import environ;
+          engine = create_engine(environ['DATABASE_URL']);
+          assert engine.scalar(text('SELECT 1')) == 1"

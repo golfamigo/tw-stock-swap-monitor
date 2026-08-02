@@ -2,6 +2,7 @@ import json
 import subprocess
 import sys
 import textwrap
+import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -69,6 +70,15 @@ def test_wheel_install_resolves_application_from_its_own_site_packages(tmp_path:
 
     wheels = list(wheel_dir.glob("tw_stock_swap_monitor-*.whl"))
     assert len(wheels) == 1, f"Expected one project wheel, found: {wheels}"
+    with zipfile.ZipFile(wheels[0]) as archive:
+        metadata_name = next(
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        )
+        metadata = archive.read(metadata_name).decode("utf-8")
+    psycopg_requirements = [
+        line for line in metadata.splitlines() if line.startswith("Requires-Dist: psycopg[binary]")
+    ]
+    assert any("extra ==" not in requirement for requirement in psycopg_requirements)
 
     installed_venv = tmp_path / "installed-venv"
     create_venv = subprocess.run(

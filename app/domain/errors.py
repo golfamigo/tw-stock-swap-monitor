@@ -29,6 +29,10 @@ class NegativeQuantityError(DomainError):
     """A quantity was negative."""
 
 
+class NonPositivePositionQuantityError(DomainError):
+    """A persisted position quantity was zero or negative."""
+
+
 class ProtectedPositionSaleError(DomainError):
     """A protected core position was offered as a sale source."""
 

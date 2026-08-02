@@ -184,11 +184,8 @@ class InMemoryLogicalScanRepository(_PortfolioScopedAdapter):
         self._require_portfolio_mutation(request.plan.portfolio_id, access_context)
         existing = self._scans_by_key.get(request.key)
         if existing is not None:
-            if (
-                existing.rotation_plan_id != request.plan.rotation_plan_id
-                or existing.portfolio_id != request.plan.portfolio_id
-            ):
-                raise ValueError("scan lock key resolves to a different rotation plan")
+            if not self._matches_request(existing, request):
+                raise ValueError("scan lock key resolves to different scan identity components")
             return existing
         scan = LogicalScanRun(
             logical_scan_run_id=uuid4(),
@@ -197,6 +194,9 @@ class InMemoryLogicalScanRepository(_PortfolioScopedAdapter):
             market_session_date=request.market_session_date,
             scan_window_start=request.scan_window_start,
             scan_interval=request.scan_interval,
+            market_timezone=request.identity.market_timezone,
+            configuration_snapshot_hash=request.identity.configuration_snapshot_hash,
+            scan_identity_format_version=request.identity.format_version,
             scan_lock_key=request.key,
             status=LogicalScanStatus.RUNNING,
             created_at=created_at,
@@ -213,12 +213,18 @@ class InMemoryLogicalScanRepository(_PortfolioScopedAdapter):
         scan = self._scans_by_key.get(request.key)
         if scan is None:
             return None
-        if (
-            scan.rotation_plan_id != request.plan.rotation_plan_id
-            or scan.portfolio_id != request.plan.portfolio_id
-        ):
-            raise ValueError("scan lock key resolves to a different rotation plan")
+        if not self._matches_request(scan, request):
+            raise ValueError("scan lock key resolves to different scan identity components")
         return scan
+
+    @staticmethod
+    def _matches_request(scan: LogicalScanRun, request: ScanLockRequest) -> bool:
+        return (
+            scan.rotation_plan_id == request.plan.rotation_plan_id
+            and scan.portfolio_id == request.plan.portfolio_id
+            and scan.identity == request.identity
+            and scan.scan_lock_key == request.key
+        )
 
     def get(self, logical_scan_run_id: UUID, *, access_context: AccessContext) -> LogicalScanRun:
         try:

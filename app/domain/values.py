@@ -1,9 +1,12 @@
 """Frozen value objects shared by aggregates and application ports."""
 
+import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
+from hashlib import sha256
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.domain.enums import Scope
 from app.domain.errors import (
@@ -12,6 +15,8 @@ from app.domain.errors import (
     NonDecimalValueError,
     NonFiniteDecimalError,
 )
+
+SCAN_IDENTITY_FORMAT_VERSION = "1"
 
 
 def require_timezone_aware(value: datetime, *, field_name: str) -> datetime:
@@ -78,6 +83,69 @@ class Quantity:
         require_finite_decimal(self.value, field_name="quantity")
         if self.value < Decimal("0"):
             raise NegativeQuantityError("quantity must not be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class ScanIdentity:
+    """Versioned, canonical scan-lock identity that survives provider recovery."""
+
+    rotation_plan_id: UUID
+    market_session_date: date
+    scan_window_start: datetime
+    scan_interval: str
+    configuration_snapshot_hash: str
+    market_timezone: str
+    format_version: str = SCAN_IDENTITY_FORMAT_VERSION
+
+    def __post_init__(self) -> None:
+        require_timezone_aware(self.scan_window_start, field_name="scan_window_start")
+        if not self.scan_interval.strip():
+            raise ValueError("scan_interval must not be blank")
+        if len(self.configuration_snapshot_hash) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in self.configuration_snapshot_hash.lower()
+        ):
+            raise ValueError("configuration_snapshot_hash must be a SHA-256 hexadecimal digest")
+        if self.format_version != SCAN_IDENTITY_FORMAT_VERSION:
+            raise ValueError("scan identity format_version is not supported")
+        try:
+            timezone = ZoneInfo(self.market_timezone)
+        except ZoneInfoNotFoundError as error:
+            raise ValueError("market_timezone must be a valid IANA timezone") from error
+        if self.market_session_date != self.scan_window_start.astimezone(timezone).date():
+            raise ValueError("market_session_date must match scan_window_start in market_timezone")
+        object.__setattr__(
+            self, "configuration_snapshot_hash", self.configuration_snapshot_hash.lower()
+        )
+        object.__setattr__(self, "market_timezone", timezone.key)
+
+    @property
+    def canonical_payload(self) -> dict[str, str]:
+        """Return the versioned JSON payload used for the preliminary scan lock."""
+
+        market_window_start = self.scan_window_start.astimezone(ZoneInfo(self.market_timezone))
+        return {
+            "configuration_snapshot_hash": self.configuration_snapshot_hash,
+            "format_version": self.format_version,
+            "market_session_date": self.market_session_date.isoformat(),
+            "market_timezone": self.market_timezone,
+            "rotation_plan_id": str(self.rotation_plan_id),
+            "scan_interval": self.scan_interval,
+            "scan_window_start": market_window_start.isoformat(timespec="microseconds"),
+        }
+
+    @property
+    def key(self) -> str:
+        """Return the SHA-256 digest of this versioned canonical identity payload."""
+
+        canonical = json.dumps(
+            self.canonical_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
