@@ -17,6 +17,7 @@ from app.domain.errors import (
     SaleQuantityExceedsPositionError,
 )
 from app.domain.values import InstrumentRef, Quantity
+from app.sizing.costs import calculate_purchase_cost
 
 
 def _api() -> Any:
@@ -190,6 +191,62 @@ def test_sizing_rejects_a_protected_source_before_calculation() -> None:
 
     with pytest.raises(ProtectedPositionSaleError):
         api.DeterministicSizingEngine().size(_request(api, source_role=PositionRole.PROTECTED_CORE))
+
+
+def test_sizing_rejects_source_identified_as_protected_by_the_plan_before_calculation() -> None:
+    api = _api()
+    request = _request(api)
+    protected_plan = RotationPlan(
+        rotation_plan_id=request.plan.rotation_plan_id,
+        portfolio_id=request.plan.portfolio_id,
+        candidate_group_ids=request.plan.candidate_group_ids,
+        source_position_ids=(),
+        protected_position_ids=(request.source_position.position_id,),
+        created_at=request.plan.created_at,
+    )
+    protected_request = api.SizingRequest(
+        plan=protected_plan,
+        candidate_group=request.candidate_group,
+        portfolio_owner_id=request.portfolio_owner_id,
+        source_position=request.source_position,
+        source_sale_quantity=request.source_sale_quantity,
+        source_sale_price=request.source_sale_price,
+        candidate=request.candidate,
+        candidate_price=request.candidate_price,
+        available_cash=request.available_cash,
+        configuration=request.configuration,
+    )
+
+    with pytest.raises(ProtectedPositionSaleError):
+        api.DeterministicSizingEngine().size(protected_request)
+
+
+def test_money_quantum_rounds_cost_audit_values_to_the_configured_increment() -> None:
+    api = _api()
+    rounding = api.DecimalRoundingPolicy(
+        money_quantum=Decimal("0.05"),
+        money_rounding=api.RoundingMode.HALF_UP,
+        quantity_rounding=api.RoundingMode.DOWN,
+    )
+    zero_costs = api.FeeTaxProfile(
+        purchase_fee_rate=Decimal("0"),
+        sale_fee_rate=Decimal("0"),
+        sale_tax_rate=Decimal("0"),
+    )
+    zero_slippage = api.SlippageProfile(purchase_rate=Decimal("0"), sale_rate=Decimal("0"))
+
+    cost = calculate_purchase_cost(
+        quantity=Decimal("1"),
+        price=Decimal("1.02"),
+        fee_tax_profile=zero_costs,
+        slippage_profile=zero_slippage,
+        rounding=rounding,
+    )
+
+    assert rounding.money(Decimal("1.02")) == Decimal("1.00")
+    assert cost.gross_value == Decimal("1.00")
+    assert cost.total_cash == Decimal("1.00")
+    assert cost.total_cash % Decimal("0.05") == Decimal("0")
 
 
 def test_sizing_rejects_overselling_and_unavailable_candidates() -> None:

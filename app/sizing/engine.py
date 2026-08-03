@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Context, Decimal, localcontext
 
+from app.domain.errors import ProtectedPositionSaleError
 from app.domain.invariants import (
     ensure_candidate_instrument_is_authorized,
     ensure_plan_reference_is_authorized,
@@ -37,6 +38,8 @@ class DeterministicSizingEngine:
 
         if not isinstance(request, SizingRequest):
             raise TypeError("request must be a SizingRequest")
+        if request.source_position.position_id in request.plan.protected_position_ids:
+            raise ProtectedPositionSaleError("protected positions are never eligible for sale")
         ensure_position_is_sellable(request.source_position, request.source_sale_quantity)
         ensure_plan_reference_is_authorized(
             request.plan,

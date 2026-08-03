@@ -42,7 +42,10 @@ class DecimalRoundingPolicy:
         """Quantize a finite money value by the supplied policy only."""
 
         require_finite_decimal(value, field_name="money value")
-        return value.quantize(self.money_quantum, rounding=self.money_rounding.value)
+        increments = (value / self.money_quantum).to_integral_value(
+            rounding=self.money_rounding.value
+        )
+        return increments * self.money_quantum
 
 
 @dataclass(frozen=True, slots=True)
