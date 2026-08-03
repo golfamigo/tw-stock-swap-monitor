@@ -17,7 +17,11 @@ from app.state_machine.machine import (
     TransitionRequest,
     TransitionResult,
 )
-from app.state_machine.states import RecommendationEvent, RecommendationStateRecord
+from app.state_machine.states import (
+    DataOutcome,
+    RecommendationEvent,
+    RecommendationStateRecord,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +83,27 @@ class RotationRunService:
             raise TypeError("evaluator must return RotationEvaluation")
         return evaluation
 
+    def transition_degraded_data(
+        self,
+        *,
+        plan: RotationPlan,
+        recommendation_state: RecommendationStateRecord,
+    ) -> TransitionResult:
+        """Apply the fixed degraded-data event from durable state without evaluating a signal."""
+
+        if recommendation_state.rotation_plan_id != plan.rotation_plan_id:
+            raise ValueError("recommendation state must belong to the supplied plan")
+        return self._machine.transition(
+            TransitionRequest(
+                current_state=recommendation_state.state,
+                event=RecommendationEvent.DATA_DEGRADED,
+                guards=TransitionGuards(data_outcome=DataOutcome.DEGRADED),
+                protected_position_ids=plan.protected_position_ids,
+                plan_portfolio_id=plan.portfolio_id,
+                remaining_stages_halted=recommendation_state.remaining_stages_halted,
+            )
+        )
+
     def build_strategy_run(
         self,
         *,
@@ -136,6 +161,10 @@ class RotationRunService:
                     "snapshot_id": snapshot.snapshot_id,
                 },
                 "recommendation": {
+                    "previous_remaining_stages_halted": (
+                        recommendation_state.remaining_stages_halted
+                    ),
+                    "previous_state": recommendation_state.state.value,
                     "next_state": transition.next_state.value,
                     "notification_intent_recorded": transition.notification_intent_recorded,
                     "remaining_stages_halted": transition.remaining_stages_halted,

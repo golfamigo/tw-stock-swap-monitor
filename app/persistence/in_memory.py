@@ -8,7 +8,7 @@ from datetime import datetime
 from threading import Lock
 from uuid import UUID, uuid4
 
-from app.application.child_intents import ChildIntent
+from app.application.child_intents import ChildIntent, same_logical_child_intent
 from app.application.configuration import (
     ConfigurationLayer,
     restore_resolved_configuration_snapshot,
@@ -134,6 +134,7 @@ class InMemoryRecommendationStateRepository(_PortfolioScopedAdapter):
     def __init__(self, portfolio_owners: Mapping[UUID, UUID]) -> None:
         super().__init__(portfolio_owners)
         self._records: dict[UUID, RecommendationStateRecord] = {}
+        self._state_lock = Lock()
 
     def get_or_create(
         self,
@@ -143,29 +144,31 @@ class InMemoryRecommendationStateRepository(_PortfolioScopedAdapter):
         access_context: AccessContext,
     ) -> RecommendationStateRecord:
         self._require_portfolio_mutation(plan.portfolio_id, access_context)
-        existing = self._records.get(plan.rotation_plan_id)
-        if existing is not None:
-            if existing.portfolio_id != plan.portfolio_id:
-                raise ValueError("recommendation state plan portfolio does not match")
-            return existing
-        record = RecommendationStateRecord(
-            rotation_plan_id=plan.rotation_plan_id,
-            portfolio_id=plan.portfolio_id,
-            state=RecommendationState.IDLE,
-            remaining_stages_halted=False,
-            revision=0,
-            updated_at=created_at,
-        )
-        self._records[plan.rotation_plan_id] = record
-        return record
+        with self._state_lock:
+            existing = self._records.get(plan.rotation_plan_id)
+            if existing is not None:
+                if existing.portfolio_id != plan.portfolio_id:
+                    raise ValueError("recommendation state plan portfolio does not match")
+                return existing
+            record = RecommendationStateRecord(
+                rotation_plan_id=plan.rotation_plan_id,
+                portfolio_id=plan.portfolio_id,
+                state=RecommendationState.IDLE,
+                remaining_stages_halted=False,
+                revision=0,
+                updated_at=created_at,
+            )
+            self._records[plan.rotation_plan_id] = record
+            return record
 
     def get(
         self, rotation_plan_id: UUID, *, access_context: AccessContext
     ) -> RecommendationStateRecord:
-        try:
-            record = self._records[rotation_plan_id]
-        except KeyError as error:
-            raise NotFoundForActor("recommendation state was not found for actor") from error
+        with self._state_lock:
+            try:
+                record = self._records[rotation_plan_id]
+            except KeyError as error:
+                raise NotFoundForActor("recommendation state was not found for actor") from error
         self._require_portfolio_read(record.portfolio_id, access_context)
         return record
 
@@ -180,23 +183,27 @@ class InMemoryRecommendationStateRepository(_PortfolioScopedAdapter):
         access_context: AccessContext,
     ) -> RecommendationStateRecord:
         self._require_portfolio_mutation(plan.portfolio_id, access_context)
-        stored = self.get(plan.rotation_plan_id, access_context=access_context)
-        if previous != stored:
-            raise IdempotencyConflictError(
-                "recommendation state changed before transition could persist"
+        with self._state_lock:
+            try:
+                stored = self._records[plan.rotation_plan_id]
+            except KeyError as error:
+                raise NotFoundForActor("recommendation state was not found for actor") from error
+            if previous != stored:
+                raise IdempotencyConflictError(
+                    "recommendation state changed before transition could persist"
+                )
+            if previous.portfolio_id != plan.portfolio_id:
+                raise ValueError("recommendation state plan portfolio does not match")
+            updated = RecommendationStateRecord(
+                rotation_plan_id=plan.rotation_plan_id,
+                portfolio_id=plan.portfolio_id,
+                state=next_state,
+                remaining_stages_halted=remaining_stages_halted,
+                revision=previous.revision + 1,
+                updated_at=changed_at,
             )
-        if previous.portfolio_id != plan.portfolio_id:
-            raise ValueError("recommendation state plan portfolio does not match")
-        updated = RecommendationStateRecord(
-            rotation_plan_id=plan.rotation_plan_id,
-            portfolio_id=plan.portfolio_id,
-            state=next_state,
-            remaining_stages_halted=remaining_stages_halted,
-            revision=previous.revision + 1,
-            updated_at=changed_at,
-        )
-        self._records[plan.rotation_plan_id] = updated
-        return updated
+            self._records[plan.rotation_plan_id] = updated
+            return updated
 
 
 class InMemoryRotationPlanRepository(_PortfolioScopedAdapter):
@@ -467,19 +474,6 @@ class InMemoryStrategyRunRepository(_PortfolioScopedAdapter):
         self._logical_scan_by_key[key] = logical_scan_run_id
         if logical_scan_run_id is not None:
             self._runs_by_logical_scan[logical_scan_run_id] = run
-            try:
-                self._logical_scan_repository.attach_final_strategy_run(
-                    logical_scan_run_id=logical_scan_run_id,
-                    plan=plan,
-                    strategy_run_id=run.strategy_run_id,
-                    completed_at=run.occurred_at,
-                    access_context=access_context,
-                )
-            except Exception:
-                del self._runs_by_key[key]
-                del self._logical_scan_by_key[key]
-                del self._runs_by_logical_scan[logical_scan_run_id]
-                raise
         return run
 
     def get_for_logical_scan(
@@ -505,7 +499,7 @@ class InMemoryChildIntentRepository(_PortfolioScopedAdapter):
         existing = self._intents_by_key.get(intent.intent_key)
         if existing is not None:
             self._require_portfolio_read(existing.portfolio_id, access_context)
-            if existing != intent:
+            if not same_logical_child_intent(existing=existing, candidate=intent):
                 raise IdempotencyConflictError(
                     "child intent key already records different evidence"
                 )

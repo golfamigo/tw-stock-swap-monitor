@@ -1399,6 +1399,13 @@ def test_in_memory_logical_scan_recovers_attempts_and_rejects_a_second_final_run
         logical_scan_run_id=scan.logical_scan_run_id,
         access_context=_context(owner_id),
     )
+    repository.attach_final_strategy_run(
+        logical_scan_run_id=scan.logical_scan_run_id,
+        plan=plan,
+        strategy_run_id=completed_run.strategy_run_id,
+        completed_at=NOW + timedelta(minutes=3),
+        access_context=_context(owner_id),
+    )
     recovered = repository.get_by_lock_key(request=request, access_context=_context(owner_id))
     assert recovered.status is logical_scans.LogicalScanStatus.COMPLETED
     assert recovered.final_strategy_run_id == completed_run.strategy_run_id

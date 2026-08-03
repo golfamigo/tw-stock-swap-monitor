@@ -66,6 +66,23 @@ def build_child_intent(
     )
 
 
+def same_logical_child_intent(*, existing: ChildIntent, candidate: ChildIntent) -> bool:
+    """Compare only stable, idempotent child evidence and ignore generated record metadata."""
+
+    return (
+        existing.rotation_plan_id == candidate.rotation_plan_id
+        and existing.portfolio_id == candidate.portfolio_id
+        and existing.strategy_run_id == candidate.strategy_run_id
+        and existing.final_strategy_key == candidate.final_strategy_key
+        and (
+            existing.final_strategy_identity_format_version
+            == candidate.final_strategy_identity_format_version
+        )
+        and existing.purpose is candidate.purpose
+        and existing.intent_key == candidate.intent_key
+    )
+
+
 def _require_sha256(value: str, *, field_name: str) -> None:
     if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
         raise ValueError(f"{field_name} must be a SHA-256 hexadecimal digest")

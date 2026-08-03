@@ -6,12 +6,12 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, insert, or_, select
+from sqlalchemy import and_, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
-from app.application.child_intents import ChildIntent
+from app.application.child_intents import ChildIntent, same_logical_child_intent
 from app.application.configuration import ConfigurationLayer
 from app.application.configuration_snapshots import PersistedConfigurationSnapshot
 from app.domain.access import AccessContext
@@ -160,8 +160,17 @@ class SqlAlchemyRecommendationStateRepository(_SqlAlchemyScopedRepository):
             revision=0,
             updated_at=created_at,
         )
-        self._session.add(recommendation_state_to_model(record))
-        self._session.flush()
+        try:
+            with self._session.begin_nested():
+                self._session.add(recommendation_state_to_model(record))
+                self._session.flush()
+        except IntegrityError as error:
+            existing = self._session.get(RecommendationStateModel, plan.rotation_plan_id)
+            if existing is None:
+                raise error
+            if existing.portfolio_id != plan.portfolio_id:
+                raise ValueError("recommendation state plan portfolio does not match") from error
+            return recommendation_state_from_model(existing)
         return record
 
     def get(
@@ -202,11 +211,28 @@ class SqlAlchemyRecommendationStateRepository(_SqlAlchemyScopedRepository):
             revision=stored.revision + 1,
             updated_at=changed_at,
         )
-        model.state = updated.state.value
-        model.remaining_stages_halted = updated.remaining_stages_halted
-        model.revision = updated.revision
-        model.updated_at = updated.updated_at.astimezone(UTC)
-        self._session.flush()
+        result = self._session.execute(
+            update(RecommendationStateModel)
+            .where(
+                RecommendationStateModel.rotation_plan_id == plan.rotation_plan_id,
+                RecommendationStateModel.portfolio_id == previous.portfolio_id,
+                RecommendationStateModel.revision == previous.revision,
+                RecommendationStateModel.state == previous.state.value,
+                RecommendationStateModel.remaining_stages_halted
+                == previous.remaining_stages_halted,
+            )
+            .values(
+                state=updated.state.value,
+                remaining_stages_halted=updated.remaining_stages_halted,
+                revision=updated.revision,
+                updated_at=updated.updated_at.astimezone(UTC),
+            )
+            .execution_options(synchronize_session="fetch")
+        )
+        if result.rowcount != 1:
+            raise IdempotencyConflictError(
+                "recommendation state changed before transition could persist"
+            )
         return updated
 
 
@@ -709,14 +735,6 @@ class SqlAlchemyStrategyRunRepository(_SqlAlchemyScopedRepository):
                     )
                 )
                 self._session.flush()
-                if logical_scan_run_id is not None:
-                    self._logical_scans.attach_final_strategy_run(
-                        logical_scan_run_id=logical_scan_run_id,
-                        plan=plan,
-                        strategy_run_id=run.strategy_run_id,
-                        completed_at=run.occurred_at,
-                        access_context=access_context,
-                    )
         except IntegrityError as error:
             if not _is_strategy_run_idempotency_conflict(error):
                 if _is_logical_scan_final_conflict(error):
@@ -810,7 +828,7 @@ class SqlAlchemyChildIntentRepository(_SqlAlchemyScopedRepository):
         if existing is not None:
             restored = child_intent_from_model(existing)
             self._require_portfolio_read(restored.portfolio_id, access_context)
-            if restored != intent:
+            if not same_logical_child_intent(existing=restored, candidate=intent):
                 raise IdempotencyConflictError(
                     "child intent key already records different evidence"
                 )

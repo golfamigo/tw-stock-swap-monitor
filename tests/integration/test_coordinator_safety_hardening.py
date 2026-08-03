@@ -7,11 +7,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from threading import Barrier, Thread
 from typing import Never
 from uuid import UUID
 
 import pytest
-from app.application.child_intents import ChildIntentPurpose
+from app.application.child_intents import ChildIntentPurpose, build_child_intent
 from app.application.configuration import (
     CANONICAL_FORMAT_VERSION,
     ResolvedConfigurationSnapshot,
@@ -35,7 +36,7 @@ from app.data_sources.models import (
 )
 from app.domain.access import AccessContext
 from app.domain.entities import Instrument, Position, RotationPlan
-from app.domain.enums import PositionRole, PositionStatus, Scope
+from app.domain.enums import LogicalScanStatus, PositionRole, PositionStatus, Scope
 from app.domain.values import ConfigurationSnapshotRef, InstrumentRef, Ownership, Quantity
 from app.persistence.in_memory import (
     InMemoryChildIntentRepository,
@@ -55,6 +56,7 @@ from app.state_machine.states import (
     DataOutcome,
     RecommendationEvent,
     RecommendationState,
+    RecommendationStateRecord,
     RuleOutcome,
     SizingOutcome,
 )
@@ -238,6 +240,18 @@ class _RecordingScans(InMemoryLogicalScanRepository):
         return super().get_by_lock_key(request=request, access_context=access_context)
 
 
+class _FailOnceChildIntents(InMemoryChildIntentRepository):
+    def __init__(self) -> None:
+        super().__init__({PORTFOLIO_ID: OWNER_ID})
+        self._remaining_failures = 1
+
+    def record_or_get(self, *, intent: object, access_context: AccessContext) -> object:
+        if self._remaining_failures:
+            self._remaining_failures -= 1
+            raise RuntimeError("injected child intent persistence failure")
+        return super().record_or_get(intent=intent, access_context=access_context)
+
+
 def _uuid_factory() -> Callable[[], UUID]:
     value = 1010
 
@@ -257,6 +271,7 @@ class _Parts:
     configuration: PersistedConfigurationSnapshot
     logical_scans: InMemoryLogicalScanRepository
     recommendation_states: InMemoryRecommendationStateRepository
+    strategy_runs: InMemoryStrategyRunRepository
     locks: _RecordingLock
     provider: _Provider
 
@@ -270,6 +285,7 @@ def _parts(
     configuration: PersistedConfigurationSnapshot | None = None,
     logical_scans: InMemoryLogicalScanRepository | None = None,
     recommendation_states: InMemoryRecommendationStateRepository | None = None,
+    child_intents: InMemoryChildIntentRepository | None = None,
     locks: _RecordingLock | None = None,
 ) -> _Parts:
     selected_plan = plan or _plan()
@@ -291,9 +307,12 @@ def _parts(
     states = recommendation_states or InMemoryRecommendationStateRepository(
         {PORTFOLIO_ID: OWNER_ID}
     )
-    intents = InMemoryChildIntentRepository({PORTFOLIO_ID: OWNER_ID})
+    intents = child_intents or InMemoryChildIntentRepository({PORTFOLIO_ID: OWNER_ID})
     used_locks = locks or _RecordingLock([])
     provider = _Provider([selected_snapshot])
+    strategy_runs = InMemoryStrategyRunRepository(
+        {PORTFOLIO_ID: OWNER_ID}, logical_scan_repository=scans
+    )
     coordinator = RunCoordinator(
         rotation_plans=plans,
         configuration_snapshots=configurations,
@@ -301,16 +320,23 @@ def _parts(
         recommendation_states=states,
         child_intents=intents,
         logical_scans=scans,
-        strategy_runs=InMemoryStrategyRunRepository(
-            {PORTFOLIO_ID: OWNER_ID}, logical_scan_repository=scans
-        ),
+        strategy_runs=strategy_runs,
         locks=used_locks,
         market_data=provider,
         evaluator=lambda *_: evaluation,
         now=lambda: NOW,
         new_uuid=_uuid_factory(),
     )
-    return _Parts(coordinator, intents, stored_configuration, scans, states, used_locks, provider)
+    return _Parts(
+        coordinator,
+        intents,
+        stored_configuration,
+        scans,
+        states,
+        strategy_runs,
+        used_locks,
+        provider,
+    )
 
 
 def _request(
@@ -492,6 +518,208 @@ def test_attempt_evidence_retains_configuration_reference_and_final_identity() -
     assert terminal.final_strategy_key == outcome.final_strategy_key
     assert terminal.final_strategy_identity_format_version == "strategy-run:v1"
     assert scan_attempt_from_model(scan_attempt_to_model(terminal)) == terminal
+
+
+@pytest.mark.parametrize(
+    ("initial_state", "expected_state", "expected_halted"),
+    [
+        (RecommendationState.ACTION_PENDING, RecommendationState.DATA_DEGRADED, False),
+        (RecommendationState.ACTION_NOTIFIED, RecommendationState.DATA_DEGRADED, False),
+        (
+            RecommendationState.PARTIALLY_EXECUTED,
+            RecommendationState.WAITING_CONFIRMATION,
+            True,
+        ),
+    ],
+)
+def test_non_actionable_data_persists_the_required_degraded_state_transition(
+    initial_state: RecommendationState,
+    expected_state: RecommendationState,
+    expected_halted: bool,
+) -> None:
+    plan = _plan()
+    parts = _parts(
+        evaluation=RotationEvaluation(
+            event=RecommendationEvent.PLAN_ACTIVATED,
+            guards=TransitionGuards(plan_is_valid=True),
+            outputs={"attempt": "not-used-for-stale-data"},
+        ),
+        plan=plan,
+        snapshot=_snapshot(stale=True),
+    )
+    _seed_state(parts.recommendation_states, plan, initial_state)
+
+    outcome = parts.coordinator.run(_request(parts.configuration, plan=plan))
+
+    assert outcome.disposition is RunDisposition.DEGRADED
+    persisted = parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context())
+    assert persisted.state is expected_state
+    assert persisted.remaining_stages_halted is expected_halted
+
+
+def test_degraded_recommendation_requires_fresh_recovery_evaluation() -> None:
+    plan = _plan()
+    parts = _parts(
+        evaluation=RotationEvaluation(
+            event=RecommendationEvent.PLAN_ACTIVATED,
+            guards=TransitionGuards(plan_is_valid=True),
+            outputs={"attempt": "not-used-for-stale-data"},
+        ),
+        plan=plan,
+        snapshot=_snapshot(stale=True),
+    )
+    _seed_state(parts.recommendation_states, plan, RecommendationState.ACTION_PENDING)
+    parts.coordinator.run(_request(parts.configuration, plan=plan))
+
+    recovered = _parts(
+        evaluation=RotationEvaluation(
+            event=RecommendationEvent.DATA_RECOVERED,
+            guards=TransitionGuards(data_outcome=DataOutcome.FRESH_FULL_EVALUATION),
+            outputs={"attempt": "fresh-recovery"},
+        ),
+        plan=plan,
+        recommendation_states=parts.recommendation_states,
+    )
+
+    outcome = recovered.coordinator.run(_request(recovered.configuration, plan=plan))
+
+    assert outcome.disposition is RunDisposition.COMPLETED
+    assert (
+        parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context()).state
+        is RecommendationState.WATCHING
+    )
+
+
+def test_finalization_failure_keeps_scan_recoverable_until_state_and_intent_are_persisted() -> None:
+    position = _position()
+    plan = _plan()
+    intents = _FailOnceChildIntents()
+    parts = _parts(
+        evaluation=RotationEvaluation(
+            event=RecommendationEvent.DECISION_VALIDATED,
+            guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+            outputs={"attempt": "recover-child-intent"},
+            sale_source_position_id=position.position_id,
+        ),
+        plan=plan,
+        positions=(position,),
+        child_intents=intents,
+    )
+    _seed_state(parts.recommendation_states, plan, RecommendationState.ACTION_PENDING)
+    request = _request(parts.configuration, plan=plan)
+
+    failed = parts.coordinator.run(request)
+
+    assert failed.disposition is RunDisposition.FAILED
+    assert failed.logical_scan_run_id is not None
+    assert (
+        parts.logical_scans.get(failed.logical_scan_run_id, access_context=_context()).status
+        is not LogicalScanStatus.COMPLETED
+    )
+    assert (
+        parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context()).state
+        is RecommendationState.ACTION_NOTIFIED
+    )
+    assert (
+        parts.child_intents.list_for_strategy_run(
+            strategy_run_id=parts.strategy_runs.get_for_logical_scan(
+                logical_scan_run_id=failed.logical_scan_run_id,
+                access_context=_context(),
+            ).strategy_run_id,
+            access_context=_context(),
+        )
+        == ()
+    )
+
+    recovered = parts.coordinator.run(request)
+
+    assert recovered.disposition is RunDisposition.COMPLETED
+    assert parts.provider.calls == 1
+    assert recovered.strategy_run is not None
+    assert parts.child_intents.list_for_strategy_run(
+        strategy_run_id=recovered.strategy_run.strategy_run_id, access_context=_context()
+    )
+    assert (
+        parts.logical_scans.get(recovered.logical_scan_run_id, access_context=_context()).status
+        is LogicalScanStatus.COMPLETED
+    )
+
+
+def test_child_intent_repository_deduplicates_a_logical_retry_with_new_id_and_timestamp() -> None:
+    repository = InMemoryChildIntentRepository({PORTFOLIO_ID: OWNER_ID})
+    stable = {
+        "rotation_plan_id": PLAN_ID,
+        "portfolio_id": PORTFOLIO_ID,
+        "strategy_run_id": UUID("00000000-0000-0000-0000-000000001010"),
+        "final_strategy_key": "a" * 64,
+        "purpose": ChildIntentPurpose.NOTIFICATION,
+    }
+    first = build_child_intent(
+        child_intent_id=UUID("00000000-0000-0000-0000-000000001011"),
+        created_at=NOW,
+        **stable,
+    )
+    retried = build_child_intent(
+        child_intent_id=UUID("00000000-0000-0000-0000-000000001012"),
+        created_at=NOW + timedelta(minutes=1),
+        **stable,
+    )
+
+    stored = repository.record_or_get(intent=first, access_context=_context())
+    recovered = repository.record_or_get(intent=retried, access_context=_context())
+
+    assert recovered == stored
+    assert repository.list_for_strategy_run(
+        strategy_run_id=stable["strategy_run_id"], access_context=_context()
+    ) == (stored,)
+
+
+def test_recommendation_state_compare_and_set_has_one_concurrent_winner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan()
+    states = InMemoryRecommendationStateRepository({PORTFOLIO_ID: OWNER_ID})
+    initial = states.get_or_create(plan=plan, created_at=NOW, access_context=_context())
+    barrier = Barrier(2)
+    original_get = states.get
+
+    def synchronized_get(
+        rotation_plan_id: UUID, *, access_context: AccessContext
+    ) -> RecommendationStateRecord:
+        record = original_get(rotation_plan_id, access_context=access_context)
+        barrier.wait(timeout=1)
+        return record
+
+    monkeypatch.setattr(states, "get", synchronized_get)
+    winners: list[RecommendationStateRecord] = []
+    errors: list[Exception] = []
+
+    def advance(next_state: RecommendationState) -> None:
+        try:
+            winners.append(
+                states.record_transition(
+                    plan=plan,
+                    previous=initial,
+                    next_state=next_state,
+                    remaining_stages_halted=False,
+                    changed_at=NOW,
+                    access_context=_context(),
+                )
+            )
+        except Exception as error:
+            errors.append(error)
+
+    first = Thread(target=lambda: advance(RecommendationState.WATCHING))
+    second = Thread(target=lambda: advance(RecommendationState.DATA_DEGRADED))
+    first.start()
+    second.start()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert len(winners) == 1
+    assert len(errors) == 1
 
 
 def test_action_notified_records_one_deterministic_child_intent_without_delivery() -> None:

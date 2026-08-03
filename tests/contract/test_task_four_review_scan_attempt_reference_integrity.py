@@ -232,6 +232,13 @@ def test_in_memory_final_evidence_requires_an_actual_completed_final_run() -> No
         logical_scan_run_id=scan.logical_scan_run_id,
         access_context=_context(owner_id),
     )
+    repository.attach_final_strategy_run(
+        logical_scan_run_id=scan.logical_scan_run_id,
+        plan=plan,
+        strategy_run_id=final_run.strategy_run_id,
+        completed_at=NOW,
+        access_context=_context(owner_id),
+    )
 
     repository.record_attempt(
         attempt=_attempt(
@@ -311,6 +318,20 @@ def test_in_memory_rejects_nonfinal_and_cross_scan_final_references() -> None:
         plan=plan,
         run=unlinked,
         idempotency_key=IdempotencyKey("unlinked-final"),
+        access_context=_context(owner_id),
+    )
+    repository.attach_final_strategy_run(
+        logical_scan_run_id=first_scan.logical_scan_run_id,
+        plan=plan,
+        strategy_run_id=first_final.strategy_run_id,
+        completed_at=NOW,
+        access_context=_context(owner_id),
+    )
+    repository.attach_final_strategy_run(
+        logical_scan_run_id=second_scan.logical_scan_run_id,
+        plan=plan,
+        strategy_run_id=second_final.strategy_run_id,
+        completed_at=NOW + timedelta(minutes=3),
         access_context=_context(owner_id),
     )
 

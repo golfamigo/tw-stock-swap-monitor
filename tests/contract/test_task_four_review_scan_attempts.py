@@ -233,6 +233,13 @@ def test_in_memory_attempt_audit_retains_failure_degradation_recovery_and_succes
         logical_scan_run_id=scan.logical_scan_run_id,
         access_context=_context(owner_id),
     )
+    repository.attach_final_strategy_run(
+        logical_scan_run_id=scan.logical_scan_run_id,
+        plan=plan,
+        strategy_run_id=final_run.strategy_run_id,
+        completed_at=NOW + timedelta(minutes=3),
+        access_context=_context(owner_id),
+    )
     succeeded = replace(succeeded, final_strategy_run_id=final_run.strategy_run_id)
     repository.record_attempt(attempt=succeeded, access_context=_context(owner_id))
 
@@ -289,6 +296,13 @@ def test_recovery_chain_requires_the_previous_retryable_attempt_and_stops_after_
         run=final_run,
         idempotency_key=IdempotencyKey("recovery-chain-final"),
         logical_scan_run_id=scan.logical_scan_run_id,
+        access_context=_context(owner_id),
+    )
+    repository.attach_final_strategy_run(
+        logical_scan_run_id=scan.logical_scan_run_id,
+        plan=plan,
+        strategy_run_id=final_run.strategy_run_id,
+        completed_at=NOW + timedelta(minutes=1),
         access_context=_context(owner_id),
     )
     succeeded = replace(succeeded, final_strategy_run_id=final_run.strategy_run_id)

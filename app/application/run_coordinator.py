@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from app.application.child_intents import ChildIntentPurpose, build_child_intent
 from app.application.configuration_snapshots import PersistedConfigurationSnapshot
@@ -28,6 +28,7 @@ from app.repositories.recommendation_states import RecommendationStateRepository
 from app.repositories.rotation_plans import RotationPlanRepository
 from app.repositories.strategy_runs import StrategyRunRepository
 from app.services.rotation_run import RotationEvaluation, RotationEvaluator, RotationRunService
+from app.state_machine.states import RecommendationState
 
 
 class TriggerSource(StrEnum):
@@ -54,6 +55,17 @@ class RunCoordinatorInvariantError(DomainError):
 
 class ConfigurationSnapshotValidationError(DomainError):
     """A request cited configuration evidence that is missing, mismatched, or unauthorized."""
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalizationEvidence:
+    """Persisted transition effects that a retry can complete without re-evaluation."""
+
+    previous_state: RecommendationState
+    previous_remaining_stages_halted: bool
+    next_state: RecommendationState
+    remaining_stages_halted: bool
+    notification_intent_recorded: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +209,18 @@ class RunCoordinator:
                 created_at=self._current_time(),
                 access_context=request.access_context,
             )
+            pending_run = self._strategy_runs.get_for_logical_scan(
+                logical_scan_run_id=scan.logical_scan_run_id,
+                access_context=request.access_context,
+            )
+            if pending_run is not None:
+                return self._recover_pending_finalization(
+                    request=request,
+                    plan=plan,
+                    scan=scan,
+                    scan_lock_key=scan_lock_key,
+                    strategy_run=pending_run,
+                )
             if (
                 self._provider_attempt_count(request=request, scan=scan)
                 >= self._max_provider_attempts
@@ -229,6 +253,36 @@ class RunCoordinator:
                 )
             final_identity = FinalStrategyIdentity.from_snapshot(scan_lock_key, snapshot)
             if not snapshot.is_actionable:
+                try:
+                    recommendation_state = self._recommendation_states.get_or_create(
+                        plan=plan,
+                        created_at=self._current_time(),
+                        access_context=request.access_context,
+                    )
+                    if recommendation_state.state is not RecommendationState.IDLE:
+                        transition = self._run_service.transition_degraded_data(
+                            plan=plan,
+                            recommendation_state=recommendation_state,
+                        )
+                        self._recommendation_states.record_transition(
+                            plan=plan,
+                            previous=recommendation_state,
+                            next_state=transition.next_state,
+                            remaining_stages_halted=transition.remaining_stages_halted,
+                            changed_at=self._current_time(),
+                            access_context=request.access_context,
+                        )
+                except Exception:
+                    return self._failed_result(
+                        request=request,
+                        scan=scan,
+                        running_attempt=running_attempt,
+                        scan_lock_key=scan_lock_key,
+                        failure_code="DATA_DEGRADATION_STATE_ERROR",
+                        failure_detail="durable degraded-data transition rejected evidence",
+                        snapshot=snapshot,
+                        final_identity=final_identity,
+                    )
                 terminal = self._record_terminal_attempt(
                     request=request,
                     scan=scan,
@@ -286,21 +340,11 @@ class RunCoordinator:
                     logical_scan_run_id=scan.logical_scan_run_id,
                     access_context=request.access_context,
                 )
-                self._recommendation_states.record_transition(
-                    plan=plan,
-                    previous=recommendation_state,
-                    next_state=prepared.transition.next_state,
-                    remaining_stages_halted=prepared.transition.remaining_stages_halted,
-                    changed_at=self._current_time(),
-                    access_context=request.access_context,
-                )
-                notification_intent_key = self._record_notification_intent(
+                notification_intent_key = self._ensure_finalization_effects(
                     request=request,
                     plan=plan,
                     strategy_run=stored_run,
                     final_identity=final_identity,
-                    evaluation=evaluation,
-                    transition_notified=prepared.transition.notification_intent_recorded,
                 )
             except Exception:
                 return self._failed_result(
@@ -313,6 +357,22 @@ class RunCoordinator:
                         "deterministic evaluation or final-run persistence rejected evidence"
                     ),
                     snapshot=snapshot,
+                    final_identity=final_identity,
+                )
+            try:
+                self._logical_scans.attach_final_strategy_run(
+                    logical_scan_run_id=scan.logical_scan_run_id,
+                    plan=plan,
+                    strategy_run_id=stored_run.strategy_run_id,
+                    completed_at=self._current_time(),
+                    access_context=request.access_context,
+                )
+            except Exception:
+                return self._pending_finalization_result(
+                    request=request,
+                    scan=scan,
+                    scan_lock_key=scan_lock_key,
+                    strategy_run=stored_run,
                     final_identity=final_identity,
                 )
             terminal = self._record_terminal_attempt(
@@ -383,6 +443,112 @@ class RunCoordinator:
             raise RunCoordinatorInvariantError("sale source position does not belong to the plan")
         return position
 
+    def _recover_pending_finalization(
+        self,
+        *,
+        request: RunCoordinatorRequest,
+        plan: RotationPlan,
+        scan: LogicalScanRun,
+        scan_lock_key: str,
+        strategy_run: StrategyRun,
+    ) -> RunCoordinatorResult:
+        """Complete persisted finalization effects without re-reading a provider or evaluator."""
+
+        try:
+            final_identity = _final_identity_from_run(strategy_run)
+            notification_intent_key = self._ensure_finalization_effects(
+                request=request,
+                plan=plan,
+                strategy_run=strategy_run,
+                final_identity=final_identity,
+            )
+            self._logical_scans.attach_final_strategy_run(
+                logical_scan_run_id=scan.logical_scan_run_id,
+                plan=plan,
+                strategy_run_id=strategy_run.strategy_run_id,
+                completed_at=self._current_time(),
+                access_context=request.access_context,
+            )
+        except Exception as error:
+            return self._pending_finalization_result(
+                request=request,
+                scan=scan,
+                scan_lock_key=scan_lock_key,
+                strategy_run=strategy_run,
+                final_identity=_try_final_identity_from_run(strategy_run),
+                failure_detail=type(error).__name__,
+            )
+        terminal = self._record_recovered_final_attempt(
+            request=request,
+            scan=scan,
+            strategy_run=strategy_run,
+            final_identity=final_identity,
+        )
+        audit = dict(
+            self._audit(
+                request=request,
+                scan=scan,
+                final_identity=final_identity,
+                terminal_attempt=terminal,
+                market_data_actionable=True,
+            )
+        )
+        if notification_intent_key is not None:
+            audit["notification_intent_key"] = notification_intent_key
+        return RunCoordinatorResult(
+            disposition=RunDisposition.COMPLETED,
+            strategy_run=strategy_run,
+            scan_lock_key=scan_lock_key,
+            logical_scan_run_id=scan.logical_scan_run_id,
+            final_strategy_key=final_identity.key,
+            audit=audit,
+        )
+
+    def _ensure_finalization_effects(
+        self,
+        *,
+        request: RunCoordinatorRequest,
+        plan: RotationPlan,
+        strategy_run: StrategyRun,
+        final_identity: FinalStrategyIdentity,
+    ) -> str | None:
+        """Persist or verify the transition and child evidence carried by one final candidate."""
+
+        effects = _finalization_evidence(strategy_run)
+        current = self._recommendation_states.get_or_create(
+            plan=plan,
+            created_at=self._current_time(),
+            access_context=request.access_context,
+        )
+        if (
+            current.state is effects.next_state
+            and current.remaining_stages_halted == effects.remaining_stages_halted
+        ):
+            pass
+        elif (
+            current.state is effects.previous_state
+            and current.remaining_stages_halted == effects.previous_remaining_stages_halted
+        ):
+            self._recommendation_states.record_transition(
+                plan=plan,
+                previous=current,
+                next_state=effects.next_state,
+                remaining_stages_halted=effects.remaining_stages_halted,
+                changed_at=self._current_time(),
+                access_context=request.access_context,
+            )
+        else:
+            raise RunCoordinatorInvariantError(
+                "pending finalization no longer matches the durable recommendation state"
+            )
+        return self._record_notification_intent(
+            request=request,
+            plan=plan,
+            strategy_run=strategy_run,
+            final_identity=final_identity,
+            notification_intent_recorded=effects.notification_intent_recorded,
+        )
+
     def _record_notification_intent(
         self,
         *,
@@ -390,19 +556,29 @@ class RunCoordinator:
         plan: RotationPlan,
         strategy_run: StrategyRun,
         final_identity: FinalStrategyIdentity,
-        evaluation: RotationEvaluation,
-        transition_notified: bool,
+        notification_intent_recorded: bool,
     ) -> str | None:
-        if not transition_notified:
+        """Record one stable notification fingerprint; this coordinator never sends it."""
+
+        if not notification_intent_recorded:
             return None
+        effects = _finalization_evidence(strategy_run)
+        if (
+            effects.previous_state is not RecommendationState.ACTION_PENDING
+            or effects.next_state is not RecommendationState.ACTION_NOTIFIED
+        ):
+            raise RunCoordinatorInvariantError("notification intent requires a validated decision")
         intent = build_child_intent(
-            child_intent_id=self._new_uuid(),
+            child_intent_id=uuid5(
+                NAMESPACE_URL,
+                f"rotation-child-intent:v1:{final_identity.key}:{strategy_run.strategy_run_id}",
+            ),
             rotation_plan_id=plan.rotation_plan_id,
             portfolio_id=plan.portfolio_id,
             strategy_run_id=strategy_run.strategy_run_id,
             final_strategy_key=final_identity.key,
             purpose=ChildIntentPurpose.NOTIFICATION,
-            created_at=self._current_time(),
+            created_at=strategy_run.occurred_at,
         )
         stored = self._child_intents.record_or_get(
             intent=intent, access_context=request.access_context
@@ -411,9 +587,95 @@ class RunCoordinator:
             raise RunCoordinatorInvariantError(
                 "notification transition recorded a different child intent"
             )
-        if evaluation.event.value != "DECISION_VALIDATED":
-            raise RunCoordinatorInvariantError("notification intent requires a validated decision")
         return stored.intent_key
+
+    def _record_recovered_final_attempt(
+        self,
+        *,
+        request: RunCoordinatorRequest,
+        scan: LogicalScanRun,
+        strategy_run: StrategyRun,
+        final_identity: FinalStrategyIdentity,
+    ) -> ScanAttempt:
+        """Append exactly one final attempt for a stored candidate that survived a failed finish."""
+
+        attempts = self._logical_scans.list_attempts(
+            logical_scan_run_id=scan.logical_scan_run_id, access_context=request.access_context
+        )
+        existing = next(
+            (
+                attempt
+                for attempt in attempts
+                if (
+                    attempt.status is ScanAttemptStatus.SUCCEEDED
+                    and attempt.final_strategy_run_id == strategy_run.strategy_run_id
+                )
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+        if not attempts:
+            raise RunCoordinatorInvariantError("pending finalization has no provider attempt")
+        previous = attempts[-1]
+        market_data_snapshot_id, market_data_content_hash = _market_evidence_from_run(strategy_run)
+        terminal = ScanAttempt(
+            scan_attempt_id=self._new_uuid(),
+            logical_scan_run_id=scan.logical_scan_run_id,
+            attempt_number=len(attempts) + 1,
+            status=ScanAttemptStatus.SUCCEEDED,
+            configuration_snapshot_hash=request.configuration_snapshot.content_hash,
+            configuration_snapshot_id=request.configuration_snapshot.snapshot_id,
+            configuration_snapshot_created_at=request.configuration_snapshot.created_at,
+            market_data_snapshot_id=market_data_snapshot_id,
+            market_data_content_hash=market_data_content_hash,
+            final_strategy_key=final_identity.key,
+            final_strategy_identity_format_version=final_identity.format_version,
+            trigger_correlation_id=request.correlation_id,
+            actor_correlation_id=f"actor:{request.access_context.actor_user_id}",
+            started_at=previous.started_at,
+            completed_at=self._current_time(),
+            recovery_of_attempt_id=previous.scan_attempt_id,
+            final_strategy_run_id=strategy_run.strategy_run_id,
+        )
+        self._logical_scans.record_attempt(attempt=terminal, access_context=request.access_context)
+        return terminal
+
+    def _pending_finalization_result(
+        self,
+        *,
+        request: RunCoordinatorRequest,
+        scan: LogicalScanRun,
+        scan_lock_key: str,
+        strategy_run: StrategyRun,
+        final_identity: FinalStrategyIdentity | None,
+        failure_detail: str | None = None,
+    ) -> RunCoordinatorResult:
+        """Report a recoverable finalization gap without appending conflicting evidence."""
+
+        audit = dict(
+            self._audit(
+                request=request,
+                scan=scan,
+                final_identity=final_identity,
+                terminal_attempt=None,
+                market_data_actionable=True,
+            )
+        )
+        audit["attempt_disposition"] = RunDisposition.FAILED.value
+        audit["failure_code"] = "FINALIZATION_PENDING"
+        if failure_detail is not None:
+            audit["failure_detail"] = failure_detail
+        return RunCoordinatorResult(
+            disposition=RunDisposition.FAILED,
+            strategy_run=None,
+            scan_lock_key=scan_lock_key,
+            logical_scan_run_id=scan.logical_scan_run_id,
+            final_strategy_key=(
+                _final_key_from_run(strategy_run) if final_identity is None else final_identity.key
+            ),
+            audit=audit,
+        )
 
     def _completed_result(
         self,
@@ -705,3 +967,98 @@ def _final_key_from_run(run: StrategyRun) -> str | None:
     if not isinstance(final_strategy_key, str) or len(final_strategy_key) != 64:
         return None
     return final_strategy_key
+
+
+def _finalization_evidence(run: StrategyRun) -> _FinalizationEvidence:
+    """Decode the complete transition facts embedded in a coordinator-built strategy run."""
+
+    recommendation = run.outputs.get("recommendation")
+    if not isinstance(recommendation, Mapping):
+        raise RunCoordinatorInvariantError(
+            "strategy run is missing recommendation finalization evidence"
+        )
+    previous_state = recommendation.get("previous_state")
+    next_state = recommendation.get("next_state")
+    previous_halted = recommendation.get("previous_remaining_stages_halted")
+    remaining_halted = recommendation.get("remaining_stages_halted")
+    notification_recorded = recommendation.get("notification_intent_recorded")
+    if not isinstance(previous_state, str) or not isinstance(next_state, str):
+        raise RunCoordinatorInvariantError(
+            "strategy run recommendation state evidence is malformed"
+        )
+    if (
+        type(previous_halted) is not bool
+        or type(remaining_halted) is not bool
+        or type(notification_recorded) is not bool
+    ):
+        raise RunCoordinatorInvariantError(
+            "strategy run recommendation guard evidence is malformed"
+        )
+    try:
+        effects = _FinalizationEvidence(
+            previous_state=RecommendationState(previous_state),
+            previous_remaining_stages_halted=previous_halted,
+            next_state=RecommendationState(next_state),
+            remaining_stages_halted=remaining_halted,
+            notification_intent_recorded=notification_recorded,
+        )
+    except ValueError as error:
+        raise RunCoordinatorInvariantError(
+            "strategy run recommendation state evidence is malformed"
+        ) from error
+    if run.state_transition != f"{effects.previous_state.value}->{effects.next_state.value}":
+        raise RunCoordinatorInvariantError(
+            "strategy run state transition does not match its evidence"
+        )
+    return effects
+
+
+def _market_evidence_from_run(run: StrategyRun) -> tuple[str, str]:
+    """Restore the immutable market identity needed for a finalization-only retry."""
+
+    market_data = run.outputs.get("market_data")
+    if not isinstance(market_data, Mapping):
+        raise RunCoordinatorInvariantError(
+            "strategy run is missing market-data finalization evidence"
+        )
+    snapshot_id = market_data.get("snapshot_id")
+    content_hash = market_data.get("content_hash")
+    if not isinstance(snapshot_id, str) or not isinstance(content_hash, str):
+        raise RunCoordinatorInvariantError("strategy run market-data evidence is malformed")
+    if snapshot_id != run.market_data_snapshot_id:
+        raise RunCoordinatorInvariantError(
+            "strategy run market-data identity does not match its evidence"
+        )
+    return snapshot_id, content_hash
+
+
+def _final_identity_from_run(run: StrategyRun) -> FinalStrategyIdentity:
+    """Rebuild and verify the two-phase final identity retained by a stored candidate."""
+
+    idempotency = run.outputs.get("idempotency")
+    if not isinstance(idempotency, Mapping):
+        raise RunCoordinatorInvariantError("strategy run is missing idempotency evidence")
+    scan_lock_key = idempotency.get("scan_lock_key")
+    final_strategy_key = idempotency.get("final_strategy_key")
+    if not isinstance(scan_lock_key, str) or not isinstance(final_strategy_key, str):
+        raise RunCoordinatorInvariantError("strategy run idempotency evidence is malformed")
+    market_data_snapshot_id, market_data_content_hash = _market_evidence_from_run(run)
+    identity = FinalStrategyIdentity(
+        scan_lock_key=scan_lock_key,
+        market_data_snapshot_id=market_data_snapshot_id,
+        market_data_content_hash=market_data_content_hash,
+    )
+    if identity.key != final_strategy_key:
+        raise RunCoordinatorInvariantError(
+            "strategy run final identity does not match its evidence"
+        )
+    return identity
+
+
+def _try_final_identity_from_run(run: StrategyRun) -> FinalStrategyIdentity | None:
+    """Keep a malformed pending candidate auditable without claiming a reconstructed identity."""
+
+    try:
+        return _final_identity_from_run(run)
+    except RunCoordinatorInvariantError:
+        return None
