@@ -17,7 +17,7 @@ from app.domain.errors import (
     SaleQuantityExceedsPositionError,
 )
 from app.domain.values import InstrumentRef, Quantity
-from app.sizing.costs import CostError, calculate_purchase_cost
+from app.sizing.costs import CostError, calculate_purchase_cost, calculate_sale_proceeds
 
 
 def _api() -> Any:
@@ -278,6 +278,58 @@ def test_money_preserves_true_half_even_rounding_just_above_a_quantum_tie() -> N
     assert rounded == Decimal("1.05")
 
 
+def test_purchase_cost_preserves_high_precision_gross_before_quantum_rounding() -> None:
+    api = _api()
+    rounding = api.DecimalRoundingPolicy(
+        money_quantum=Decimal("0.05"),
+        money_rounding=api.RoundingMode.HALF_EVEN,
+        quantity_rounding=api.RoundingMode.DOWN,
+    )
+    zero_costs = api.FeeTaxProfile(
+        purchase_fee_rate=Decimal("0"),
+        sale_fee_rate=Decimal("0"),
+        sale_tax_rate=Decimal("0"),
+    )
+    zero_slippage = api.SlippageProfile(purchase_rate=Decimal("0"), sale_rate=Decimal("0"))
+
+    cost = calculate_purchase_cost(
+        quantity=Decimal("1"),
+        price=Decimal("1.025000000000000000000000000001"),
+        fee_tax_profile=zero_costs,
+        slippage_profile=zero_slippage,
+        rounding=rounding,
+    )
+
+    assert cost.gross_value == Decimal("1.05")
+    assert cost.total_cash == Decimal("1.05")
+
+
+def test_sale_credit_never_rounds_a_high_precision_sub_quantum_amount_upward() -> None:
+    api = _api()
+    rounding = api.DecimalRoundingPolicy(
+        money_quantum=Decimal("0.05"),
+        money_rounding=api.RoundingMode.HALF_EVEN,
+        quantity_rounding=api.RoundingMode.DOWN,
+    )
+    zero_costs = api.FeeTaxProfile(
+        purchase_fee_rate=Decimal("0"),
+        sale_fee_rate=Decimal("0"),
+        sale_tax_rate=Decimal("0"),
+    )
+    zero_slippage = api.SlippageProfile(purchase_rate=Decimal("0"), sale_rate=Decimal("0"))
+
+    proceeds = calculate_sale_proceeds(
+        quantity=Decimal("1"),
+        price=Decimal("0.049999999999999999999999999999"),
+        fee_tax_profile=zero_costs,
+        slippage_profile=zero_slippage,
+        rounding=rounding,
+    )
+
+    assert proceeds.gross_value == Decimal("0")
+    assert proceeds.net_proceeds == Decimal("0")
+
+
 def test_money_floor_rejects_huge_finite_decimal_exponents_before_scale_expansion() -> None:
     api = _api()
     rounding = api.DecimalRoundingPolicy(
@@ -288,6 +340,47 @@ def test_money_floor_rejects_huge_finite_decimal_exponents_before_scale_expansio
 
     with pytest.raises(CostError, match="scale"):
         rounding.money_not_increasing(Decimal("0E+1000000"))
+
+
+def test_sizing_does_not_pre_round_available_cash_and_proceeds_into_an_action() -> None:
+    api = _api()
+    request = _request(api)
+    high_precision_funding_configuration = api.SizingConfiguration(
+        stages=(api.SizingStage(stage_id="only", allocation_weight=Decimal("1")),),
+        fee_tax_profile=api.FeeTaxProfile(
+            purchase_fee_rate=Decimal("0"),
+            sale_fee_rate=Decimal("0"),
+            sale_tax_rate=Decimal("0"),
+        ),
+        slippage_profile=api.SlippageProfile(purchase_rate=Decimal("0"), sale_rate=Decimal("0")),
+        reserve=Decimal("0.05"),
+        minimum_quantity=Decimal("1"),
+        lot_quantity=Decimal("1"),
+        odd_lot_policy=api.OddLotPolicy.ALLOWED,
+        rounding=api.DecimalRoundingPolicy(
+            money_quantum=Decimal("0.05"),
+            money_rounding=api.RoundingMode.HALF_EVEN,
+            quantity_rounding=api.RoundingMode.DOWN,
+        ),
+    )
+    request = api.SizingRequest(
+        plan=request.plan,
+        candidate_group=request.candidate_group,
+        portfolio_owner_id=request.portfolio_owner_id,
+        source_position=request.source_position,
+        source_sale_quantity=Quantity(Decimal("1")),
+        source_sale_price=Decimal("0.05"),
+        candidate=request.candidate,
+        candidate_price=Decimal("0.05"),
+        available_cash=Decimal("0.049999999999999999999999999999"),
+        configuration=high_precision_funding_configuration,
+    )
+
+    result = api.DeterministicSizingEngine().size(request)
+
+    assert result.actionable is False
+    assert result.stages[0].purchase_quantity == Quantity(Decimal("0"))
+    assert result.total_required_cash <= result.available_cash + result.net_sale_proceeds
 
 
 def test_sizing_preserves_raw_cash_before_half_up_quantization_for_affordability() -> None:

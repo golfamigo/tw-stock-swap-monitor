@@ -118,10 +118,14 @@ def calculate_purchase_cost(
 
     _require_nonnegative(quantity, field_name="purchase quantity")
     _require_positive(price, field_name="purchase price")
-    gross_value = rounding.money(quantity * price)
-    slippage_cost = rounding.money(gross_value * slippage_profile.purchase_rate)
-    fee = rounding.money((gross_value + slippage_cost) * fee_tax_profile.purchase_fee_rate)
-    total_cash = rounding.money(gross_value + slippage_cost + fee)
+    gross_value = rounding.money(multiply_decimals(quantity, price))
+    slippage_cost = rounding.money(multiply_decimals(gross_value, slippage_profile.purchase_rate))
+    fee = rounding.money(
+        multiply_decimals(
+            add_decimals(gross_value, slippage_cost), fee_tax_profile.purchase_fee_rate
+        )
+    )
+    total_cash = rounding.money(add_decimals(add_decimals(gross_value, slippage_cost), fee))
     return PurchaseCost(
         gross_value=gross_value,
         slippage_cost=slippage_cost,
@@ -142,12 +146,14 @@ def calculate_sale_proceeds(
 
     _require_nonnegative(quantity, field_name="sale quantity")
     _require_positive(price, field_name="sale price")
-    gross_value = rounding.money_not_increasing(quantity * price)
-    slippage_cost = rounding.money(gross_value * slippage_profile.sale_rate)
-    post_slippage_value = gross_value - slippage_cost
-    fee = rounding.money(post_slippage_value * fee_tax_profile.sale_fee_rate)
-    tax = rounding.money(post_slippage_value * fee_tax_profile.sale_tax_rate)
-    net_proceeds = rounding.money_not_increasing(post_slippage_value - fee - tax)
+    gross_value = rounding.money_not_increasing(multiply_decimals(quantity, price))
+    slippage_cost = rounding.money(multiply_decimals(gross_value, slippage_profile.sale_rate))
+    post_slippage_value = subtract_decimals(gross_value, slippage_cost)
+    fee = rounding.money(multiply_decimals(post_slippage_value, fee_tax_profile.sale_fee_rate))
+    tax = rounding.money(multiply_decimals(post_slippage_value, fee_tax_profile.sale_tax_rate))
+    net_proceeds = rounding.money_not_increasing(
+        subtract_decimals(subtract_decimals(post_slippage_value, fee), tax)
+    )
     return SaleProceeds(
         gross_value=gross_value,
         slippage_cost=slippage_cost,
@@ -173,6 +179,66 @@ def _require_positive(value: Decimal, *, field_name: str) -> None:
     _require_nonnegative(value, field_name=field_name)
     if value.is_zero():
         raise CostError(f"{field_name} must be positive")
+
+
+def add_decimals(left: Decimal, right: Decimal) -> Decimal:
+    """Add validated Decimal operands without ambient-context rounding."""
+
+    left_coefficient, left_exponent = _decimal_coefficient_and_exponent(
+        left, field_name="left Decimal"
+    )
+    right_coefficient, right_exponent = _decimal_coefficient_and_exponent(
+        right, field_name="right Decimal"
+    )
+    result_exponent = min(left_exponent, right_exponent)
+    left_shift = left_exponent - result_exponent
+    right_shift = right_exponent - result_exponent
+    _validate_scaled_coefficient(left_coefficient, left_shift, field_name="left Decimal")
+    _validate_scaled_coefficient(right_coefficient, right_shift, field_name="right Decimal")
+    result_coefficient = (left_coefficient * (10**left_shift)) + (
+        right_coefficient * (10**right_shift)
+    )
+    return _decimal_from_coefficient(result_coefficient, result_exponent)
+
+
+def subtract_decimals(left: Decimal, right: Decimal) -> Decimal:
+    """Subtract validated Decimal operands without ambient-context rounding."""
+
+    left_coefficient, left_exponent = _decimal_coefficient_and_exponent(
+        left, field_name="left Decimal"
+    )
+    right_coefficient, right_exponent = _decimal_coefficient_and_exponent(
+        right, field_name="right Decimal"
+    )
+    result_exponent = min(left_exponent, right_exponent)
+    left_shift = left_exponent - result_exponent
+    right_shift = right_exponent - result_exponent
+    _validate_scaled_coefficient(left_coefficient, left_shift, field_name="left Decimal")
+    _validate_scaled_coefficient(right_coefficient, right_shift, field_name="right Decimal")
+    result_coefficient = (left_coefficient * (10**left_shift)) - (
+        right_coefficient * (10**right_shift)
+    )
+    return _decimal_from_coefficient(result_coefficient, result_exponent)
+
+
+def multiply_decimals(left: Decimal, right: Decimal) -> Decimal:
+    """Multiply validated Decimal operands without ambient-context rounding."""
+
+    left_coefficient, left_exponent = _decimal_coefficient_and_exponent(
+        left, field_name="left Decimal"
+    )
+    right_coefficient, right_exponent = _decimal_coefficient_and_exponent(
+        right, field_name="right Decimal"
+    )
+    result_exponent = left_exponent + right_exponent
+    if abs(result_exponent) > MAX_ROUNDING_DECIMAL_EXPONENT:
+        raise CostError("Decimal product scale exceeds the rounding resource limit")
+    if (
+        _coefficient_digit_count(left_coefficient) + _coefficient_digit_count(right_coefficient)
+        > MAX_ROUNDING_DECIMAL_DIGITS
+    ):
+        raise CostError("Decimal product digit count exceeds the rounding resource limit")
+    return _decimal_from_coefficient(left_coefficient * right_coefficient, result_exponent)
 
 
 def _floor_to_quantum(value: Decimal, quantum: Decimal) -> Decimal:
@@ -202,10 +268,16 @@ def _quantum_ratio(value: Decimal, quantum: Decimal) -> tuple[int, int, int, int
     if abs(exponent_difference) > MAX_ROUNDING_SCALE_DIFFERENCE:
         raise CostError("Decimal scale difference exceeds the rounding resource limit")
     if exponent_difference >= 0:
+        _validate_scaled_coefficient(
+            value_coefficient, exponent_difference, field_name="money value"
+        )
         numerator = value_coefficient * (10**exponent_difference)
         denominator = quantum_coefficient
     else:
         numerator = value_coefficient
+        _validate_scaled_coefficient(
+            quantum_coefficient, -exponent_difference, field_name="money_quantum"
+        )
         denominator = quantum_coefficient * (10 ** (-exponent_difference))
     return numerator, denominator, quantum_coefficient, quantum_exponent
 
@@ -249,6 +321,21 @@ def _validate_rounding_decimal(value: Decimal, *, field_name: str) -> None:
 
 
 def _decimal_from_coefficient(coefficient: int, exponent: int) -> Decimal:
+    if abs(exponent) > MAX_ROUNDING_DECIMAL_EXPONENT:
+        raise CostError("Decimal result scale exceeds the rounding resource limit")
+    if _coefficient_digit_count(coefficient) > MAX_ROUNDING_DECIMAL_DIGITS:
+        raise CostError("Decimal result digit count exceeds the rounding resource limit")
     sign = 1 if coefficient < 0 else 0
     digits = tuple(int(digit) for digit in str(abs(coefficient)))
     return Decimal((sign, digits, exponent))
+
+
+def _validate_scaled_coefficient(coefficient: int, scale: int, *, field_name: str) -> None:
+    if scale > MAX_ROUNDING_SCALE_DIFFERENCE:
+        raise CostError(f"{field_name} scale exceeds the rounding resource limit")
+    if _coefficient_digit_count(coefficient) + scale > MAX_ROUNDING_DECIMAL_DIGITS:
+        raise CostError(f"{field_name} digit count exceeds the rounding resource limit")
+
+
+def _coefficient_digit_count(coefficient: int) -> int:
+    return len(str(abs(coefficient)))

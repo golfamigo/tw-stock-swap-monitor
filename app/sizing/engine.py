@@ -23,8 +23,11 @@ from app.sizing.base import (
 )
 from app.sizing.costs import (
     SaleProceeds,
+    add_decimals,
     calculate_purchase_cost,
     calculate_sale_proceeds,
+    multiply_decimals,
+    subtract_decimals,
 )
 
 _DECIMAL_CONTEXT = Context(prec=28, rounding=ROUND_HALF_EVEN)
@@ -60,7 +63,7 @@ class DeterministicSizingEngine:
             rounding=request.configuration.rounding,
         )
         source_sale = self._source_sale(request.source_sale_quantity, sale_proceeds)
-        funding = request.available_cash + sale_proceeds.net_proceeds
+        funding = add_decimals(request.available_cash, sale_proceeds.net_proceeds)
         if funding < request.configuration.reserve:
             return self._non_actionable_result(
                 request=request,
@@ -69,7 +72,7 @@ class DeterministicSizingEngine:
                 status=SizingStatus.INSUFFICIENT_CASH,
                 reason="funding_does_not_cover_reserve",
             )
-        spendable = funding - request.configuration.reserve
+        spendable = subtract_decimals(funding, request.configuration.reserve)
         quantities = self._initial_quantities(
             request.configuration, request.candidate_price, spendable
         )
@@ -114,7 +117,7 @@ class DeterministicSizingEngine:
             self._quantity_for_target(
                 configuration=configuration,
                 target_value=configuration.rounding.money_not_increasing(
-                    spendable * stage.allocation_weight
+                    multiply_decimals(spendable, stage.allocation_weight)
                 ),
                 unit_cost=unit_cost,
             )
@@ -146,7 +149,7 @@ class DeterministicSizingEngine:
                 stage=stage,
                 candidate_price=candidate_price,
                 target_value=configuration.rounding.money_not_increasing(
-                    spendable * stage.allocation_weight
+                    multiply_decimals(spendable, stage.allocation_weight)
                 ),
                 quantity=quantity,
             )
@@ -219,19 +222,16 @@ class DeterministicSizingEngine:
         quantities: list[Decimal],
         candidate_price: Decimal,
     ) -> Decimal:
-        purchase_total = sum(
-            (
-                calculate_purchase_cost(
-                    quantity=quantity,
-                    price=candidate_price,
-                    fee_tax_profile=configuration.fee_tax_profile,
-                    slippage_profile=configuration.slippage_profile,
-                    rounding=configuration.rounding,
-                ).total_cash
-                for quantity in quantities
-            ),
-            configuration.reserve,
-        )
+        purchase_total = configuration.reserve
+        for quantity in quantities:
+            purchase_cost = calculate_purchase_cost(
+                quantity=quantity,
+                price=candidate_price,
+                fee_tax_profile=configuration.fee_tax_profile,
+                slippage_profile=configuration.slippage_profile,
+                rounding=configuration.rounding,
+            )
+            purchase_total = add_decimals(purchase_total, purchase_cost.total_cash)
         return purchase_total
 
     def _last_reducible_stage(
@@ -303,14 +303,17 @@ class DeterministicSizingEngine:
         reserve: Decimal,
         reason: str | None = None,
     ) -> SizingResult:
-        required_purchase_value = sum(
-            (stage.required_purchase_value for stage in stages), Decimal("0")
-        )
-        total_purchase_cash = sum((stage.total_cash for stage in stages), Decimal("0"))
-        configured_costs = total_purchase_cash - required_purchase_value
-        total_required_cash = total_purchase_cash + reserve
-        funding = available_cash + net_sale_proceeds
-        remaining_cash = funding - total_required_cash
+        required_purchase_value = Decimal("0")
+        total_purchase_cash = Decimal("0")
+        for stage in stages:
+            required_purchase_value = add_decimals(
+                required_purchase_value, stage.required_purchase_value
+            )
+            total_purchase_cash = add_decimals(total_purchase_cash, stage.total_cash)
+        configured_costs = subtract_decimals(total_purchase_cash, required_purchase_value)
+        total_required_cash = add_decimals(total_purchase_cash, reserve)
+        funding = add_decimals(available_cash, net_sale_proceeds)
+        remaining_cash = subtract_decimals(funding, total_required_cash)
         if remaining_cash < Decimal("0"):
             remaining_cash = Decimal("0")
         return SizingResult(
