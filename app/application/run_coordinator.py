@@ -28,7 +28,7 @@ from app.repositories.recommendation_states import RecommendationStateRepository
 from app.repositories.rotation_plans import RotationPlanRepository
 from app.repositories.strategy_runs import StrategyRunRepository
 from app.services.rotation_run import RotationEvaluation, RotationEvaluator, RotationRunService
-from app.state_machine.states import RecommendationState, RecommendationStateRecord
+from app.state_machine.states import RecommendationState
 
 
 class TriggerSource(StrEnum):
@@ -571,7 +571,6 @@ class RunCoordinator:
                 and current.finalization_strategy_key is None
                 and self._is_legacy_pending_finalization(
                     request=request,
-                    current=current,
                     effects=effects,
                     scan=scan,
                     strategy_run=strategy_run,
@@ -630,7 +629,6 @@ class RunCoordinator:
         self,
         *,
         request: RunCoordinatorRequest,
-        current: RecommendationStateRecord,
         effects: _FinalizationEvidence,
         scan: LogicalScanRun,
         strategy_run: StrategyRun,
@@ -642,7 +640,6 @@ class RunCoordinator:
             scan.status is not LogicalScanStatus.RUNNING
             or final_identity.scan_lock_key != scan.scan_lock_key
             or strategy_run.configuration_snapshot.content_hash != scan.configuration_snapshot_hash
-            or current.updated_at <= strategy_run.occurred_at
             or (
                 effects.previous_state is effects.next_state
                 and (effects.previous_remaining_stages_halted == effects.remaining_stages_halted)

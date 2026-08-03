@@ -1022,7 +1022,7 @@ def test_concurrent_scan_candidates_finalize_the_fenced_loser_without_another_in
     )
 
 
-def test_legacy_pending_finalization_backfills_fence_without_terminal_attempt() -> None:
+def test_legacy_pending_finalization_with_coarse_timestamps_backfills_fence() -> None:
     position = _position()
     plan = _plan()
     scans = _FailOnceFinalAttemptScans()
@@ -1060,7 +1060,6 @@ def test_legacy_pending_finalization_backfills_fence_without_terminal_attempt() 
         legacy_state,
         finalization_strategy_run_id=None,
         finalization_strategy_key=None,
-        updated_at=legacy_state.updated_at + timedelta(microseconds=1),
     )
 
     recovered = parts.coordinator.run(request)
