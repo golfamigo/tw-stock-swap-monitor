@@ -8,6 +8,10 @@ from enum import StrEnum
 
 from app.domain.values import require_finite_decimal
 
+MAX_ROUNDING_DECIMAL_DIGITS = 1_000
+MAX_ROUNDING_DECIMAL_EXPONENT = 1_000
+MAX_ROUNDING_SCALE_DIFFERENCE = 1_000
+
 
 class CostError(ValueError):
     """Raised for invalid cost configuration or unrepresentable cost inputs."""
@@ -31,6 +35,7 @@ class DecimalRoundingPolicy:
 
     def __post_init__(self) -> None:
         require_finite_decimal(self.money_quantum, field_name="money_quantum")
+        _validate_rounding_decimal(self.money_quantum, field_name="money_quantum")
         if self.money_quantum <= Decimal("0"):
             raise CostError("money_quantum must be positive")
         if not isinstance(self.money_rounding, RoundingMode):
@@ -42,10 +47,7 @@ class DecimalRoundingPolicy:
         """Quantize a finite money value by the supplied policy only."""
 
         require_finite_decimal(value, field_name="money value")
-        increments = (value / self.money_quantum).to_integral_value(
-            rounding=self.money_rounding.value
-        )
-        return increments * self.money_quantum
+        return _round_to_quantum(value, self.money_quantum, self.money_rounding)
 
     def money_not_increasing(self, value: Decimal) -> Decimal:
         """Round monetary credit down to a quantum without increasing available funding."""
@@ -176,27 +178,74 @@ def _require_positive(value: Decimal, *, field_name: str) -> None:
 def _floor_to_quantum(value: Decimal, quantum: Decimal) -> Decimal:
     """Return the exact mathematical floor multiple without context-rounded division."""
 
-    value_coefficient, value_exponent = _decimal_coefficient_and_exponent(value)
-    quantum_coefficient, quantum_exponent = _decimal_coefficient_and_exponent(quantum)
+    numerator, denominator, quantum_coefficient, quantum_exponent = _quantum_ratio(value, quantum)
+    increments = numerator // denominator
+    return _decimal_from_coefficient(increments * quantum_coefficient, quantum_exponent)
+
+
+def _round_to_quantum(value: Decimal, quantum: Decimal, rounding: RoundingMode) -> Decimal:
+    """Return an exact configured multiple without context-rounded division."""
+
+    numerator, denominator, quantum_coefficient, quantum_exponent = _quantum_ratio(value, quantum)
+    increments = _round_ratio(numerator, denominator, rounding)
+    return _decimal_from_coefficient(increments * quantum_coefficient, quantum_exponent)
+
+
+def _quantum_ratio(value: Decimal, quantum: Decimal) -> tuple[int, int, int, int]:
+    value_coefficient, value_exponent = _decimal_coefficient_and_exponent(
+        value, field_name="money value"
+    )
+    quantum_coefficient, quantum_exponent = _decimal_coefficient_and_exponent(
+        quantum, field_name="money_quantum"
+    )
     exponent_difference = value_exponent - quantum_exponent
+    if abs(exponent_difference) > MAX_ROUNDING_SCALE_DIFFERENCE:
+        raise CostError("Decimal scale difference exceeds the rounding resource limit")
     if exponent_difference >= 0:
         numerator = value_coefficient * (10**exponent_difference)
         denominator = quantum_coefficient
     else:
         numerator = value_coefficient
         denominator = quantum_coefficient * (10 ** (-exponent_difference))
-    increments = numerator // denominator
-    return _decimal_from_coefficient(increments * quantum_coefficient, quantum_exponent)
+    return numerator, denominator, quantum_coefficient, quantum_exponent
 
 
-def _decimal_coefficient_and_exponent(value: Decimal) -> tuple[int, int]:
+def _round_ratio(numerator: int, denominator: int, rounding: RoundingMode) -> int:
+    floor = numerator // denominator
+    remainder = numerator - (floor * denominator)
+    if rounding is RoundingMode.DOWN:
+        return floor if numerator >= 0 or remainder == 0 else floor + 1
+    comparison = (remainder * 2) - denominator
+    if comparison < 0:
+        return floor
+    if comparison > 0:
+        return floor + 1
+    if rounding is RoundingMode.HALF_UP:
+        return floor + 1 if numerator >= 0 else floor
+    if rounding is RoundingMode.HALF_EVEN:
+        return floor if floor % 2 == 0 else floor + 1
+    raise AssertionError("unsupported rounding mode")
+
+
+def _decimal_coefficient_and_exponent(value: Decimal, *, field_name: str) -> tuple[int, int]:
     decimal_tuple = value.as_tuple()
     if not isinstance(decimal_tuple.exponent, int):
         raise AssertionError("finite Decimal must have an integer exponent")
+    _validate_rounding_decimal(value, field_name=field_name)
     coefficient = int("".join(str(digit) for digit in decimal_tuple.digits))
     if decimal_tuple.sign:
         coefficient = -coefficient
     return coefficient, decimal_tuple.exponent
+
+
+def _validate_rounding_decimal(value: Decimal, *, field_name: str) -> None:
+    decimal_tuple = value.as_tuple()
+    if not isinstance(decimal_tuple.exponent, int):
+        raise AssertionError("finite Decimal must have an integer exponent")
+    if len(decimal_tuple.digits) > MAX_ROUNDING_DECIMAL_DIGITS:
+        raise CostError(f"{field_name} digit count exceeds the rounding resource limit")
+    if abs(decimal_tuple.exponent) > MAX_ROUNDING_DECIMAL_EXPONENT:
+        raise CostError(f"{field_name} scale exceeds the rounding resource limit")
 
 
 def _decimal_from_coefficient(coefficient: int, exponent: int) -> Decimal:

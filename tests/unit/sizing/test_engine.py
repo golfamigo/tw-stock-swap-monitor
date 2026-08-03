@@ -17,7 +17,7 @@ from app.domain.errors import (
     SaleQuantityExceedsPositionError,
 )
 from app.domain.values import InstrumentRef, Quantity
-from app.sizing.costs import calculate_purchase_cost
+from app.sizing.costs import CostError, calculate_purchase_cost
 
 
 def _api() -> Any:
@@ -263,6 +263,31 @@ def test_money_not_increasing_preserves_the_true_quantum_floor_at_decimal_precis
     assert floored == Decimal("1.00")
     assert floored <= value
     assert floored % Decimal("0.05") == Decimal("0")
+
+
+def test_money_preserves_true_half_even_rounding_just_above_a_quantum_tie() -> None:
+    api = _api()
+    rounding = api.DecimalRoundingPolicy(
+        money_quantum=Decimal("0.05"),
+        money_rounding=api.RoundingMode.HALF_EVEN,
+        quantity_rounding=api.RoundingMode.DOWN,
+    )
+
+    rounded = rounding.money(Decimal("1.025000000000000000000000000001"))
+
+    assert rounded == Decimal("1.05")
+
+
+def test_money_floor_rejects_huge_finite_decimal_exponents_before_scale_expansion() -> None:
+    api = _api()
+    rounding = api.DecimalRoundingPolicy(
+        money_quantum=Decimal("0.05"),
+        money_rounding=api.RoundingMode.HALF_EVEN,
+        quantity_rounding=api.RoundingMode.DOWN,
+    )
+
+    with pytest.raises(CostError, match="scale"):
+        rounding.money_not_increasing(Decimal("0E+1000000"))
 
 
 def test_sizing_preserves_raw_cash_before_half_up_quantization_for_affordability() -> None:
