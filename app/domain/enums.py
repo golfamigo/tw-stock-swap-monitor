@@ -43,6 +43,13 @@ class ScanAttemptStatus(str, Enum):
     SUCCEEDED = "SUCCEEDED"
 
 
+class FinalizationDisposition(str, Enum):
+    """The durable outcome of a final strategy candidate's coordinator finish."""
+
+    APPLIED = "APPLIED"
+    SUPERSEDED = "SUPERSEDED"
+
+
 class ScanAttemptRecoveryDecision(str, Enum):
     """The deterministic worker action allowed after observing an attempt."""
 

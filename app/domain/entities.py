@@ -9,6 +9,7 @@ from types import MappingProxyType
 from uuid import UUID
 
 from app.domain.enums import (
+    FinalizationDisposition,
     LogicalScanStatus,
     PositionRole,
     PositionStatus,
@@ -344,12 +345,17 @@ class ScanAttempt:
     configuration_snapshot_created_at: datetime | None = None
     final_strategy_key: str | None = None
     final_strategy_identity_format_version: str | None = None
+    finalization_disposition: FinalizationDisposition | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.attempt_number, bool) or self.attempt_number < 1:
             raise ValueError("attempt_number must be positive")
         if not isinstance(self.status, ScanAttemptStatus):
             raise TypeError("status must be a ScanAttemptStatus")
+        if self.finalization_disposition is not None and not isinstance(
+            self.finalization_disposition, FinalizationDisposition
+        ):
+            raise TypeError("finalization_disposition must be a FinalizationDisposition")
         _require_sha256_hash(
             self.configuration_snapshot_hash, field_name="configuration_snapshot_hash"
         )
@@ -416,7 +422,12 @@ class ScanAttempt:
         has_market_data = self.market_data_snapshot_id is not None
         has_failure = self.failure_code is not None or self.failure_detail is not None
         if self.status is ScanAttemptStatus.RUNNING:
-            if self.completed_at is not None or has_market_data or has_failure:
+            if (
+                self.completed_at is not None
+                or has_market_data
+                or has_failure
+                or self.finalization_disposition is not None
+            ):
                 raise ValueError("RUNNING attempts cannot have completed outcome evidence")
             if self.duplicate_of_attempt_id is not None or self.final_strategy_run_id is not None:
                 raise ValueError("RUNNING attempts cannot have final or duplicate references")
@@ -430,6 +441,8 @@ class ScanAttempt:
                 raise ValueError("failed or degraded attempts cannot have a final strategy run")
             if self.duplicate_of_attempt_id is not None:
                 raise ValueError("failed or degraded attempts cannot be duplicate results")
+            if self.finalization_disposition is not None:
+                raise ValueError("failed or degraded attempts cannot have finalization evidence")
             if self.status is ScanAttemptStatus.DEGRADED and not has_market_data:
                 raise ValueError("DEGRADED attempts require market_data evidence")
             return
@@ -440,9 +453,17 @@ class ScanAttempt:
                 raise ValueError("duplicate successes cannot repeat market_data evidence")
             if self.final_strategy_run_id is not None:
                 raise ValueError("duplicate successes cannot create a final strategy run")
+            if self.finalization_disposition is not None:
+                raise ValueError("duplicate successes cannot have finalization evidence")
             return
         if not has_market_data:
             raise ValueError("SUCCEEDED attempts require market_data evidence")
+        if self.finalization_disposition is not None and (
+            self.final_strategy_run_id is None or self.final_strategy_key is None
+        ):
+            raise ValueError(
+                "finalization disposition requires final strategy run and key evidence"
+            )
 
     @property
     def recovery_decision(self) -> ScanAttemptRecoveryDecision:

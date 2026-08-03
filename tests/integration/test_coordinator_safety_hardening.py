@@ -802,7 +802,7 @@ def test_pending_finalization_uses_the_stored_run_configuration_not_a_new_reques
     assert terminal.configuration_snapshot != _configuration_ref(second_configuration)
 
 
-def test_concurrent_scan_candidates_cannot_share_another_runs_finalization_effects() -> None:
+def test_concurrent_scan_candidates_finalize_the_fenced_loser_without_another_intent() -> None:
     position = _position()
     plan = _plan()
     intents = _PauseFirstChildIntentWrite()
@@ -824,12 +824,12 @@ def test_concurrent_scan_candidates_cannot_share_another_runs_finalization_effec
         first_request,
         scan_window_start=first_request.scan_window_start + timedelta(minutes=3),
     )
-    results: list[RunCoordinatorResult] = []
+    results: list[tuple[RunCoordinatorRequest, RunCoordinatorResult]] = []
     errors: list[Exception] = []
 
     def run(request: RunCoordinatorRequest) -> None:
         try:
-            results.append(parts.coordinator.run(request))
+            results.append((request, parts.coordinator.run(request)))
         except Exception as error:
             errors.append(error)
 
@@ -845,13 +845,14 @@ def test_concurrent_scan_candidates_cannot_share_another_runs_finalization_effec
     assert not first.is_alive()
     assert not second.is_alive()
     assert errors == []
-    assert sum(result.disposition is RunDisposition.COMPLETED for result in results) == 1
+    assert sum(result.disposition is RunDisposition.COMPLETED for _, result in results) == 1
+    assert sum(result.disposition is RunDisposition.SUPERSEDED for _, result in results) == 1
     completed_scan_ids = [
         result.logical_scan_run_id
-        for result in results
-        if result.disposition is RunDisposition.COMPLETED
+        for _, result in results
+        if result.disposition in {RunDisposition.COMPLETED, RunDisposition.SUPERSEDED}
     ]
-    assert len(completed_scan_ids) == 1
+    assert len(completed_scan_ids) == 2
     assert all(
         parts.logical_scans.get(scan_id, access_context=_context()).status
         is LogicalScanStatus.COMPLETED
@@ -861,7 +862,7 @@ def test_concurrent_scan_candidates_cannot_share_another_runs_finalization_effec
         parts.strategy_runs.get_for_logical_scan(
             logical_scan_run_id=result.logical_scan_run_id, access_context=_context()
         )
-        for result in results
+        for _, result in results
         if result.logical_scan_run_id is not None
     ]
     assert (
@@ -875,6 +876,110 @@ def test_concurrent_scan_candidates_cannot_share_another_runs_finalization_effec
             if run is not None
         )
         == 1
+    )
+    loser_request, loser = next(
+        (request, result)
+        for request, result in results
+        if result.disposition is RunDisposition.SUPERSEDED
+    )
+    assert loser.logical_scan_run_id is not None
+    assert loser.audit["failure_code"] == "FINALIZATION_SUPERSEDED"
+    assert (
+        parts.logical_scans.get(loser.logical_scan_run_id, access_context=_context()).status
+        is LogicalScanStatus.COMPLETED
+    )
+
+    retried_loser = parts.coordinator.run(loser_request)
+
+    assert retried_loser.disposition is RunDisposition.SUPERSEDED
+    assert retried_loser.audit["failure_code"] == "FINALIZATION_SUPERSEDED"
+    assert (
+        sum(
+            len(
+                parts.child_intents.list_for_strategy_run(
+                    strategy_run_id=run.strategy_run_id, access_context=_context()
+                )
+            )
+            for run in all_runs
+            if run is not None
+        )
+        == 1
+    )
+
+
+def test_legacy_pending_finalization_backfills_its_missing_fence_before_completion() -> None:
+    position = _position()
+    plan = _plan()
+    scans = _FailOnceAttachScans()
+    parts = _parts(
+        evaluation=RotationEvaluation(
+            event=RecommendationEvent.DECISION_VALIDATED,
+            guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+            outputs={"attempt": "legacy-fence-backfill"},
+            sale_source_position_id=position.position_id,
+        ),
+        plan=plan,
+        positions=(position,),
+        logical_scans=scans,
+    )
+    _seed_state(parts.recommendation_states, plan, RecommendationState.ACTION_PENDING)
+    request = _request(parts.configuration, plan=plan)
+
+    pending = parts.coordinator.run(request)
+
+    assert pending.disposition is RunDisposition.FAILED
+    assert pending.logical_scan_run_id is not None
+    candidate = parts.strategy_runs.get_for_logical_scan(
+        logical_scan_run_id=pending.logical_scan_run_id, access_context=_context()
+    )
+    assert candidate is not None
+    legacy_state = parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context())
+    parts.recommendation_states._records[plan.rotation_plan_id] = replace(  # type: ignore[attr-defined]
+        legacy_state,
+        finalization_strategy_run_id=None,
+        finalization_strategy_key=None,
+    )
+
+    recovered = parts.coordinator.run(request)
+
+    assert recovered.disposition is RunDisposition.COMPLETED
+    backfilled = parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context())
+    assert backfilled.finalization_strategy_run_id == candidate.strategy_run_id
+    assert backfilled.finalization_strategy_key == recovered.final_strategy_key
+    assert parts.provider.calls == 1
+
+
+def test_unfenced_matching_state_does_not_let_a_new_candidate_claim_legacy_recovery() -> None:
+    position = _position()
+    plan = _plan()
+    parts = _parts(
+        evaluation=RotationEvaluation(
+            event=RecommendationEvent.DECISION_VALIDATED,
+            guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+            outputs={"attempt": "unfenced-noop"},
+            sale_source_position_id=position.position_id,
+        ),
+        plan=plan,
+        positions=(position,),
+    )
+    _seed_state(parts.recommendation_states, plan, RecommendationState.ACTION_NOTIFIED)
+
+    result = parts.coordinator.run(_request(parts.configuration, plan=plan))
+
+    assert result.disposition is RunDisposition.SUPERSEDED
+    assert result.logical_scan_run_id is not None
+    state = parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context())
+    assert state.finalization_strategy_run_id is None
+    assert state.finalization_strategy_key is None
+    strategy_run = parts.strategy_runs.get_for_logical_scan(
+        logical_scan_run_id=result.logical_scan_run_id, access_context=_context()
+    )
+    assert strategy_run is not None
+    assert (
+        parts.child_intents.list_for_strategy_run(
+            strategy_run_id=strategy_run.strategy_run_id, access_context=_context()
+        )
+        == ()
     )
 
 

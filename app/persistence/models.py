@@ -423,6 +423,17 @@ class ScanAttemptModel(Base):
             "AND (failure_detail IS NULL OR length(failure_detail) <= 1024)",
             name="ck_scan_attempt_evidence_bounds",
         ),
+        CheckConstraint(
+            "finalization_disposition IS NULL OR "
+            "finalization_disposition IN ('APPLIED', 'SUPERSEDED')",
+            name="ck_scan_attempt_finalization_disposition",
+        ),
+        CheckConstraint(
+            "finalization_disposition IS NULL OR "
+            "(status = 'SUCCEEDED' AND final_strategy_run_id IS NOT NULL "
+            "AND final_strategy_key IS NOT NULL)",
+            name="ck_scan_attempt_finalization_evidence",
+        ),
     )
 
     scan_attempt_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -453,6 +464,7 @@ class ScanAttemptModel(Base):
     recovery_of_attempt_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     duplicate_of_attempt_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     final_strategy_run_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    finalization_disposition: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class StrategyRunModel(Base):

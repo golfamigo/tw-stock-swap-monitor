@@ -16,7 +16,7 @@ from app.data_sources.base import MarketDataProvider
 from app.data_sources.models import MarketDataRequest, MarketDataSnapshot
 from app.domain.access import AccessContext
 from app.domain.entities import LogicalScanRun, Position, RotationPlan, ScanAttempt, StrategyRun
-from app.domain.enums import LogicalScanStatus, ScanAttemptStatus
+from app.domain.enums import FinalizationDisposition, LogicalScanStatus, ScanAttemptStatus
 from app.domain.errors import DomainError
 from app.domain.values import ConfigurationSnapshotRef, require_timezone_aware
 from app.repositories.child_intents import ChildIntentRepository
@@ -45,12 +45,17 @@ class RunDisposition(StrEnum):
     API_CONFLICT = "API_CONFLICT"
     SCHEDULER_SKIPPED = "SCHEDULER_SKIPPED"
     DEGRADED = "DEGRADED"
+    SUPERSEDED = "SUPERSEDED"
     FAILED = "FAILED"
     RETRY_EXHAUSTED = "RETRY_EXHAUSTED"
 
 
 class RunCoordinatorInvariantError(DomainError):
     """Persisted scan evidence did not support a safe coordinator action."""
+
+
+class _FinalizationSuperseded(RunCoordinatorInvariantError):
+    """A persisted candidate lost its state transition to durable evidence."""
 
 
 class ConfigurationSnapshotValidationError(DomainError):
@@ -340,12 +345,23 @@ class RunCoordinator:
                     logical_scan_run_id=scan.logical_scan_run_id,
                     access_context=request.access_context,
                 )
-                notification_intent_key = self._ensure_finalization_effects(
-                    request=request,
-                    plan=plan,
-                    strategy_run=stored_run,
-                    final_identity=final_identity,
-                )
+                try:
+                    notification_intent_key = self._ensure_finalization_effects(
+                        request=request,
+                        plan=plan,
+                        scan=scan,
+                        strategy_run=stored_run,
+                        final_identity=final_identity,
+                    )
+                except _FinalizationSuperseded:
+                    return self._finalize_superseded_candidate(
+                        request=request,
+                        plan=plan,
+                        scan=scan,
+                        scan_lock_key=scan_lock_key,
+                        strategy_run=stored_run,
+                        final_identity=final_identity,
+                    )
                 terminal = self._record_recovered_final_attempt(
                     request=request,
                     scan=scan,
@@ -453,12 +469,23 @@ class RunCoordinator:
 
         try:
             final_identity = _final_identity_from_run(strategy_run)
-            notification_intent_key = self._ensure_finalization_effects(
-                request=request,
-                plan=plan,
-                strategy_run=strategy_run,
-                final_identity=final_identity,
-            )
+            try:
+                notification_intent_key = self._ensure_finalization_effects(
+                    request=request,
+                    plan=plan,
+                    scan=scan,
+                    strategy_run=strategy_run,
+                    final_identity=final_identity,
+                )
+            except _FinalizationSuperseded:
+                return self._finalize_superseded_candidate(
+                    request=request,
+                    plan=plan,
+                    scan=scan,
+                    scan_lock_key=scan_lock_key,
+                    strategy_run=strategy_run,
+                    final_identity=final_identity,
+                )
             terminal = self._record_recovered_final_attempt(
                 request=request,
                 scan=scan,
@@ -506,6 +533,7 @@ class RunCoordinator:
         *,
         request: RunCoordinatorRequest,
         plan: RotationPlan,
+        scan: LogicalScanRun,
         strategy_run: StrategyRun,
         final_identity: FinalStrategyIdentity,
     ) -> str | None:
@@ -524,11 +552,33 @@ class RunCoordinator:
             and current.remaining_stages_halted == effects.remaining_stages_halted
         ):
             if (
-                current.finalization_strategy_run_id != expected_run_id
-                or current.finalization_strategy_key != expected_key
+                current.finalization_strategy_run_id == expected_run_id
+                and current.finalization_strategy_key == expected_key
             ):
-                raise RunCoordinatorInvariantError(
-                    "pending finalization belongs to different durable state evidence"
+                pass
+            elif (
+                current.finalization_strategy_run_id is None
+                and current.finalization_strategy_key is None
+                and self._is_legacy_pending_finalization(
+                    request=request,
+                    scan=scan,
+                    strategy_run=strategy_run,
+                    final_identity=final_identity,
+                )
+            ):
+                self._recommendation_states.record_transition(
+                    plan=plan,
+                    previous=current,
+                    next_state=effects.next_state,
+                    remaining_stages_halted=effects.remaining_stages_halted,
+                    changed_at=self._current_time(),
+                    access_context=request.access_context,
+                    finalization_strategy_run_id=expected_run_id,
+                    finalization_strategy_key=expected_key,
+                )
+            else:
+                raise _FinalizationSuperseded(
+                    "pending finalization lost to different durable state evidence"
                 )
         elif (
             current.state is effects.previous_state
@@ -545,7 +595,7 @@ class RunCoordinator:
                 finalization_strategy_key=expected_key,
             )
         else:
-            raise RunCoordinatorInvariantError(
+            raise _FinalizationSuperseded(
                 "pending finalization no longer matches the durable recommendation state"
             )
         return self._record_notification_intent(
@@ -554,6 +604,33 @@ class RunCoordinator:
             strategy_run=strategy_run,
             final_identity=final_identity,
             notification_intent_recorded=effects.notification_intent_recorded,
+        )
+
+    def _is_legacy_pending_finalization(
+        self,
+        *,
+        request: RunCoordinatorRequest,
+        scan: LogicalScanRun,
+        strategy_run: StrategyRun,
+        final_identity: FinalStrategyIdentity,
+    ) -> bool:
+        """Allow only an already-audited 0002 candidate to claim a missing fence."""
+
+        if scan.status is not LogicalScanStatus.RUNNING:
+            return False
+        market_data_snapshot_id, market_data_content_hash = _market_evidence_from_run(strategy_run)
+        return any(
+            attempt.status is ScanAttemptStatus.SUCCEEDED
+            and attempt.final_strategy_run_id == strategy_run.strategy_run_id
+            and attempt.final_strategy_key == final_identity.key
+            and attempt.final_strategy_identity_format_version == final_identity.format_version
+            and attempt.configuration_snapshot == strategy_run.configuration_snapshot
+            and attempt.market_data_snapshot_id == market_data_snapshot_id
+            and attempt.market_data_content_hash == market_data_content_hash
+            for attempt in self._logical_scans.list_attempts(
+                logical_scan_run_id=scan.logical_scan_run_id,
+                access_context=request.access_context,
+            )
         )
 
     def _record_notification_intent(
@@ -603,6 +680,7 @@ class RunCoordinator:
         scan: LogicalScanRun,
         strategy_run: StrategyRun,
         final_identity: FinalStrategyIdentity,
+        finalization_disposition: FinalizationDisposition = FinalizationDisposition.APPLIED,
     ) -> ScanAttempt:
         """Append exactly one final attempt for a stored candidate that survived a failed finish."""
 
@@ -612,7 +690,7 @@ class RunCoordinator:
         existing = next(
             (
                 attempt
-                for attempt in attempts
+                for attempt in reversed(attempts)
                 if (
                     attempt.status is ScanAttemptStatus.SUCCEEDED
                     and attempt.final_strategy_run_id == strategy_run.strategy_run_id
@@ -620,7 +698,13 @@ class RunCoordinator:
             ),
             None,
         )
-        if existing is not None:
+        if existing is not None and (
+            existing.finalization_disposition is finalization_disposition
+            or (
+                finalization_disposition is FinalizationDisposition.APPLIED
+                and existing.finalization_disposition is None
+            )
+        ):
             return existing
         if not attempts:
             raise RunCoordinatorInvariantError("pending finalization has no provider attempt")
@@ -644,9 +728,87 @@ class RunCoordinator:
             completed_at=self._current_time(),
             recovery_of_attempt_id=previous.scan_attempt_id,
             final_strategy_run_id=strategy_run.strategy_run_id,
+            finalization_disposition=finalization_disposition,
         )
         self._logical_scans.record_attempt(attempt=terminal, access_context=request.access_context)
         return terminal
+
+    def _finalize_superseded_candidate(
+        self,
+        *,
+        request: RunCoordinatorRequest,
+        plan: RotationPlan,
+        scan: LogicalScanRun,
+        scan_lock_key: str,
+        strategy_run: StrategyRun,
+        final_identity: FinalStrategyIdentity,
+    ) -> RunCoordinatorResult:
+        """Terminally audit a candidate that lost its finalization fence without side effects."""
+
+        try:
+            terminal = self._record_recovered_final_attempt(
+                request=request,
+                scan=scan,
+                strategy_run=strategy_run,
+                final_identity=final_identity,
+                finalization_disposition=FinalizationDisposition.SUPERSEDED,
+            )
+            self._logical_scans.attach_final_strategy_run(
+                logical_scan_run_id=scan.logical_scan_run_id,
+                plan=plan,
+                strategy_run_id=strategy_run.strategy_run_id,
+                completed_at=self._current_time(),
+                access_context=request.access_context,
+            )
+        except Exception as error:
+            return self._pending_finalization_result(
+                request=request,
+                scan=scan,
+                scan_lock_key=scan_lock_key,
+                strategy_run=strategy_run,
+                final_identity=final_identity,
+                failure_detail=type(error).__name__,
+            )
+        return self._superseded_result(
+            request=request,
+            scan=scan,
+            scan_lock_key=scan_lock_key,
+            strategy_run=strategy_run,
+            final_identity=final_identity,
+            terminal_attempt=terminal,
+        )
+
+    def _superseded_result(
+        self,
+        *,
+        request: RunCoordinatorRequest,
+        scan: LogicalScanRun,
+        scan_lock_key: str,
+        strategy_run: StrategyRun,
+        final_identity: FinalStrategyIdentity,
+        terminal_attempt: ScanAttempt,
+    ) -> RunCoordinatorResult:
+        """Render the durable no-op outcome from a superseded final attempt."""
+
+        audit = dict(
+            self._audit(
+                request=request,
+                scan=scan,
+                final_identity=final_identity,
+                terminal_attempt=terminal_attempt,
+                market_data_actionable=True,
+            )
+        )
+        audit["attempt_disposition"] = RunDisposition.SUPERSEDED.value
+        audit["failure_code"] = "FINALIZATION_SUPERSEDED"
+        return RunCoordinatorResult(
+            disposition=RunDisposition.SUPERSEDED,
+            strategy_run=strategy_run,
+            scan_lock_key=scan_lock_key,
+            logical_scan_run_id=scan.logical_scan_run_id,
+            final_strategy_key=final_identity.key,
+            audit=audit,
+        )
 
     def _pending_finalization_result(
         self,
@@ -697,12 +859,39 @@ class RunCoordinator:
         )
         if stored_run is None:
             raise RunCoordinatorInvariantError("completed scan is missing its final strategy run")
-        terminal = self._record_recovered_final_attempt(
-            request=request,
-            scan=scan,
-            strategy_run=stored_run,
-            final_identity=_final_identity_from_run(stored_run),
+        final_identity = _final_identity_from_run(stored_run)
+        terminal = next(
+            (
+                attempt
+                for attempt in reversed(
+                    self._logical_scans.list_attempts(
+                        logical_scan_run_id=scan.logical_scan_run_id,
+                        access_context=request.access_context,
+                    )
+                )
+                if (
+                    attempt.status is ScanAttemptStatus.SUCCEEDED
+                    and attempt.final_strategy_run_id == stored_run.strategy_run_id
+                )
+            ),
+            None,
         )
+        if terminal is None:
+            terminal = self._record_recovered_final_attempt(
+                request=request,
+                scan=scan,
+                strategy_run=stored_run,
+                final_identity=final_identity,
+            )
+        if terminal.finalization_disposition is FinalizationDisposition.SUPERSEDED:
+            return self._superseded_result(
+                request=request,
+                scan=scan,
+                scan_lock_key=scan_lock_key,
+                strategy_run=stored_run,
+                final_identity=final_identity,
+                terminal_attempt=terminal,
+            )
         return RunCoordinatorResult(
             disposition=RunDisposition.COMPLETED,
             strategy_run=stored_run,

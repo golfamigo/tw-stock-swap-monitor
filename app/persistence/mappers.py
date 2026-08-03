@@ -20,6 +20,7 @@ from app.domain.entities import (
     StrategyRun,
 )
 from app.domain.enums import (
+    FinalizationDisposition,
     LogicalScanStatus,
     PositionRole,
     PositionStatus,
@@ -403,6 +404,11 @@ def scan_attempt_to_model(attempt: ScanAttempt) -> ScanAttemptModel:
         recovery_of_attempt_id=attempt.recovery_of_attempt_id,
         duplicate_of_attempt_id=attempt.duplicate_of_attempt_id,
         final_strategy_run_id=attempt.final_strategy_run_id,
+        finalization_disposition=(
+            None
+            if attempt.finalization_disposition is None
+            else attempt.finalization_disposition.value
+        ),
     )
 
 
@@ -436,6 +442,11 @@ def scan_attempt_from_model(model: ScanAttemptModel) -> ScanAttempt:
         recovery_of_attempt_id=model.recovery_of_attempt_id,
         duplicate_of_attempt_id=model.duplicate_of_attempt_id,
         final_strategy_run_id=model.final_strategy_run_id,
+        finalization_disposition=(
+            None
+            if model.finalization_disposition is None
+            else FinalizationDisposition(model.finalization_disposition)
+        ),
     )
 
 
