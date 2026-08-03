@@ -232,7 +232,7 @@ class DeterministicSizingEngine:
             ),
             configuration.reserve,
         )
-        return configuration.rounding.money(purchase_total)
+        return purchase_total
 
     def _last_reducible_stage(
         self, configuration: SizingConfiguration, quantities: list[Decimal]

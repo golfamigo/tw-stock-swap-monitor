@@ -291,6 +291,46 @@ def test_sizing_preserves_raw_cash_before_half_up_quantization_for_affordability
     assert result.total_required_cash <= result.available_cash + result.net_sale_proceeds
 
 
+def test_sizing_enforces_raw_aggregate_requirement_after_stage_cost_rounding() -> None:
+    api = _api()
+    request = _request(api)
+    aggregate_rounding_configuration = api.SizingConfiguration(
+        stages=(api.SizingStage(stage_id="only", allocation_weight=Decimal("1")),),
+        fee_tax_profile=api.FeeTaxProfile(
+            purchase_fee_rate=Decimal("0"),
+            sale_fee_rate=Decimal("0"),
+            sale_tax_rate=Decimal("0"),
+        ),
+        slippage_profile=api.SlippageProfile(purchase_rate=Decimal("0"), sale_rate=Decimal("0")),
+        reserve=Decimal("0.02"),
+        minimum_quantity=Decimal("1"),
+        lot_quantity=Decimal("1"),
+        odd_lot_policy=api.OddLotPolicy.ALLOWED,
+        rounding=api.DecimalRoundingPolicy(
+            money_quantum=Decimal("0.05"),
+            money_rounding=api.RoundingMode.HALF_EVEN,
+            quantity_rounding=api.RoundingMode.DOWN,
+        ),
+    )
+    request = api.SizingRequest(
+        plan=request.plan,
+        candidate_group=request.candidate_group,
+        portfolio_owner_id=request.portfolio_owner_id,
+        source_position=request.source_position,
+        source_sale_quantity=Quantity(Decimal("0")),
+        source_sale_price=Decimal("0.074"),
+        candidate=request.candidate,
+        candidate_price=Decimal("0.074"),
+        available_cash=Decimal("0.21"),
+        configuration=aggregate_rounding_configuration,
+    )
+
+    result = api.DeterministicSizingEngine().size(request)
+
+    assert result.stages[0].purchase_quantity.value <= Decimal("2")
+    assert result.total_required_cash <= result.available_cash + result.net_sale_proceeds
+
+
 def test_sizing_rejects_overselling_and_unavailable_candidates() -> None:
     api = _api()
     request = _request(api)
