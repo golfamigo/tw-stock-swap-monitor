@@ -162,6 +162,50 @@ def test_sizing_prohibits_odd_lots_when_configuration_requires_whole_lots() -> N
     )
 
 
+def test_sizing_full_lot_target_uses_lot_cost_for_quantity_increment() -> None:
+    api = _api()
+    request = _request(api)
+    configuration = api.SizingConfiguration(
+        stages=(api.SizingStage(stage_id="one_lot", allocation_weight=Decimal("1")),),
+        fee_tax_profile=api.FeeTaxProfile(
+            purchase_fee_rate=Decimal("0"), sale_fee_rate=Decimal("0"), sale_tax_rate=Decimal("0")
+        ),
+        slippage_profile=api.SlippageProfile(purchase_rate=Decimal("0"), sale_rate=Decimal("0")),
+        reserve=Decimal("0"),
+        minimum_quantity=Decimal("1"),
+        lot_quantity=Decimal("10"),
+        odd_lot_policy=api.OddLotPolicy.PROHIBITED,
+        rounding=request.configuration.rounding,
+    )
+    request = api.SizingRequest(
+        plan=request.plan,
+        candidate_group=request.candidate_group,
+        portfolio_owner_id=request.portfolio_owner_id,
+        source_position=request.source_position,
+        source_sale_quantity=Quantity(Decimal("0")),
+        source_sale_price=request.source_sale_price,
+        candidate=request.candidate,
+        candidate_price=Decimal("10"),
+        available_cash=Decimal("100"),
+        configuration=configuration,
+    )
+
+    engine = api.DeterministicSizingEngine()
+
+    assert engine._quantity_for_target(
+        configuration=configuration,
+        target_value=Decimal("100"),
+        unit_cost=Decimal("10"),
+    ) == Decimal("10")
+
+    result = engine.size(request)
+
+    assert result.status is api.SizingStatus.ACTIONABLE
+    assert result.stages[0].target_value == Decimal("100")
+    assert result.stages[0].purchase_quantity == Quantity(Decimal("10"))
+    assert result.stages[0].total_cash == Decimal("100")
+
+
 def test_sizing_returns_non_actionable_insufficient_cash_without_negative_quantities() -> None:
     api = _api()
     request = _request(api)

@@ -129,7 +129,8 @@ class DeterministicSizingEngine:
         self, *, configuration: SizingConfiguration, target_value: Decimal, unit_cost: Decimal
     ) -> Decimal:
         increment = self._quantity_increment(configuration)
-        increments = floor_divide_decimals(target_value, unit_cost)
+        increment_cost = multiply_decimals(unit_cost, increment)
+        increments = floor_divide_decimals(target_value, increment_cost)
         quantity = multiply_decimals(Decimal(increments), increment)
         if quantity < configuration.minimum_quantity:
             return Decimal("0")
