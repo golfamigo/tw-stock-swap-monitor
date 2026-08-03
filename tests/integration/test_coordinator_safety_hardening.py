@@ -12,7 +12,7 @@ from typing import Never
 from uuid import UUID
 
 import pytest
-from app.application.child_intents import ChildIntentPurpose, build_child_intent
+from app.application.child_intents import ChildIntent, ChildIntentPurpose, build_child_intent
 from app.application.configuration import (
     CANONICAL_FORMAT_VERSION,
     ResolvedConfigurationSnapshot,
@@ -36,7 +36,13 @@ from app.data_sources.models import (
     Quote,
 )
 from app.domain.access import AccessContext
-from app.domain.entities import Instrument, Position, RotationPlan, ScanAttempt
+from app.domain.entities import (
+    Instrument,
+    LogicalScanRun,
+    Position,
+    RotationPlan,
+    ScanAttempt,
+)
 from app.domain.enums import (
     FinalizationDisposition,
     LogicalScanStatus,
@@ -249,7 +255,9 @@ class _RecordingScans(InMemoryLogicalScanRepository):
         super().__init__({PORTFOLIO_ID: OWNER_ID})
         self._events = events
 
-    def get_by_lock_key(self, *, request: ScanLockRequest, access_context: AccessContext) -> object:
+    def get_by_lock_key(
+        self, *, request: ScanLockRequest, access_context: AccessContext
+    ) -> LogicalScanRun | None:
         self._events.append("scan")
         return super().get_by_lock_key(request=request, access_context=access_context)
 
@@ -259,7 +267,7 @@ class _FailOnceChildIntents(InMemoryChildIntentRepository):
         super().__init__({PORTFOLIO_ID: OWNER_ID})
         self._remaining_failures = 1
 
-    def record_or_get(self, *, intent: object, access_context: AccessContext) -> object:
+    def record_or_get(self, *, intent: ChildIntent, access_context: AccessContext) -> ChildIntent:
         if self._remaining_failures:
             self._remaining_failures -= 1
             raise RuntimeError("injected child intent persistence failure")
@@ -271,11 +279,25 @@ class _FailOnceAttachScans(InMemoryLogicalScanRepository):
         super().__init__({PORTFOLIO_ID: OWNER_ID})
         self._remaining_failures = 1
 
-    def attach_final_strategy_run(self, **kwargs: object) -> object:
+    def attach_final_strategy_run(
+        self,
+        *,
+        logical_scan_run_id: UUID,
+        plan: RotationPlan,
+        strategy_run_id: UUID,
+        completed_at: datetime,
+        access_context: AccessContext,
+    ) -> LogicalScanRun:
         if self._remaining_failures:
             self._remaining_failures -= 1
             raise RuntimeError("injected logical scan finalization failure")
-        return super().attach_final_strategy_run(**kwargs)  # type: ignore[arg-type]
+        return super().attach_final_strategy_run(
+            logical_scan_run_id=logical_scan_run_id,
+            plan=plan,
+            strategy_run_id=strategy_run_id,
+            completed_at=completed_at,
+            access_context=access_context,
+        )
 
 
 class _FailOnceFinalAttemptScans(InMemoryLogicalScanRepository):
@@ -301,7 +323,7 @@ class _PauseFirstChildIntentWrite(InMemoryChildIntentRepository):
         self.release_first_write = Event()
         self._writes = 0
 
-    def record_or_get(self, *, intent: object, access_context: AccessContext) -> object:
+    def record_or_get(self, *, intent: ChildIntent, access_context: AccessContext) -> ChildIntent:
         self._writes += 1
         if self._writes == 1:
             self.first_write_started.set()
@@ -319,12 +341,32 @@ class _PauseNextRecommendationStateTransition(InMemoryRecommendationStateReposit
     def pause_next_transition(self) -> None:
         self._pause_next = True
 
-    def record_transition(self, **kwargs: object) -> object:
+    def record_transition(
+        self,
+        *,
+        plan: RotationPlan,
+        previous: RecommendationStateRecord,
+        next_state: RecommendationState,
+        remaining_stages_halted: bool,
+        changed_at: datetime,
+        access_context: AccessContext,
+        finalization_strategy_run_id: UUID | None = None,
+        finalization_strategy_key: str | None = None,
+    ) -> RecommendationStateRecord:
         if self._pause_next:
             self._pause_next = False
             self.transition_started.set()
             assert self.release_transition.wait(timeout=1)
-        return super().record_transition(**kwargs)  # type: ignore[arg-type]
+        return super().record_transition(
+            plan=plan,
+            previous=previous,
+            next_state=next_state,
+            remaining_stages_halted=remaining_stages_halted,
+            changed_at=changed_at,
+            access_context=access_context,
+            finalization_strategy_run_id=finalization_strategy_run_id,
+            finalization_strategy_key=finalization_strategy_key,
+        )
 
 
 def _uuid_factory(*, start: int = 1010) -> Callable[[], UUID]:
@@ -702,12 +744,14 @@ def test_finalization_failure_keeps_scan_recoverable_until_state_and_intent_are_
         parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context()).state
         is RecommendationState.ACTION_NOTIFIED
     )
+    stored_run = parts.strategy_runs.get_for_logical_scan(
+        logical_scan_run_id=failed.logical_scan_run_id,
+        access_context=_context(),
+    )
+    assert stored_run is not None
     assert (
         parts.child_intents.list_for_strategy_run(
-            strategy_run_id=parts.strategy_runs.get_for_logical_scan(
-                logical_scan_run_id=failed.logical_scan_run_id,
-                access_context=_context(),
-            ).strategy_run_id,
+            strategy_run_id=stored_run.strategy_run_id,
             access_context=_context(),
         )
         == ()
@@ -718,6 +762,7 @@ def test_finalization_failure_keeps_scan_recoverable_until_state_and_intent_are_
     assert recovered.disposition is RunDisposition.COMPLETED
     assert parts.provider.calls == 1
     assert recovered.strategy_run is not None
+    assert recovered.logical_scan_run_id is not None
     assert parts.child_intents.list_for_strategy_run(
         strategy_run_id=recovered.strategy_run.strategy_run_id, access_context=_context()
     )
@@ -982,11 +1027,11 @@ def test_concurrent_scan_candidates_finalize_the_fenced_loser_without_another_in
     assert errors == []
     assert sum(result.disposition is RunDisposition.COMPLETED for _, result in results) == 1
     assert sum(result.disposition is RunDisposition.SUPERSEDED for _, result in results) == 1
-    completed_scan_ids = [
-        result.logical_scan_run_id
-        for _, result in results
-        if result.disposition in {RunDisposition.COMPLETED, RunDisposition.SUPERSEDED}
-    ]
+    completed_scan_ids: list[UUID] = []
+    for _, result in results:
+        if result.disposition in {RunDisposition.COMPLETED, RunDisposition.SUPERSEDED}:
+            assert result.logical_scan_run_id is not None
+            completed_scan_ids.append(result.logical_scan_run_id)
     assert len(completed_scan_ids) == 2
     assert all(
         parts.logical_scans.get(scan_id, access_context=_context()).status
@@ -1077,7 +1122,7 @@ def test_uniquely_claimed_legacy_finalization_with_coarse_timestamps_backfills_f
     )
     legacy_state = parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context())
     assert isinstance(pending.final_strategy_key, str)
-    parts.recommendation_states._records[plan.rotation_plan_id] = replace(  # type: ignore[attr-defined]
+    parts.recommendation_states._records[plan.rotation_plan_id] = replace(
         legacy_state,
         finalization_strategy_run_id=None,
         finalization_strategy_key=None,
@@ -1143,7 +1188,7 @@ def test_unmarked_legacy_pending_finalization_without_terminal_attempt_is_supers
     )
     assert len(existing_intents) == 1
     legacy_state = parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context())
-    parts.recommendation_states._records[plan.rotation_plan_id] = replace(  # type: ignore[attr-defined]
+    parts.recommendation_states._records[plan.rotation_plan_id] = replace(
         legacy_state,
         finalization_strategy_run_id=None,
         finalization_strategy_key=None,
@@ -1214,7 +1259,7 @@ def test_concurrent_non_noop_candidate_cannot_claim_another_legacy_finalization_
     assert winner.disposition is RunDisposition.COMPLETED
     assert winner.strategy_run is not None
     marker_state = states.get(plan.rotation_plan_id, access_context=_context())
-    states._records[plan.rotation_plan_id] = replace(  # type: ignore[attr-defined]
+    states._records[plan.rotation_plan_id] = replace(
         marker_state,
         finalization_strategy_run_id=None,
         finalization_strategy_key=None,
@@ -1291,7 +1336,7 @@ def test_ambiguous_legacy_pending_finalization_without_terminal_attempt_is_super
     )
     assert len(existing_intents) == 1
     legacy_state = parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context())
-    parts.recommendation_states._records[plan.rotation_plan_id] = replace(  # type: ignore[attr-defined]
+    parts.recommendation_states._records[plan.rotation_plan_id] = replace(
         legacy_state,
         finalization_strategy_run_id=None,
         finalization_strategy_key=None,
@@ -1361,23 +1406,26 @@ def test_child_intent_repository_deduplicates_a_logical_retry_with_new_id_and_ti
     completed = parts.coordinator.run(_request(parts.configuration, plan=plan))
     assert completed.strategy_run is not None
     repository = parts.child_intents
-    stable = {
-        "rotation_plan_id": plan.rotation_plan_id,
-        "portfolio_id": PORTFOLIO_ID,
-        "strategy_run_id": completed.strategy_run.strategy_run_id,
-        "final_strategy_key": completed.final_strategy_key,
-        "purpose": ChildIntentPurpose.NOTIFICATION,
-    }
-    assert isinstance(stable["final_strategy_key"], str)
+    strategy_run_id = completed.strategy_run.strategy_run_id
+    final_strategy_key = completed.final_strategy_key
+    assert final_strategy_key is not None
     first = build_child_intent(
         child_intent_id=UUID("00000000-0000-0000-0000-000000001011"),
         created_at=NOW,
-        **stable,
+        rotation_plan_id=plan.rotation_plan_id,
+        portfolio_id=PORTFOLIO_ID,
+        strategy_run_id=strategy_run_id,
+        final_strategy_key=final_strategy_key,
+        purpose=ChildIntentPurpose.NOTIFICATION,
     )
     retried = build_child_intent(
         child_intent_id=UUID("00000000-0000-0000-0000-000000001012"),
         created_at=NOW + timedelta(minutes=1),
-        **stable,
+        rotation_plan_id=plan.rotation_plan_id,
+        portfolio_id=PORTFOLIO_ID,
+        strategy_run_id=strategy_run_id,
+        final_strategy_key=final_strategy_key,
+        purpose=ChildIntentPurpose.NOTIFICATION,
     )
 
     stored = repository.record_or_get(intent=first, access_context=_context())
@@ -1385,7 +1433,7 @@ def test_child_intent_repository_deduplicates_a_logical_retry_with_new_id_and_ti
 
     assert recovered == stored
     assert repository.list_for_strategy_run(
-        strategy_run_id=stable["strategy_run_id"], access_context=_context()
+        strategy_run_id=strategy_run_id, access_context=_context()
     ) == (stored,)
 
 
@@ -1491,6 +1539,7 @@ def test_action_notified_records_one_deterministic_child_intent_without_delivery
     second = parts.coordinator.run(_request(parts.configuration, plan=plan))
 
     assert first.disposition is RunDisposition.COMPLETED
+    assert first.strategy_run is not None
     assert second.strategy_run == first.strategy_run
     intent_key = first.audit["notification_intent_key"]
     assert isinstance(intent_key, str)
