@@ -60,9 +60,7 @@ class DeterministicSizingEngine:
             rounding=request.configuration.rounding,
         )
         source_sale = self._source_sale(request.source_sale_quantity, sale_proceeds)
-        funding = request.configuration.rounding.money(
-            request.available_cash + sale_proceeds.net_proceeds
-        )
+        funding = request.available_cash + sale_proceeds.net_proceeds
         if funding < request.configuration.reserve:
             return self._non_actionable_result(
                 request=request,
@@ -71,7 +69,7 @@ class DeterministicSizingEngine:
                 status=SizingStatus.INSUFFICIENT_CASH,
                 reason="funding_does_not_cover_reserve",
             )
-        spendable = request.configuration.rounding.money(funding - request.configuration.reserve)
+        spendable = funding - request.configuration.reserve
         quantities = self._initial_quantities(
             request.configuration, request.candidate_price, spendable
         )
@@ -110,10 +108,14 @@ class DeterministicSizingEngine:
             slippage_profile=configuration.slippage_profile,
             rounding=configuration.rounding,
         ).total_cash
+        if unit_cost <= Decimal("0"):
+            return tuple(Decimal("0") for _ in configuration.stages)
         return tuple(
             self._quantity_for_target(
                 configuration=configuration,
-                target_value=configuration.rounding.money(spendable * stage.allocation_weight),
+                target_value=configuration.rounding.money_not_increasing(
+                    spendable * stage.allocation_weight
+                ),
                 unit_cost=unit_cost,
             )
             for stage in configuration.stages
@@ -143,7 +145,9 @@ class DeterministicSizingEngine:
                 configuration=configuration,
                 stage=stage,
                 candidate_price=candidate_price,
-                target_value=configuration.rounding.money(spendable * stage.allocation_weight),
+                target_value=configuration.rounding.money_not_increasing(
+                    spendable * stage.allocation_weight
+                ),
                 quantity=quantity,
             )
             for stage, quantity in zip(configuration.stages, quantities, strict=True)
@@ -196,8 +200,18 @@ class DeterministicSizingEngine:
             quantities[decrement_index] = self._decrement_quantity(
                 configuration, quantities[decrement_index]
             )
-        spendable = sum((stage.target_value for stage in stages), Decimal("0"))
-        return self._stage_results(configuration, candidate_price, spendable, tuple(quantities))
+        return tuple(
+            self._stage_result(
+                configuration=configuration,
+                stage=configured_stage,
+                candidate_price=candidate_price,
+                target_value=existing_stage.target_value,
+                quantity=quantity,
+            )
+            for configured_stage, existing_stage, quantity in zip(
+                configuration.stages, stages, quantities, strict=True
+            )
+        )
 
     def _total_cash(
         self,

@@ -112,7 +112,7 @@ def test_sizing_three_configured_stages_accounts_for_costs_reserve_and_decimal_q
     assert tuple(stage.stage_id for stage in result.stages) == ("first", "second", "third")
     assert tuple(stage.target_value for stage in result.stages) == (
         Decimal("56.01"),
-        Decimal("84.02"),
+        Decimal("84.01"),
         Decimal("140.03"),
     )
     assert tuple(stage.purchase_quantity.value for stage in result.stages) == (
@@ -247,6 +247,48 @@ def test_money_quantum_rounds_cost_audit_values_to_the_configured_increment() ->
     assert cost.gross_value == Decimal("1.00")
     assert cost.total_cash == Decimal("1.00")
     assert cost.total_cash % Decimal("0.05") == Decimal("0")
+
+
+def test_sizing_preserves_raw_cash_before_half_up_quantization_for_affordability() -> None:
+    api = _api()
+    request = _request(api)
+    zero_cost_configuration = api.SizingConfiguration(
+        stages=(api.SizingStage(stage_id="only", allocation_weight=Decimal("1")),),
+        fee_tax_profile=api.FeeTaxProfile(
+            purchase_fee_rate=Decimal("0"),
+            sale_fee_rate=Decimal("0"),
+            sale_tax_rate=Decimal("0"),
+        ),
+        slippage_profile=api.SlippageProfile(purchase_rate=Decimal("0"), sale_rate=Decimal("0")),
+        reserve=Decimal("0"),
+        minimum_quantity=Decimal("1"),
+        lot_quantity=Decimal("1"),
+        odd_lot_policy=api.OddLotPolicy.ALLOWED,
+        rounding=api.DecimalRoundingPolicy(
+            money_quantum=Decimal("0.05"),
+            money_rounding=api.RoundingMode.HALF_UP,
+            quantity_rounding=api.RoundingMode.DOWN,
+        ),
+    )
+    request = api.SizingRequest(
+        plan=request.plan,
+        candidate_group=request.candidate_group,
+        portfolio_owner_id=request.portfolio_owner_id,
+        source_position=request.source_position,
+        source_sale_quantity=Quantity(Decimal("0")),
+        source_sale_price=Decimal("0.04"),
+        candidate=request.candidate,
+        candidate_price=Decimal("0.04"),
+        available_cash=Decimal("0.04"),
+        configuration=zero_cost_configuration,
+    )
+
+    result = api.DeterministicSizingEngine().size(request)
+
+    assert result.actionable is False
+    assert result.status is api.SizingStatus.NO_PURCHASE_QUANTITY
+    assert result.stages[0].purchase_quantity == Quantity(Decimal("0"))
+    assert result.total_required_cash <= result.available_cash + result.net_sale_proceeds
 
 
 def test_sizing_rejects_overselling_and_unavailable_candidates() -> None:

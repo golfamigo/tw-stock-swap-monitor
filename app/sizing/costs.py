@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
 
 from app.domain.values import require_finite_decimal
@@ -45,6 +45,13 @@ class DecimalRoundingPolicy:
         increments = (value / self.money_quantum).to_integral_value(
             rounding=self.money_rounding.value
         )
+        return increments * self.money_quantum
+
+    def money_not_increasing(self, value: Decimal) -> Decimal:
+        """Round monetary credit down to a quantum without increasing available funding."""
+
+        require_finite_decimal(value, field_name="money value")
+        increments = (value / self.money_quantum).to_integral_value(rounding=ROUND_FLOOR)
         return increments * self.money_quantum
 
 
@@ -134,12 +141,12 @@ def calculate_sale_proceeds(
 
     _require_nonnegative(quantity, field_name="sale quantity")
     _require_positive(price, field_name="sale price")
-    gross_value = rounding.money(quantity * price)
+    gross_value = rounding.money_not_increasing(quantity * price)
     slippage_cost = rounding.money(gross_value * slippage_profile.sale_rate)
     post_slippage_value = gross_value - slippage_cost
     fee = rounding.money(post_slippage_value * fee_tax_profile.sale_fee_rate)
     tax = rounding.money(post_slippage_value * fee_tax_profile.sale_tax_rate)
-    net_proceeds = rounding.money(post_slippage_value - fee - tax)
+    net_proceeds = rounding.money_not_increasing(post_slippage_value - fee - tax)
     return SaleProceeds(
         gross_value=gross_value,
         slippage_cost=slippage_cost,
