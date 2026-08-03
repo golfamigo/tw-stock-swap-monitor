@@ -249,6 +249,22 @@ def test_money_quantum_rounds_cost_audit_values_to_the_configured_increment() ->
     assert cost.total_cash % Decimal("0.05") == Decimal("0")
 
 
+def test_money_not_increasing_preserves_the_true_quantum_floor_at_decimal_precision() -> None:
+    api = _api()
+    rounding = api.DecimalRoundingPolicy(
+        money_quantum=Decimal("0.05"),
+        money_rounding=api.RoundingMode.HALF_EVEN,
+        quantity_rounding=api.RoundingMode.DOWN,
+    )
+    value = Decimal("1.049999999999999999999999999999")
+
+    floored = rounding.money_not_increasing(value)
+
+    assert floored == Decimal("1.00")
+    assert floored <= value
+    assert floored % Decimal("0.05") == Decimal("0")
+
+
 def test_sizing_preserves_raw_cash_before_half_up_quantization_for_affordability() -> None:
     api = _api()
     request = _request(api)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import ROUND_FLOOR, Decimal
+from decimal import Decimal
 from enum import StrEnum
 
 from app.domain.values import require_finite_decimal
@@ -51,8 +51,7 @@ class DecimalRoundingPolicy:
         """Round monetary credit down to a quantum without increasing available funding."""
 
         require_finite_decimal(value, field_name="money value")
-        increments = (value / self.money_quantum).to_integral_value(rounding=ROUND_FLOOR)
-        return increments * self.money_quantum
+        return _floor_to_quantum(value, self.money_quantum)
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,3 +171,35 @@ def _require_positive(value: Decimal, *, field_name: str) -> None:
     _require_nonnegative(value, field_name=field_name)
     if value.is_zero():
         raise CostError(f"{field_name} must be positive")
+
+
+def _floor_to_quantum(value: Decimal, quantum: Decimal) -> Decimal:
+    """Return the exact mathematical floor multiple without context-rounded division."""
+
+    value_coefficient, value_exponent = _decimal_coefficient_and_exponent(value)
+    quantum_coefficient, quantum_exponent = _decimal_coefficient_and_exponent(quantum)
+    exponent_difference = value_exponent - quantum_exponent
+    if exponent_difference >= 0:
+        numerator = value_coefficient * (10**exponent_difference)
+        denominator = quantum_coefficient
+    else:
+        numerator = value_coefficient
+        denominator = quantum_coefficient * (10 ** (-exponent_difference))
+    increments = numerator // denominator
+    return _decimal_from_coefficient(increments * quantum_coefficient, quantum_exponent)
+
+
+def _decimal_coefficient_and_exponent(value: Decimal) -> tuple[int, int]:
+    decimal_tuple = value.as_tuple()
+    if not isinstance(decimal_tuple.exponent, int):
+        raise AssertionError("finite Decimal must have an integer exponent")
+    coefficient = int("".join(str(digit) for digit in decimal_tuple.digits))
+    if decimal_tuple.sign:
+        coefficient = -coefficient
+    return coefficient, decimal_tuple.exponent
+
+
+def _decimal_from_coefficient(coefficient: int, exponent: int) -> Decimal:
+    sign = 1 if coefficient < 0 else 0
+    digits = tuple(int(digit) for digit in str(abs(coefficient)))
+    return Decimal((sign, digits, exponent))
