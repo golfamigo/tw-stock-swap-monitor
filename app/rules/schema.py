@@ -12,6 +12,12 @@ from types import MappingProxyType
 
 MAX_EXPRESSION_DEPTH = 16
 MAX_AST_NODES = 128
+MAX_RULESET_RULES = 512
+MAX_RULESET_AST_NODES = 512
+MAX_EVALUATION_STEPS = 512
+MAX_DECIMAL_COEFFICIENT_DIGITS = 256
+MAX_DECIMAL_ABSOLUTE_EXPONENT = 256
+MAX_DECIMAL_SERIALIZED_CHARACTERS = 512
 
 _PATH_PATTERN = re.compile(
     r"^(source|candidate|market|run)\.[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$"
@@ -40,6 +46,10 @@ class RuleEvaluationError(RuleError):
 
 class ProtectedRuleInputError(RuleEvaluationError):
     """A protected source was offered for a sell or action evaluation."""
+
+
+class DecimalResourceLimitError(RuleEvaluationError):
+    """A Decimal could exceed the fixed evidence and canonicalization resource limits."""
 
 
 class EvidenceKind(StrEnum):
@@ -164,6 +174,7 @@ class Rule:
             raise RuleSemanticError("rule id must be a non-blank string")
         if not isinstance(self.weight, Decimal) or not self.weight.is_finite():
             raise RuleSemanticError("rule weight must be a finite Decimal")
+        require_bounded_decimal(self.weight)
         if self.weight <= Decimal("0"):
             raise RuleSemanticError("rule weight must be positive")
         if self.expression.kind is not EvidenceKind.BOOLEAN:
@@ -176,3 +187,38 @@ def _validate_registered_path(path: object) -> None:
         raise RuleSemanticError("evidence paths must use an allowed root and identifier segments")
     if any(segment.startswith("__") for segment in path.split(".")):
         raise RuleSemanticError("dunder-style evidence paths are not permitted")
+
+
+def require_bounded_decimal(value: Decimal) -> Decimal:
+    """Reject finite Decimals that could allocate unbounded canonical evidence text."""
+
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise DecimalResourceLimitError("Decimal values must be finite")
+    decimal_tuple = value.as_tuple()
+    if not isinstance(decimal_tuple.exponent, int):
+        raise DecimalResourceLimitError("finite Decimal values require an integer exponent")
+    coefficient_digits = len(decimal_tuple.digits)
+    if coefficient_digits > MAX_DECIMAL_COEFFICIENT_DIGITS:
+        raise DecimalResourceLimitError("Decimal coefficient exceeds the fixed digit limit")
+    if abs(decimal_tuple.exponent) > MAX_DECIMAL_ABSOLUTE_EXPONENT:
+        raise DecimalResourceLimitError("Decimal exponent exceeds the fixed magnitude limit")
+    serialized_characters = _decimal_serialized_characters(
+        coefficient_digits=coefficient_digits,
+        exponent=decimal_tuple.exponent,
+        negative=bool(decimal_tuple.sign),
+    )
+    if serialized_characters > MAX_DECIMAL_SERIALIZED_CHARACTERS:
+        raise DecimalResourceLimitError("Decimal canonical form exceeds the fixed size limit")
+    return value
+
+
+def _decimal_serialized_characters(
+    *, coefficient_digits: int, exponent: int, negative: bool
+) -> int:
+    sign_characters = 1 if negative else 0
+    if exponent >= 0:
+        return sign_characters + coefficient_digits + exponent
+    decimal_point = coefficient_digits + exponent
+    if decimal_point > 0:
+        return sign_characters + coefficient_digits + 1
+    return sign_characters + 2 + (-decimal_point) + coefficient_digits

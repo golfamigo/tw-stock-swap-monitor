@@ -72,7 +72,7 @@ The schema is a transport-level guard. A second semantic validator checks arity,
 
 ## Evaluation constraints
 
-The engine enforces a maximum expression depth of 16, at most 128 AST nodes, and a monotonic evaluation budget. These are non-configurable safety invariants. Missing path values yield MISSING evidence and make that rule neither matched nor failed; they never coerce to zero, empty string, or false. A ruleset aggregation can be INSUFFICIENT when missing evidence means its threshold cannot be evaluated safely.
+The engine enforces a maximum expression depth of 16, at most 128 AST nodes, a ruleset maximum of 512 rules and 512 aggregate AST nodes, and a monotonic 512-step evaluation budget. These are non-configurable safety invariants. Decimal evidence, arithmetic results, and scores are limited to 256 coefficient digits, an absolute exponent of 256, and a maximum 512-character canonical form before capture. Missing path values yield MISSING evidence and make that rule neither matched nor failed; they never coerce to zero, empty string, or false. A ruleset aggregation can be INSUFFICIENT when missing evidence means its threshold cannot be evaluated safely.
 
 ## Evidence result
 

@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 
-from app.rules.schema import EvidenceKind, RuleEvaluationError
+from app.rules.schema import EvidenceKind, RuleEvaluationError, require_bounded_decimal
 
 
 class EvidenceStatus(StrEnum):
@@ -126,6 +126,7 @@ def canonical_decimal(value: Decimal) -> Decimal:
 
     if not isinstance(value, Decimal) or not value.is_finite():
         raise RuleEvaluationError("Decimal evidence must be finite")
+    require_bounded_decimal(value)
     if value.is_zero():
         return Decimal("0")
     decimal_tuple = value.as_tuple()

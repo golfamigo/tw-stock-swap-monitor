@@ -12,6 +12,8 @@ from jsonschema import Draft202012Validator, ValidationError  # type: ignore[imp
 from app.rules.schema import (
     MAX_AST_NODES,
     MAX_EXPRESSION_DEPTH,
+    MAX_RULESET_AST_NODES,
+    MAX_RULESET_RULES,
     EvidenceKind,
     Expression,
     LiteralExpression,
@@ -22,6 +24,7 @@ from app.rules.schema import (
     RuleSafetyError,
     RuleSemanticError,
     RuleTransportError,
+    require_bounded_decimal,
 )
 
 _ALLOWED_OPERATORS = frozenset(
@@ -110,6 +113,7 @@ class _ParseBudget:
 def validate_expression_transport(raw: object) -> None:
     """Apply the documented Draft 2020-12 JSON Schema before semantic validation."""
 
+    _preflight_raw_expression(raw)
     try:
         _RULE_EXPRESSION_VALIDATOR.validate(raw)
     except ValidationError as error:
@@ -155,11 +159,100 @@ def parse_rules(raw_rules: object) -> tuple[Rule, ...]:
 
     if not isinstance(raw_rules, list | tuple):
         raise RuleTransportError("rules must be a JSON array")
+    if len(raw_rules) > MAX_RULESET_RULES:
+        raise RuleSafetyError(f"ruleset rule count exceeds {MAX_RULESET_RULES}")
+    total_nodes = 0
+    for raw_rule in raw_rules:
+        if isinstance(raw_rule, dict) and "expression" in raw_rule:
+            total_nodes += _preflight_raw_expression(raw_rule["expression"])
+            if total_nodes > MAX_RULESET_AST_NODES:
+                raise RuleSafetyError(f"ruleset AST node count exceeds {MAX_RULESET_AST_NODES}")
     rules = tuple(parse_rule(raw_rule) for raw_rule in raw_rules)
     rule_ids = tuple(rule.rule_id for rule in rules)
     if len(set(rule_ids)) != len(rule_ids):
         raise RuleSemanticError("rule ids must be unique")
     return rules
+
+
+def validate_expression_ast(expression: Expression) -> None:
+    """Revalidate a public AST iteratively before direct evaluator use."""
+
+    stack: list[tuple[object, int]] = [(expression, 1)]
+    operations: list[OperationExpression] = []
+    node_count = 0
+    while stack:
+        node, depth = stack.pop()
+        if depth > MAX_EXPRESSION_DEPTH:
+            raise RuleSafetyError(f"expression depth exceeds {MAX_EXPRESSION_DEPTH}")
+        node_count += 1
+        if node_count > MAX_AST_NODES:
+            raise RuleSafetyError(f"expression node count exceeds {MAX_AST_NODES}")
+        if isinstance(node, LiteralExpression):
+            _validate_public_literal(node)
+            continue
+        if isinstance(node, PathExpression):
+            expected_kind = M0M1EvidenceRegistry.schema().kind_for(node.path)
+            if node.kind is not expected_kind:
+                raise RuleSemanticError("public path expression kind does not match the registry")
+            continue
+        if not isinstance(node, OperationExpression):
+            raise RuleSemanticError("public expression contains an unsupported AST node")
+        if not isinstance(node.operator, str) or node.operator not in _ALLOWED_OPERATORS:
+            raise RuleSemanticError("public operation expression has an unsupported operator")
+        if not isinstance(node.operands, tuple):
+            raise RuleSemanticError("public operation operands must be a tuple")
+        if not isinstance(node.kind, EvidenceKind):
+            raise RuleSemanticError("public operation expression kind must be an EvidenceKind")
+        operations.append(node)
+        for operand in reversed(node.operands):
+            stack.append((operand, depth + 1))
+
+    for operation in reversed(operations):
+        operand_kinds: list[EvidenceKind] = []
+        for operand in operation.operands:
+            if not isinstance(operand, LiteralExpression | PathExpression | OperationExpression):
+                raise RuleSemanticError("public operation has an unsupported operand node")
+            if not isinstance(operand.kind, EvidenceKind):
+                raise RuleSemanticError("public operation operand kind must be an EvidenceKind")
+            operand_kinds.append(operand.kind)
+        result_kind = _validate_operator(operation.operator, tuple(operation.operands))
+        if operation.kind is not result_kind:
+            raise RuleSemanticError("public operation result kind does not match its operands")
+
+
+def _preflight_raw_expression(raw: object) -> int:
+    """Iteratively enforce raw JSON expression limits before recursive JSON Schema validation."""
+
+    stack: list[tuple[object, int]] = [(raw, 1)]
+    node_count = 0
+    while stack:
+        node, depth = stack.pop()
+        if depth > MAX_EXPRESSION_DEPTH:
+            raise RuleSafetyError(f"expression depth exceeds {MAX_EXPRESSION_DEPTH}")
+        node_count += 1
+        if node_count > MAX_AST_NODES:
+            raise RuleSafetyError(f"expression node count exceeds {MAX_AST_NODES}")
+        if not isinstance(node, dict):
+            continue
+        if set(node) == {"var"}:
+            continue
+        if len(node) != 1:
+            continue
+        raw_operands = next(iter(node.values()))
+        if not isinstance(raw_operands, list):
+            continue
+        for operand in reversed(raw_operands):
+            stack.append((operand, depth + 1))
+    return node_count
+
+
+def _validate_public_literal(expression: LiteralExpression) -> None:
+    if not isinstance(expression.kind, EvidenceKind):
+        raise RuleSemanticError("public literal kind must be an EvidenceKind")
+    if expression.kind is EvidenceKind.DECIMAL:
+        if not isinstance(expression.value, Decimal):
+            raise RuleSemanticError("public Decimal literals must hold Decimal values")
+        require_bounded_decimal(expression.value)
 
 
 def _parse_expression(
@@ -284,7 +377,7 @@ def _decimal_from_json_number(value: int | float, *, label: str) -> Decimal:
         raise RuleTransportError(f"{label} must be finite")
     try:
         decimal = Decimal(str(value))
-    except InvalidOperation as error:
+    except (InvalidOperation, ValueError) as error:
         raise RuleTransportError(f"{label} must be Decimal-compatible") from error
     if not decimal.is_finite():
         raise RuleTransportError(f"{label} must be finite")
@@ -324,6 +417,7 @@ def _static_decimal(expression: Expression) -> Decimal | None:
 
 
 def _canonical_decimal(value: Decimal) -> Decimal:
+    require_bounded_decimal(value)
     if value.is_zero():
         return Decimal("0")
     decimal_tuple = value.as_tuple()

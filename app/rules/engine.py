@@ -19,7 +19,9 @@ from app.rules.evidence import (
     RulesetStatus,
     canonical_decimal,
 )
+from app.rules.parser import validate_expression_ast
 from app.rules.schema import (
+    MAX_EVALUATION_STEPS,
     EvidenceKind,
     Expression,
     LiteralExpression,
@@ -31,7 +33,6 @@ from app.rules.schema import (
     RuleEvaluationError,
 )
 
-MAX_EVALUATION_STEPS = 512
 _DECIMAL_CONTEXT = Context(prec=28, rounding=ROUND_HALF_EVEN)
 
 
@@ -102,6 +103,8 @@ def evaluate_ruleset(
     rule_ids = tuple(rule.rule_id for rule in parsed_rules)
     if len(set(rule_ids)) != len(rule_ids):
         raise RuleEvaluationError("rules must have unique ids")
+    for rule in parsed_rules:
+        validate_expression_ast(rule.expression)
     values = _prepare_values(rule_input.values)
     budget = _EvaluationBudget()
     matched_rule_ids: list[str] = []
