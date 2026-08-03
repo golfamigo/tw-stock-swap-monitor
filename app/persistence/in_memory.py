@@ -205,6 +205,9 @@ class InMemoryRecommendationStateRepository(_PortfolioScopedAdapter):
                 updated_at=changed_at,
                 finalization_strategy_run_id=finalization_strategy_run_id,
                 finalization_strategy_key=finalization_strategy_key,
+                legacy_finalization_claim_status=stored.legacy_finalization_claim_status,
+                legacy_finalization_strategy_run_id=(stored.legacy_finalization_strategy_run_id),
+                legacy_finalization_strategy_key=stored.legacy_finalization_strategy_key,
             )
             self._records[plan.rotation_plan_id] = updated
             return updated

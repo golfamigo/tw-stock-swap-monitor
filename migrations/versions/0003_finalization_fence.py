@@ -27,7 +27,9 @@ def upgrade() -> None:
 
     with op.batch_alter_table("recommendation_states") as batch:
         batch.add_column(sa.Column("finalization_strategy_run_id", _uuid(), nullable=True))
-        batch.add_column(sa.Column("finalization_strategy_key", sa.String(length=64), nullable=True))
+        batch.add_column(
+            sa.Column("finalization_strategy_key", sa.String(length=64), nullable=True)
+        )
         batch.create_foreign_key(
             "fk_recommendation_state_finalization_strategy_run",
             "strategy_runs",

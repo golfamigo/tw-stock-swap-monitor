@@ -343,11 +343,29 @@ class RecommendationStateModel(Base):
 
     __tablename__ = "recommendation_states"
     __table_args__ = (
+        UniqueConstraint(
+            "legacy_finalization_strategy_run_id",
+            name="uq_recommendation_state_legacy_finalization_strategy_run",
+        ),
         CheckConstraint("revision >= 0", name="ck_recommendation_state_revision"),
         CheckConstraint(
             "(finalization_strategy_run_id IS NULL AND finalization_strategy_key IS NULL) OR "
             "(finalization_strategy_run_id IS NOT NULL AND finalization_strategy_key IS NOT NULL)",
             name="ck_recommendation_state_finalization_fence",
+        ),
+        CheckConstraint(
+            "legacy_finalization_claim_status IN "
+            "('NOT_APPLICABLE', 'CLAIMED', 'NO_CLAIM', 'AMBIGUOUS')",
+            name="ck_recommendation_state_legacy_claim_status",
+        ),
+        CheckConstraint(
+            "(legacy_finalization_claim_status = 'CLAIMED' "
+            "AND legacy_finalization_strategy_run_id IS NOT NULL "
+            "AND legacy_finalization_strategy_key IS NOT NULL) OR "
+            "(legacy_finalization_claim_status != 'CLAIMED' "
+            "AND legacy_finalization_strategy_run_id IS NULL "
+            "AND legacy_finalization_strategy_key IS NULL)",
+            name="ck_recommendation_state_legacy_claim_evidence",
         ),
         CheckConstraint(
             "state IN ('IDLE', 'WATCHING', 'NEAR_TRIGGER', 'ACTION_PENDING', "
@@ -369,6 +387,13 @@ class RecommendationStateModel(Base):
         Uuid(as_uuid=True), ForeignKey("strategy_runs.strategy_run_id"), nullable=True
     )
     finalization_strategy_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    legacy_finalization_claim_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="NOT_APPLICABLE"
+    )
+    legacy_finalization_strategy_run_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("strategy_runs.strategy_run_id"), nullable=True
+    )
+    legacy_finalization_strategy_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     revision: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

@@ -48,7 +48,11 @@ from app.persistence.models import (
 from app.persistence.records import PersistedConfigurationSnapshot
 from app.schemas.common import ConfigurationLayerScope, ParentVersion
 from app.schemas.configuration import LayerPatchSchema
-from app.state_machine.states import RecommendationState, RecommendationStateRecord
+from app.state_machine.states import (
+    LegacyFinalizationClaimStatus,
+    RecommendationState,
+    RecommendationStateRecord,
+)
 
 
 def _persist_datetime(value: datetime) -> datetime:
@@ -460,6 +464,9 @@ def recommendation_state_to_model(record: RecommendationStateRecord) -> Recommen
         remaining_stages_halted=record.remaining_stages_halted,
         finalization_strategy_run_id=record.finalization_strategy_run_id,
         finalization_strategy_key=record.finalization_strategy_key,
+        legacy_finalization_claim_status=record.legacy_finalization_claim_status.value,
+        legacy_finalization_strategy_run_id=record.legacy_finalization_strategy_run_id,
+        legacy_finalization_strategy_key=record.legacy_finalization_strategy_key,
         revision=record.revision,
         updated_at=_persist_datetime(record.updated_at),
     )
@@ -475,6 +482,11 @@ def recommendation_state_from_model(model: RecommendationStateModel) -> Recommen
         remaining_stages_halted=model.remaining_stages_halted,
         finalization_strategy_run_id=model.finalization_strategy_run_id,
         finalization_strategy_key=model.finalization_strategy_key,
+        legacy_finalization_claim_status=LegacyFinalizationClaimStatus(
+            model.legacy_finalization_claim_status
+        ),
+        legacy_finalization_strategy_run_id=model.legacy_finalization_strategy_run_id,
+        legacy_finalization_strategy_key=model.legacy_finalization_strategy_key,
         revision=model.revision,
         updated_at=_restore_datetime(model.updated_at),
     )

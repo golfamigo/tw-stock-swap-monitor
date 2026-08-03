@@ -214,6 +214,9 @@ class SqlAlchemyRecommendationStateRepository(_SqlAlchemyScopedRepository):
             updated_at=changed_at,
             finalization_strategy_run_id=finalization_strategy_run_id,
             finalization_strategy_key=finalization_strategy_key,
+            legacy_finalization_claim_status=stored.legacy_finalization_claim_status,
+            legacy_finalization_strategy_run_id=stored.legacy_finalization_strategy_run_id,
+            legacy_finalization_strategy_key=stored.legacy_finalization_strategy_key,
         )
         result = self._session.execute(
             update(RecommendationStateModel)
@@ -230,6 +233,9 @@ class SqlAlchemyRecommendationStateRepository(_SqlAlchemyScopedRepository):
                 remaining_stages_halted=updated.remaining_stages_halted,
                 finalization_strategy_run_id=updated.finalization_strategy_run_id,
                 finalization_strategy_key=updated.finalization_strategy_key,
+                legacy_finalization_claim_status=updated.legacy_finalization_claim_status.value,
+                legacy_finalization_strategy_run_id=(updated.legacy_finalization_strategy_run_id),
+                legacy_finalization_strategy_key=updated.legacy_finalization_strategy_key,
                 revision=updated.revision,
                 updated_at=updated.updated_at.astimezone(UTC),
             )

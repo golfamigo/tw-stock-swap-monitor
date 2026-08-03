@@ -61,6 +61,7 @@ from app.services.rotation_run import RotationEvaluation
 from app.state_machine.machine import TransitionGuards
 from app.state_machine.states import (
     DataOutcome,
+    LegacyFinalizationClaimStatus,
     RecommendationEvent,
     RecommendationState,
     RecommendationStateRecord,
@@ -308,8 +309,26 @@ class _PauseFirstChildIntentWrite(InMemoryChildIntentRepository):
         return super().record_or_get(intent=intent, access_context=access_context)
 
 
-def _uuid_factory() -> Callable[[], UUID]:
-    value = 1010
+class _PauseNextRecommendationStateTransition(InMemoryRecommendationStateRepository):
+    def __init__(self) -> None:
+        super().__init__({PORTFOLIO_ID: OWNER_ID})
+        self.transition_started = Event()
+        self.release_transition = Event()
+        self._pause_next = False
+
+    def pause_next_transition(self) -> None:
+        self._pause_next = True
+
+    def record_transition(self, **kwargs: object) -> object:
+        if self._pause_next:
+            self._pause_next = False
+            self.transition_started.set()
+            assert self.release_transition.wait(timeout=1)
+        return super().record_transition(**kwargs)  # type: ignore[arg-type]
+
+
+def _uuid_factory(*, start: int = 1010) -> Callable[[], UUID]:
+    value = start
 
     def next_uuid() -> UUID:
         nonlocal value
@@ -344,6 +363,7 @@ def _parts(
     recommendation_states: InMemoryRecommendationStateRepository | None = None,
     child_intents: InMemoryChildIntentRepository | None = None,
     strategy_runs: InMemoryStrategyRunRepository | None = None,
+    new_uuid: Callable[[], UUID] | None = None,
     locks: _RecordingLock | None = None,
     provider: _Provider | None = None,
 ) -> _Parts:
@@ -386,7 +406,7 @@ def _parts(
         market_data=used_provider,
         evaluator=lambda *_: evaluation,
         now=lambda: NOW,
-        new_uuid=_uuid_factory(),
+        new_uuid=new_uuid or _uuid_factory(),
     )
     return _Parts(
         coordinator,
@@ -1022,7 +1042,7 @@ def test_concurrent_scan_candidates_finalize_the_fenced_loser_without_another_in
     )
 
 
-def test_legacy_pending_finalization_with_coarse_timestamps_backfills_fence() -> None:
+def test_uniquely_claimed_legacy_finalization_with_coarse_timestamps_backfills_fence() -> None:
     position = _position()
     plan = _plan()
     scans = _FailOnceFinalAttemptScans()
@@ -1056,10 +1076,14 @@ def test_legacy_pending_finalization_with_coarse_timestamps_backfills_fence() ->
         )
     )
     legacy_state = parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context())
+    assert isinstance(pending.final_strategy_key, str)
     parts.recommendation_states._records[plan.rotation_plan_id] = replace(  # type: ignore[attr-defined]
         legacy_state,
         finalization_strategy_run_id=None,
         finalization_strategy_key=None,
+        legacy_finalization_claim_status=LegacyFinalizationClaimStatus.CLAIMED,
+        legacy_finalization_strategy_run_id=candidate.strategy_run_id,
+        legacy_finalization_strategy_key=pending.final_strategy_key,
     )
 
     recovered = parts.coordinator.run(request)
@@ -1088,7 +1112,155 @@ def test_legacy_pending_finalization_with_coarse_timestamps_backfills_fence() ->
     )
 
 
-def test_mismatched_legacy_pending_finalization_without_terminal_attempt_is_superseded() -> None:
+def test_unmarked_legacy_pending_finalization_without_terminal_attempt_is_superseded() -> None:
+    position = _position()
+    plan = _plan()
+    scans = _FailOnceFinalAttemptScans()
+    parts = _parts(
+        evaluation=RotationEvaluation(
+            event=RecommendationEvent.DECISION_VALIDATED,
+            guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+            outputs={"attempt": "legacy-unmarked"},
+            sale_source_position_id=position.position_id,
+        ),
+        plan=plan,
+        positions=(position,),
+        logical_scans=scans,
+    )
+    _seed_state(parts.recommendation_states, plan, RecommendationState.ACTION_PENDING)
+    request = _request(parts.configuration, plan=plan)
+
+    pending = parts.coordinator.run(request)
+
+    assert pending.disposition is RunDisposition.FAILED
+    assert pending.logical_scan_run_id is not None
+    candidate = parts.strategy_runs.get_for_logical_scan(
+        logical_scan_run_id=pending.logical_scan_run_id, access_context=_context()
+    )
+    assert candidate is not None
+    existing_intents = parts.child_intents.list_for_strategy_run(
+        strategy_run_id=candidate.strategy_run_id, access_context=_context()
+    )
+    assert len(existing_intents) == 1
+    legacy_state = parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context())
+    parts.recommendation_states._records[plan.rotation_plan_id] = replace(  # type: ignore[attr-defined]
+        legacy_state,
+        finalization_strategy_run_id=None,
+        finalization_strategy_key=None,
+        legacy_finalization_claim_status=LegacyFinalizationClaimStatus.NO_CLAIM,
+    )
+
+    recovered = parts.coordinator.run(request)
+
+    assert recovered.disposition is RunDisposition.SUPERSEDED
+    assert recovered.audit["failure_code"] == "FINALIZATION_SUPERSEDED"
+    assert (
+        parts.child_intents.list_for_strategy_run(
+            strategy_run_id=candidate.strategy_run_id, access_context=_context()
+        )
+        == existing_intents
+    )
+
+
+def test_concurrent_non_noop_candidate_cannot_claim_another_legacy_finalization_marker() -> None:
+    position = _position()
+    plan = _plan()
+    states = _PauseNextRecommendationStateTransition()
+    scans = InMemoryLogicalScanRepository({PORTFOLIO_ID: OWNER_ID})
+    intents = InMemoryChildIntentRepository({PORTFOLIO_ID: OWNER_ID})
+    first = _parts(
+        evaluation=RotationEvaluation(
+            event=RecommendationEvent.DECISION_VALIDATED,
+            guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+            outputs={"attempt": "legacy-marker-loser"},
+            sale_source_position_id=position.position_id,
+        ),
+        plan=plan,
+        positions=(position,),
+        logical_scans=scans,
+        recommendation_states=states,
+        child_intents=intents,
+    )
+    _seed_state(states, plan, RecommendationState.ACTION_PENDING)
+    second = _parts(
+        evaluation=RotationEvaluation(
+            event=RecommendationEvent.DECISION_VALIDATED,
+            guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+            outputs={"attempt": "legacy-marker-winner"},
+            sale_source_position_id=position.position_id,
+        ),
+        plan=plan,
+        positions=(position,),
+        logical_scans=scans,
+        recommendation_states=states,
+        child_intents=intents,
+        strategy_runs=first.strategy_runs,
+        new_uuid=_uuid_factory(start=2020),
+    )
+    loser_request = _request(first.configuration, plan=plan)
+    winner_request = replace(
+        _request(second.configuration, plan=plan),
+        scan_window_start=loser_request.scan_window_start + timedelta(minutes=3),
+    )
+    results: list[RunCoordinatorResult] = []
+
+    states.pause_next_transition()
+    loser_thread = Thread(target=lambda: results.append(first.coordinator.run(loser_request)))
+    loser_thread.start()
+    assert states.transition_started.wait(timeout=1)
+
+    winner = second.coordinator.run(winner_request)
+
+    assert winner.disposition is RunDisposition.COMPLETED
+    assert winner.strategy_run is not None
+    marker_state = states.get(plan.rotation_plan_id, access_context=_context())
+    states._records[plan.rotation_plan_id] = replace(  # type: ignore[attr-defined]
+        marker_state,
+        finalization_strategy_run_id=None,
+        finalization_strategy_key=None,
+        legacy_finalization_claim_status=LegacyFinalizationClaimStatus.CLAIMED,
+        legacy_finalization_strategy_run_id=winner.strategy_run.strategy_run_id,
+        legacy_finalization_strategy_key=winner.final_strategy_key,
+    )
+    states.release_transition.set()
+    loser_thread.join(timeout=1)
+
+    assert not loser_thread.is_alive()
+    assert len(results) == 1
+    assert results[0].disposition is RunDisposition.FAILED
+    assert results[0].logical_scan_run_id is not None
+    loser_run = first.strategy_runs.get_for_logical_scan(
+        logical_scan_run_id=results[0].logical_scan_run_id, access_context=_context()
+    )
+    assert loser_run is not None
+
+    recovered = first.coordinator.run(loser_request)
+
+    assert recovered.disposition is RunDisposition.SUPERSEDED
+    assert recovered.audit["failure_code"] == "FINALIZATION_SUPERSEDED"
+    assert (
+        intents.list_for_strategy_run(
+            strategy_run_id=loser_run.strategy_run_id, access_context=_context()
+        )
+        == ()
+    )
+    loser_final_attempts = [
+        attempt
+        for attempt in scans.list_attempts(
+            logical_scan_run_id=results[0].logical_scan_run_id, access_context=_context()
+        )
+        if attempt.final_strategy_run_id == loser_run.strategy_run_id
+    ]
+    assert len(loser_final_attempts) == 1
+    assert loser_final_attempts[0].finalization_disposition is FinalizationDisposition.SUPERSEDED
+    preserved_marker = states.get(plan.rotation_plan_id, access_context=_context())
+    assert (
+        preserved_marker.legacy_finalization_strategy_run_id == winner.strategy_run.strategy_run_id
+    )
+    assert preserved_marker.legacy_finalization_strategy_key == winner.final_strategy_key
+
+
+def test_ambiguous_legacy_pending_finalization_without_terminal_attempt_is_superseded() -> None:
     position = _position()
     plan = _plan()
     scans = _FailOnceFinalAttemptScans()
@@ -1114,14 +1286,16 @@ def test_mismatched_legacy_pending_finalization_without_terminal_attempt_is_supe
         logical_scan_run_id=pending.logical_scan_run_id, access_context=_context()
     )
     assert candidate is not None
+    existing_intents = parts.child_intents.list_for_strategy_run(
+        strategy_run_id=candidate.strategy_run_id, access_context=_context()
+    )
+    assert len(existing_intents) == 1
     legacy_state = parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context())
     parts.recommendation_states._records[plan.rotation_plan_id] = replace(  # type: ignore[attr-defined]
         legacy_state,
-        state=RecommendationState.WATCHING,
-        remaining_stages_halted=False,
         finalization_strategy_run_id=None,
         finalization_strategy_key=None,
-        updated_at=legacy_state.updated_at + timedelta(microseconds=1),
+        legacy_finalization_claim_status=LegacyFinalizationClaimStatus.AMBIGUOUS,
     )
 
     recovered = parts.coordinator.run(request)
@@ -1129,15 +1303,14 @@ def test_mismatched_legacy_pending_finalization_without_terminal_attempt_is_supe
     assert recovered.disposition is RunDisposition.SUPERSEDED
     assert recovered.audit["failure_code"] == "FINALIZATION_SUPERSEDED"
     unchanged = parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context())
-    assert unchanged.state is RecommendationState.WATCHING
+    assert unchanged.state is RecommendationState.ACTION_NOTIFIED
     assert unchanged.finalization_strategy_run_id is None
+    assert unchanged.legacy_finalization_claim_status is LegacyFinalizationClaimStatus.AMBIGUOUS
     assert (
-        len(
-            parts.child_intents.list_for_strategy_run(
-                strategy_run_id=candidate.strategy_run_id, access_context=_context()
-            )
+        parts.child_intents.list_for_strategy_run(
+            strategy_run_id=candidate.strategy_run_id, access_context=_context()
         )
-        == 1
+        == existing_intents
     )
 
 

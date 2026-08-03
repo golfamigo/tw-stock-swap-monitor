@@ -19,8 +19,10 @@ from app.state_machine.machine import (
 )
 from app.state_machine.states import (
     DataOutcome,
+    LegacyFinalizationClaimStatus,
     RecommendationEvent,
     RecommendationState,
+    RecommendationStateRecord,
     RuleOutcome,
     SizingOutcome,
     TransitionNotAllowed,
@@ -78,6 +80,30 @@ def _transition(
             remaining_stages_halted=remaining_stages_halted,
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("strategy_run_id", "final_strategy_key"),
+    [
+        pytest.param(UUID("00000000-0000-0000-0000-000000000704"), None, id="run-only"),
+        pytest.param(None, "a" * 64, id="key-only"),
+    ],
+)
+def test_non_claimed_legacy_provenance_rejects_partial_run_key_evidence(
+    strategy_run_id: UUID | None, final_strategy_key: str | None
+) -> None:
+    with pytest.raises(ValueError, match="legacy finalization claim"):
+        RecommendationStateRecord(
+            rotation_plan_id=UUID("00000000-0000-0000-0000-000000000705"),
+            portfolio_id=PORTFOLIO_ID,
+            state=RecommendationState.ACTION_NOTIFIED,
+            remaining_stages_halted=False,
+            revision=1,
+            updated_at=datetime(2026, 8, 1, tzinfo=UTC),
+            legacy_finalization_claim_status=LegacyFinalizationClaimStatus.NO_CLAIM,
+            legacy_finalization_strategy_run_id=strategy_run_id,
+            legacy_finalization_strategy_key=final_strategy_key,
+        )
 
 
 @pytest.mark.parametrize(

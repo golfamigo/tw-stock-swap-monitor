@@ -33,7 +33,12 @@ def upgrade() -> None:
             sa.ForeignKey("rotation_plans.rotation_plan_id"),
             primary_key=True,
         ),
-        sa.Column("portfolio_id", _uuid(), sa.ForeignKey("portfolios.portfolio_id"), nullable=False),
+        sa.Column(
+            "portfolio_id",
+            _uuid(),
+            sa.ForeignKey("portfolios.portfolio_id"),
+            nullable=False,
+        ),
         sa.Column("state", sa.String(length=32), nullable=False),
         sa.Column("remaining_stages_halted", sa.Boolean(), nullable=False),
         sa.Column("revision", sa.Integer(), nullable=False),
@@ -55,7 +60,12 @@ def upgrade() -> None:
             sa.ForeignKey("rotation_plans.rotation_plan_id"),
             nullable=False,
         ),
-        sa.Column("portfolio_id", _uuid(), sa.ForeignKey("portfolios.portfolio_id"), nullable=False),
+        sa.Column(
+            "portfolio_id",
+            _uuid(),
+            sa.ForeignKey("portfolios.portfolio_id"),
+            nullable=False,
+        ),
         sa.Column(
             "strategy_run_id",
             _uuid(),
@@ -73,7 +83,11 @@ def upgrade() -> None:
     with op.batch_alter_table("scan_attempts") as batch:
         batch.add_column(sa.Column("configuration_snapshot_id", _uuid(), nullable=True))
         batch.add_column(
-            sa.Column("configuration_snapshot_created_at", sa.DateTime(timezone=True), nullable=True)
+            sa.Column(
+                "configuration_snapshot_created_at",
+                sa.DateTime(timezone=True),
+                nullable=True,
+            )
         )
         batch.add_column(sa.Column("final_strategy_key", sa.String(length=64), nullable=True))
         batch.add_column(

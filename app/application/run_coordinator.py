@@ -28,7 +28,11 @@ from app.repositories.recommendation_states import RecommendationStateRepository
 from app.repositories.rotation_plans import RotationPlanRepository
 from app.repositories.strategy_runs import StrategyRunRepository
 from app.services.rotation_run import RotationEvaluation, RotationEvaluator, RotationRunService
-from app.state_machine.states import RecommendationState
+from app.state_machine.states import (
+    LegacyFinalizationClaimStatus,
+    RecommendationState,
+    RecommendationStateRecord,
+)
 
 
 class TriggerSource(StrEnum):
@@ -571,6 +575,7 @@ class RunCoordinator:
                 and current.finalization_strategy_key is None
                 and self._is_legacy_pending_finalization(
                     request=request,
+                    current=current,
                     effects=effects,
                     scan=scan,
                     strategy_run=strategy_run,
@@ -629,6 +634,7 @@ class RunCoordinator:
         self,
         *,
         request: RunCoordinatorRequest,
+        current: RecommendationStateRecord,
         effects: _FinalizationEvidence,
         scan: LogicalScanRun,
         strategy_run: StrategyRun,
@@ -637,7 +643,10 @@ class RunCoordinator:
         """Allow only the historic no-terminal-attempt 0002 shape to claim a fence."""
 
         if (
-            scan.status is not LogicalScanStatus.RUNNING
+            current.legacy_finalization_claim_status is not LegacyFinalizationClaimStatus.CLAIMED
+            or current.legacy_finalization_strategy_run_id != strategy_run.strategy_run_id
+            or current.legacy_finalization_strategy_key != final_identity.key
+            or scan.status is not LogicalScanStatus.RUNNING
             or final_identity.scan_lock_key != scan.scan_lock_key
             or strategy_run.configuration_snapshot.content_hash != scan.configuration_snapshot_hash
             or (

@@ -45,6 +45,15 @@ class RecommendationEvent(StrEnum):
     PLAN_RESUMED = "PLAN_RESUMED"
 
 
+class LegacyFinalizationClaimStatus(StrEnum):
+    """Migration-era provenance for a legacy unfenced finalization candidate."""
+
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    CLAIMED = "CLAIMED"
+    NO_CLAIM = "NO_CLAIM"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
 class DataOutcome(StrEnum):
     """Validated market-data quality relevant to a recommendation transition."""
 
@@ -94,6 +103,11 @@ class RecommendationStateRecord:
     updated_at: datetime
     finalization_strategy_run_id: UUID | None = None
     finalization_strategy_key: str | None = None
+    legacy_finalization_claim_status: LegacyFinalizationClaimStatus = (
+        LegacyFinalizationClaimStatus.NOT_APPLICABLE
+    )
+    legacy_finalization_strategy_run_id: UUID | None = None
+    legacy_finalization_strategy_key: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, RecommendationState):
@@ -115,4 +129,29 @@ class RecommendationStateRecord:
             )
         ):
             raise ValueError("finalization_strategy_key must be a SHA-256 hexadecimal digest")
+        if not isinstance(self.legacy_finalization_claim_status, LegacyFinalizationClaimStatus):
+            raise TypeError(
+                "legacy_finalization_claim_status must be a LegacyFinalizationClaimStatus"
+            )
+        legacy_claimed = (
+            self.legacy_finalization_claim_status is LegacyFinalizationClaimStatus.CLAIMED
+        )
+        has_legacy_run = self.legacy_finalization_strategy_run_id is not None
+        has_legacy_key = self.legacy_finalization_strategy_key is not None
+        if has_legacy_run != has_legacy_key or legacy_claimed != has_legacy_run:
+            raise ValueError("legacy finalization claim requires exactly one strategy run and key")
+        if self.legacy_finalization_strategy_run_id is not None and not isinstance(
+            self.legacy_finalization_strategy_run_id, UUID
+        ):
+            raise TypeError("legacy_finalization_strategy_run_id must be a UUID or None")
+        if self.legacy_finalization_strategy_key is not None and (
+            len(self.legacy_finalization_strategy_key) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.legacy_finalization_strategy_key
+            )
+        ):
+            raise ValueError(
+                "legacy_finalization_strategy_key must be a SHA-256 hexadecimal digest"
+            )
         require_timezone_aware(self.updated_at, field_name="updated_at")

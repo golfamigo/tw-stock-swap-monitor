@@ -15,6 +15,7 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
+import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
 from app.application.child_intents import ChildIntentPurpose, build_child_intent
@@ -2158,6 +2159,217 @@ def test_frozen_alembic_upgrade_creates_every_foundation_table(tmp_path: Path) -
     with engine.connect() as connection:
         table_names = set(connection.dialect.get_table_names(connection))
     assert table_names == set(EXPECTED_FOUNDATION_TABLES) | {"alembic_version"}
+
+
+def test_head_migration_persists_legacy_finalization_claim_provenance(tmp_path: Path) -> None:
+    database_path = tmp_path / "legacy-finalization-claim.sqlite3"
+    config = Config(str(Path("alembic.ini").resolve()))
+    config.set_main_option("script_location", str(Path("migrations").resolve()))
+    config.set_main_option("sqlalchemy.url", f"sqlite+pysqlite:///{database_path}")
+
+    command.upgrade(config, "head")
+
+    engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+    with engine.connect() as connection:
+        columns = {
+            column["name"] for column in inspect(connection).get_columns("recommendation_states")
+        }
+        constraints = {
+            constraint["name"]
+            for constraint in inspect(connection).get_check_constraints("recommendation_states")
+        }
+        unique_constraints = {
+            constraint["name"]
+            for constraint in inspect(connection).get_unique_constraints("recommendation_states")
+        }
+    assert {
+        "legacy_finalization_claim_status",
+        "legacy_finalization_strategy_run_id",
+        "legacy_finalization_strategy_key",
+    } <= columns
+    assert {
+        "ck_recommendation_state_legacy_claim_status",
+        "ck_recommendation_state_legacy_claim_evidence",
+    } <= constraints
+    assert "uq_recommendation_state_legacy_finalization_strategy_run" in unique_constraints
+
+
+def test_legacy_claim_backfill_accepts_only_a_unique_verified_candidate() -> None:
+    migration_path = Path("migrations/versions/0005_legacy_finalization_claims.py").resolve()
+    spec = importlib.util.spec_from_file_location("legacy_finalization_claims", migration_path)
+    assert spec is not None and spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    metadata = sa.MetaData()
+    scans = sa.Table(
+        "logical_scan_runs",
+        metadata,
+        sa.Column("logical_scan_run_id", sa.Uuid(as_uuid=True), primary_key=True),
+        sa.Column("rotation_plan_id", sa.Uuid(as_uuid=True), nullable=False),
+        sa.Column("configuration_snapshot_hash", sa.String(64), nullable=False),
+        sa.Column("scan_lock_key", sa.String(64), nullable=False),
+        sa.Column("status", sa.String(16), nullable=False),
+    )
+    runs = sa.Table(
+        "strategy_runs",
+        metadata,
+        sa.Column("strategy_run_id", sa.Uuid(as_uuid=True), primary_key=True),
+        sa.Column("rotation_plan_id", sa.Uuid(as_uuid=True), nullable=False),
+        sa.Column("portfolio_id", sa.Uuid(as_uuid=True), nullable=False),
+        sa.Column("logical_scan_run_id", sa.Uuid(as_uuid=True), nullable=False),
+        sa.Column("configuration_content_hash", sa.String(64), nullable=False),
+        sa.Column("outputs", sa.JSON(), nullable=False),
+        sa.Column("state_transition", sa.String(128), nullable=False),
+    )
+    attempts = sa.Table(
+        "scan_attempts",
+        metadata,
+        sa.Column("scan_attempt_id", sa.Uuid(as_uuid=True), primary_key=True),
+        sa.Column("logical_scan_run_id", sa.Uuid(as_uuid=True), nullable=False),
+        sa.Column("status", sa.String(16), nullable=False),
+        sa.Column("final_strategy_run_id", sa.Uuid(as_uuid=True), nullable=True),
+    )
+    intents = sa.Table(
+        "child_intents",
+        metadata,
+        sa.Column("child_intent_id", sa.Uuid(as_uuid=True), primary_key=True),
+        sa.Column("rotation_plan_id", sa.Uuid(as_uuid=True), nullable=False),
+        sa.Column("portfolio_id", sa.Uuid(as_uuid=True), nullable=False),
+        sa.Column("strategy_run_id", sa.Uuid(as_uuid=True), nullable=False),
+        sa.Column("final_strategy_key", sa.String(64), nullable=False),
+        sa.Column("purpose", sa.String(32), nullable=False),
+    )
+    plan_id = uuid4()
+    portfolio_id = uuid4()
+    first_run_id = uuid4()
+    first_scan_id = uuid4()
+    first_key = "a" * 64
+    first_lock_key = "b" * 64
+    state = {
+        "rotation_plan_id": plan_id,
+        "portfolio_id": portfolio_id,
+        "state": "ACTION_NOTIFIED",
+        "remaining_stages_halted": False,
+    }
+
+    def outputs(*, final_key: str, scan_lock_key: str) -> dict[str, object]:
+        return {
+            "idempotency": {
+                "final_strategy_key": final_key,
+                "scan_lock_key": scan_lock_key,
+            },
+            "recommendation": {
+                "previous_state": "ACTION_PENDING",
+                "next_state": "ACTION_NOTIFIED",
+                "previous_remaining_stages_halted": False,
+                "remaining_stages_halted": False,
+                "notification_intent_recorded": True,
+            },
+        }
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            scans.insert(),
+            {
+                "logical_scan_run_id": first_scan_id,
+                "rotation_plan_id": plan_id,
+                "configuration_snapshot_hash": "c" * 64,
+                "scan_lock_key": first_lock_key,
+                "status": "RUNNING",
+            },
+        )
+        connection.execute(
+            runs.insert(),
+            {
+                "strategy_run_id": first_run_id,
+                "rotation_plan_id": plan_id,
+                "portfolio_id": portfolio_id,
+                "logical_scan_run_id": first_scan_id,
+                "configuration_content_hash": "c" * 64,
+                "outputs": outputs(final_key=first_key, scan_lock_key=first_lock_key),
+                "state_transition": "ACTION_PENDING->ACTION_NOTIFIED",
+            },
+        )
+        connection.execute(
+            intents.insert(),
+            {
+                "child_intent_id": uuid4(),
+                "rotation_plan_id": plan_id,
+                "portfolio_id": portfolio_id,
+                "strategy_run_id": first_run_id,
+                "final_strategy_key": first_key,
+                "purpose": "NOTIFICATION",
+            },
+        )
+        assert migration._legacy_candidates(
+            bind=connection,
+            state=state,
+            scans=scans,
+            runs=runs,
+            attempts=attempts,
+            intents=intents,
+        ) == [(first_run_id, first_key)]
+
+        second_run_id = uuid4()
+        second_scan_id = uuid4()
+        second_key = "d" * 64
+        second_lock_key = "e" * 64
+        connection.execute(
+            scans.insert(),
+            {
+                "logical_scan_run_id": second_scan_id,
+                "rotation_plan_id": plan_id,
+                "configuration_snapshot_hash": "c" * 64,
+                "scan_lock_key": second_lock_key,
+                "status": "RUNNING",
+            },
+        )
+        connection.execute(
+            runs.insert(),
+            {
+                "strategy_run_id": second_run_id,
+                "rotation_plan_id": plan_id,
+                "portfolio_id": portfolio_id,
+                "logical_scan_run_id": second_scan_id,
+                "configuration_content_hash": "c" * 64,
+                "outputs": outputs(final_key=second_key, scan_lock_key=second_lock_key),
+                "state_transition": "ACTION_PENDING->ACTION_NOTIFIED",
+            },
+        )
+        connection.execute(
+            intents.insert(),
+            {
+                "child_intent_id": uuid4(),
+                "rotation_plan_id": plan_id,
+                "portfolio_id": portfolio_id,
+                "strategy_run_id": second_run_id,
+                "final_strategy_key": second_key,
+                "purpose": "NOTIFICATION",
+            },
+        )
+        assert migration._legacy_candidates(
+            bind=connection,
+            state=state,
+            scans=scans,
+            runs=runs,
+            attempts=attempts,
+            intents=intents,
+        ) == [(first_run_id, first_key), (second_run_id, second_key)]
+        connection.execute(intents.delete())
+        assert (
+            migration._legacy_candidates(
+                bind=connection,
+                state=state,
+                scans=scans,
+                runs=runs,
+                attempts=attempts,
+                intents=intents,
+            )
+            == []
+        )
 
 
 def test_foundation_migration_is_revision_frozen_not_live_metadata() -> None:
