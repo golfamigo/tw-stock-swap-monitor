@@ -242,6 +242,7 @@ def test_full_request_missing_its_final_session_is_not_actionable() -> None:
     assert not result.actionable
     assert result.value is None
     assert result.reason == "incomplete_source_coverage"
+    assert result.evidence["coverage_gap"] == "missing_session_open"
     assert result.evidence["session_segment"] == "1"
     assert result.evidence["required_end"].endswith("14:00:00+08:00")
 
@@ -261,3 +262,23 @@ def test_full_cross_break_request_uses_the_final_complete_session_for_vwap() -> 
     assert result.actionable
     assert result.value == Decimal("10")
     assert result.evidence["session_segment"] == "1"
+
+
+def test_session_vwap_requires_coverage_from_the_actual_session_open() -> None:
+    session_date = date(2030, 1, 10)
+    indicator = SessionVwapIndicator(
+        calendar=FixtureCalendar(), market=MARKET, instrument_id=INSTRUMENT_A
+    )
+
+    result = indicator.calculate(
+        snapshot(
+            session_date,
+            (bar(session_date, 9, 15), bar(session_date, 9, 16)),
+        )
+    )
+
+    assert not result.actionable
+    assert result.value is None
+    assert result.reason == "incomplete_source_coverage"
+    assert result.evidence["coverage_gap"] == "missing_session_open"
+    assert result.evidence["required_start"].endswith("09:00:00+08:00")

@@ -1,7 +1,9 @@
 """Offline contract between the deterministic source and calendar-aligned aggregation."""
 
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import pytest
 from app.calendar.mock import MockTradingCalendar
@@ -13,6 +15,8 @@ from app.indicators.bars import aggregate_bars
 
 MARKET = "source-a"
 TRADING_DAY = date(2030, 1, 2)
+TAIPEI = ZoneInfo("Asia/Taipei")
+EQUIVALENT_OFFSET_TIMEZONE = ZoneInfo("Etc/GMT-8")
 
 
 def _calendar() -> MockTradingCalendar:
@@ -54,6 +58,45 @@ def _request(interval: timedelta) -> MarketDataRequest:
     )
 
 
+def _taipei_calendar() -> MockTradingCalendar:
+    return MockTradingCalendar(
+        market=MARKET,
+        timezone_name="Asia/Taipei",
+        trading_day=TRADING_DAY,
+        sessions=(
+            MarketSession(
+                opens_at=datetime(2030, 1, 2, 9, 0, tzinfo=TAIPEI),
+                closes_at=datetime(2030, 1, 2, 11, 0, tzinfo=TAIPEI),
+            ),
+            MarketSession(
+                opens_at=datetime(2030, 1, 2, 13, 0, tzinfo=TAIPEI),
+                closes_at=datetime(2030, 1, 2, 14, 0, tzinfo=TAIPEI),
+            ),
+        ),
+    )
+
+
+def _equivalent_timezone_request(interval: timedelta) -> MarketDataRequest:
+    return MarketDataRequest(
+        request_id=UUID("00000000-0000-0000-0000-000000000703"),
+        instruments=(
+            Instrument(
+                instrument_id=UUID("00000000-0000-0000-0000-000000000704"),
+                market=MARKET,
+                symbol="instrument-taipei",
+                created_at=datetime(2030, 1, 1, tzinfo=TAIPEI),
+            ),
+        ),
+        requested_at=datetime(2030, 1, 2, 15, 0, tzinfo=TAIPEI),
+        intraday_start=datetime(2030, 1, 2, 9, 15, tzinfo=EQUIVALENT_OFFSET_TIMEZONE),
+        intraday_end=datetime(2030, 1, 2, 14, 0, tzinfo=EQUIVALENT_OFFSET_TIMEZONE),
+        intraday_interval=interval,
+        daily_start=TRADING_DAY,
+        daily_end=TRADING_DAY + timedelta(days=1),
+        maximum_data_delay=timedelta(minutes=5),
+    )
+
+
 @pytest.mark.parametrize("width", (timedelta(minutes=3), timedelta(minutes=15)))
 def test_mock_intraday_grid_is_directly_compatible_with_task_six_aggregation(
     width: timedelta,
@@ -74,3 +117,33 @@ def test_mock_intraday_grid_is_directly_compatible_with_task_six_aggregation(
         not (bar.starts_at < datetime(2030, 1, 2, 12, 0, tzinfo=UTC) < bar.ends_at)
         for bar in aggregated
     )
+
+
+@pytest.mark.parametrize("width", (timedelta(minutes=3), timedelta(minutes=15)))
+def test_equivalent_timezone_request_emits_calendar_timezone_bars(
+    width: timedelta,
+) -> None:
+    calendar = _taipei_calendar()
+    provider = MockMarketDataProvider(provider_name="mock-source-a", seed=17, calendar=calendar)
+    offset_snapshot = provider.get_intraday_bars(_equivalent_timezone_request(width))
+    market_timezone_request = replace(
+        _equivalent_timezone_request(width),
+        intraday_start=datetime(2030, 1, 2, 9, 15, tzinfo=TAIPEI),
+        intraday_end=datetime(2030, 1, 2, 14, 0, tzinfo=TAIPEI),
+    )
+    market_timezone_snapshot = provider.get_intraday_bars(market_timezone_request)
+
+    aggregated = aggregate_bars(
+        offset_snapshot.intraday_bars,
+        calendar=calendar,
+        market=MARKET,
+        width=width,
+    )
+
+    assert aggregated == offset_snapshot.intraday_bars
+    assert all(
+        bar.starts_at.tzinfo is TAIPEI and bar.ends_at.tzinfo is TAIPEI for bar in aggregated
+    )
+    assert offset_snapshot.canonical_json == market_timezone_snapshot.canonical_json
+    assert offset_snapshot.content_hash == market_timezone_snapshot.content_hash
+    assert offset_snapshot.snapshot_id == market_timezone_snapshot.snapshot_id

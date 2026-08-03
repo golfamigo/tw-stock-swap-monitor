@@ -282,3 +282,63 @@ def test_mock_provider_does_not_open_network_connections(monkeypatch) -> None:  
     snapshot = _provider(seed=17).get_market_snapshot(_request())
 
     assert snapshot.is_actionable
+
+
+@pytest.mark.parametrize("seed", (0, -1, -17))
+def test_zero_and_negative_seeds_produce_only_positive_ohlc_prices(seed: int) -> None:
+    source_request = _request()
+    varied_instruments = (
+        *source_request.instruments,
+        Instrument(
+            instrument_id=UUID(int=246541),
+            market=MARKET,
+            symbol="instrument-246541",
+            created_at=datetime(2030, 1, 1, tzinfo=UTC),
+        ),
+        Instrument(
+            instrument_id=UUID("00000000-0000-0000-0000-000000000901"),
+            market=MARKET,
+            symbol="instrument-901",
+            created_at=datetime(2030, 1, 1, tzinfo=UTC),
+        ),
+    )
+
+    snapshot = _provider(seed=seed).get_market_snapshot(
+        replace(source_request, instruments=varied_instruments)
+    )
+
+    generated_bars = (*snapshot.intraday_bars, *snapshot.daily_bars)
+    assert generated_bars
+    assert all(
+        bar.open > Decimal("0")
+        and bar.high > Decimal("0")
+        and bar.low > Decimal("0")
+        and bar.close > Decimal("0")
+        for bar in generated_bars
+    )
+
+
+def test_large_neighboring_seeds_produce_distinct_quote_snapshot_evidence() -> None:
+    source_request = _request()
+    lower_seed_snapshot = _provider(seed=10**40).get_quotes(source_request)
+    higher_seed_snapshot = _provider(seed=10**40 + 1).get_quotes(source_request)
+
+    assert lower_seed_snapshot.quotes[0].price != higher_seed_snapshot.quotes[0].price
+    assert lower_seed_snapshot.canonical_json != higher_seed_snapshot.canonical_json
+    assert lower_seed_snapshot.content_hash != higher_seed_snapshot.content_hash
+    assert lower_seed_snapshot.snapshot_id != higher_seed_snapshot.snapshot_id
+
+
+def test_extremely_large_seed_produces_finite_deterministic_quote_evidence() -> None:
+    huge_seed = 10**999_996
+    source_request = _request()
+
+    first = _provider(seed=huge_seed).get_quotes(source_request)
+    second = _provider(seed=huge_seed).get_quotes(source_request)
+
+    assert first.quotes[0].price.is_finite()
+    assert first.quotes[0].price > Decimal("0")
+    assert first.quotes == second.quotes
+    assert first.canonical_json == second.canonical_json
+    assert first.content_hash == second.content_hash
+    assert first.snapshot_id == second.snapshot_id

@@ -2,7 +2,8 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Context, Decimal, localcontext
+from functools import lru_cache
 from hashlib import sha256
 
 from app.calendar.base import TradingCalendarProvider
@@ -15,6 +16,14 @@ from app.data_sources.models import (
     canonical_datetime,
 )
 from app.domain.entities import Instrument
+
+_MINIMUM_GENERATED_BASE_UNITS = 400
+# The largest downward adjustment is 0.025 and the largest spread is 0.01,
+# so the 0.04 floor (at the fixed 0.0001 OHLC scale) remains strictly positive.
+_PRICE_UNIT_EXPONENT = -4
+_HEX_TO_DECIMAL_PAIRS = str.maketrans(
+    {character: f"{value:02d}" for value, character in enumerate("0123456789abcdef")}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,8 +132,10 @@ class MockMarketDataProvider:
         for instrument in request.instruments:
             has_effective_session_overlap = False
             timezone = self.calendar.market_timezone(instrument.market)
-            session_date = request.intraday_start.astimezone(timezone).date()
-            final_date = request.intraday_end.astimezone(timezone).date()
+            intraday_start = request.intraday_start.astimezone(timezone)
+            intraday_end = request.intraday_end.astimezone(timezone)
+            session_date = intraday_start.date()
+            final_date = intraday_end.date()
             while session_date <= final_date:
                 if self.calendar.is_holiday(instrument.market, session_date):
                     saw_closed_market = True
@@ -136,8 +147,8 @@ class MockMarketDataProvider:
                     session_date += timedelta(days=1)
                     continue
                 for session in sessions:
-                    bar_start = max(session.opens_at, request.intraday_start)
-                    bar_limit = min(session.closes_at, request.intraday_end)
+                    bar_start = max(session.opens_at, intraday_start)
+                    bar_limit = min(session.closes_at, intraday_end)
                     if bar_start >= bar_limit:
                         continue
                     has_effective_session_overlap = True
@@ -183,40 +194,53 @@ class MockMarketDataProvider:
     def _bar(
         self, instrument: Instrument, kind: str, starts_at: datetime, ends_at: datetime
     ) -> Bar:
-        open_price = self._price(instrument, f"{kind}:open", starts_at, ends_at)
-        direction = Decimal(
-            self._number(instrument, f"{kind}:direction", starts_at, ends_at) % 501 - 250
-        )
-        close_price = open_price + direction / Decimal("10000")
-        spread = Decimal(self._number(instrument, f"{kind}:spread", starts_at, ends_at) % 100 + 1)
-        spread /= Decimal("10000")
-        volume = Decimal(
-            self._number(instrument, f"{kind}:volume", starts_at, ends_at) % 1_000_000 + 1
-        )
-        return Bar(
-            instrument_id=instrument.instrument_id,
-            starts_at=starts_at,
-            ends_at=ends_at,
-            open=open_price,
-            high=max(open_price, close_price) + spread,
-            low=min(open_price, close_price) - spread,
-            close=close_price,
-            volume=volume,
-        )
+        with localcontext() as context:
+            _configure_mock_decimal_context(context, self.seed)
+            seed_prefix = _seed_price_prefix(self.seed)
+            open_units = self._price_unit_suffix(instrument, f"{kind}:open", starts_at, ends_at)
+            direction_units = (
+                self._number(instrument, f"{kind}:direction", starts_at, ends_at) % 501 - 250
+            )
+            close_units = open_units + direction_units
+            spread_units = self._number(instrument, f"{kind}:spread", starts_at, ends_at) % 100 + 1
+            volume = Decimal(
+                self._number(instrument, f"{kind}:volume", starts_at, ends_at) % 1_000_000 + 1
+            )
+            return Bar(
+                instrument_id=instrument.instrument_id,
+                starts_at=starts_at,
+                ends_at=ends_at,
+                open=_decimal_from_units(seed_prefix, open_units),
+                high=_decimal_from_units(seed_prefix, max(open_units, close_units) + spread_units),
+                low=_decimal_from_units(seed_prefix, min(open_units, close_units) - spread_units),
+                close=_decimal_from_units(seed_prefix, close_units),
+                volume=volume,
+            )
 
     def _price(
         self, instrument: Instrument, kind: str, starts_at: datetime, ends_at: datetime
     ) -> Decimal:
-        seed_component = _nonnegative_seed(self.seed)
-        variation = self._number(instrument, kind, starts_at, ends_at) % 100_000
-        return Decimal(seed_component * 1_000_000 + variation + 1) / Decimal("100")
+        with localcontext() as context:
+            _configure_mock_decimal_context(context, self.seed)
+            return _decimal_from_units(
+                _seed_price_prefix(self.seed),
+                self._price_unit_suffix(instrument, kind, starts_at, ends_at),
+            )
+
+    def _price_unit_suffix(
+        self, instrument: Instrument, kind: str, starts_at: datetime, ends_at: datetime
+    ) -> int:
+        """Return exact low-order OHLC units without carrying into the seed prefix."""
+
+        variation = self._number(instrument, kind, starts_at, ends_at) % 99_000
+        return _MINIMUM_GENERATED_BASE_UNITS + 100 + variation
 
     def _number(
         self, instrument: Instrument, kind: str, starts_at: datetime, ends_at: datetime
     ) -> int:
         payload = "\x1f".join(
             (
-                str(self.seed),
+                _seed_text(self.seed),
                 self.provider_name,
                 str(instrument.instrument_id),
                 instrument.market,
@@ -229,10 +253,40 @@ class MockMarketDataProvider:
         return int.from_bytes(sha256(payload.encode("utf-8")).digest(), byteorder="big")
 
 
-def _nonnegative_seed(seed: int) -> int:
-    """Injectively encode signed Python integers so distinct seeds change every price."""
+def _mock_decimal_precision(seed: int) -> int:
+    """Preserve four fractional OHLC places beyond a seed's full integer magnitude."""
 
-    return seed * 2 if seed >= 0 else -seed * 2 - 1
+    return max(28, len(_seed_price_prefix(seed)) + 5)
+
+
+def _configure_mock_decimal_context(context: Context, seed: int) -> None:
+    """Set precision and exponent bounds for exact price and OHLC construction."""
+
+    price_adjusted = len(_seed_price_prefix(seed))
+    context.prec = _mock_decimal_precision(seed)
+    context.Emax = max(context.Emax, price_adjusted + 1)
+    context.Emin = min(context.Emin, price_adjusted - context.prec - 1)
+
+
+@lru_cache(maxsize=128)
+def _seed_price_prefix(seed: int) -> str:
+    """Injectively encode signed Python integers as Decimal-safe coefficient digits."""
+
+    sign_marker = "1" if seed >= 0 else "2"
+    return sign_marker + format(abs(seed), "x").translate(_HEX_TO_DECIMAL_PAIRS)
+
+
+def _decimal_from_units(seed_prefix: str, units: int) -> Decimal:
+    """Represent a seed prefix and exact low-order units at the fixed OHLC scale."""
+
+    digits = tuple(int(digit) for digit in f"{seed_prefix}{units:05d}")
+    return Decimal((0, digits, _PRICE_UNIT_EXPONENT))
+
+
+def _seed_text(seed: int) -> str:
+    """Encode every Python integer injectively without decimal-string digit limits."""
+
+    return f"{'-' if seed < 0 else '+'}{abs(seed):x}"
 
 
 def _require_session_grid_alignment(

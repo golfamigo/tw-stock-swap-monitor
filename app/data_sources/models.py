@@ -26,7 +26,24 @@ def _decimal_text(value: Decimal) -> str:
     require_finite_decimal(value, field_name="decimal")
     if value.is_zero():
         return "0"
-    return format(value.normalize(), "f")
+    return _exact_decimal_text(value)
+
+
+def _exact_decimal_text(value: Decimal) -> str:
+    """Encode finite nonzero Decimals without context-dependent normalization."""
+
+    decimal_tuple = value.as_tuple()
+    if not isinstance(decimal_tuple.exponent, int):
+        raise AssertionError("finite Decimal must have an integer exponent")
+    digits = "".join(str(digit) for digit in decimal_tuple.digits).rstrip("0")
+    exponent = decimal_tuple.exponent + (len(decimal_tuple.digits) - len(digits))
+    sign = "-" if decimal_tuple.sign else ""
+    if exponent >= 0:
+        return f"{sign}{digits}{'0' * exponent}"
+    decimal_point = len(digits) + exponent
+    if decimal_point > 0:
+        return f"{sign}{digits[:decimal_point]}.{digits[decimal_point:]}"
+    return f"{sign}0.{('0' * -decimal_point)}{digits}"
 
 
 def _timedelta_text(value: timedelta) -> str:

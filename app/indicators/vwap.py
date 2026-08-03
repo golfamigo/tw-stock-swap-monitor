@@ -96,9 +96,10 @@ class SessionVwapIndicator:
         evidence["observed_bars"] = str(len(active_bars))
         evidence["latest_bar_start"] = latest_bar.starts_at.isoformat()
         if trailing_coverage is not None:
-            covered_end, required_end = trailing_coverage
-            evidence["coverage_gap"] = "trailing"
+            coverage_gap, covered_end, required_end = trailing_coverage
+            evidence["coverage_gap"] = coverage_gap
             evidence["covered_end"] = covered_end.isoformat()
+            evidence["required_start"] = latest_location.session.opens_at.isoformat()
             evidence["required_end"] = required_end.isoformat()
             return IndicatorResult.unavailable(
                 key=self.key,
@@ -126,14 +127,11 @@ def _weighted_typical_price(bar: Bar) -> Decimal:
 
 def _validate_active_session_coverage(
     active_bars: tuple[Bar, ...], location: SessionLocation, market_snapshot: MarketDataSnapshot
-) -> tuple[datetime, datetime] | None:
-    """Require active bars to cover the complete requested interval in their session."""
+) -> tuple[str, datetime, datetime] | None:
+    """Require a session VWAP source to cover from session open through request end."""
 
     session_timezone = location.session.opens_at.tzinfo
-    required_start = max(
-        location.session.opens_at,
-        market_snapshot.request.intraday_start.astimezone(session_timezone),
-    )
+    required_start = location.session.opens_at
     required_end = min(
         location.session.closes_at,
         market_snapshot.request.intraday_end.astimezone(session_timezone),
@@ -146,12 +144,15 @@ def _validate_active_session_coverage(
         local_start = bar.starts_at.astimezone(session_timezone)
         local_end = bar.ends_at.astimezone(session_timezone)
         if local_start != expected_start:
+            if expected_start == required_start and local_start > expected_start:
+                return ("missing_session_open", expected_start, required_end)
             raise BarAggregationInputError("active session bars have incomplete coverage")
         if local_end > required_end:
             raise BarAggregationInputError("active session bars exceed the requested range")
         expected_start = local_end
     if expected_start != required_end:
-        return (expected_start, required_end)
+        coverage_gap = "missing_session_open" if expected_start == required_start else "trailing"
+        return (coverage_gap, expected_start, required_end)
     return None
 
 
