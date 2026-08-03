@@ -36,6 +36,24 @@ def test_raw_preflight_bounds_malformed_multikey_nesting_before_schema_validatio
         parse_expression(malformed)
 
 
+def test_raw_preflight_preserves_full_valid_semantic_ast_capacity() -> None:
+    expression = _binary_and_tree([{"var": "market.is_actionable"}] * 64)
+    rule = Rule(
+        rule_id="capacity",
+        expression=parse_expression(expression),
+        weight=Decimal("1"),
+    )
+
+    result = evaluate_ruleset(
+        (rule,),
+        rule_input=RuleInput(values={"market.is_actionable": True}),
+        threshold=Decimal("1"),
+        evaluated_at=datetime(2035, 1, 1, tzinfo=UTC),
+    )
+
+    assert result.matched_rule_ids == ("capacity",)
+
+
 def test_parse_rules_rejects_aggregate_ruleset_limit_before_rule_parsing() -> None:
     raw_rules = [{"id": f"rule_{index}", "expression": True} for index in range(513)]
 
@@ -66,3 +84,16 @@ def test_evaluator_rejects_handcrafted_invalid_public_ast_without_index_error() 
             threshold=Decimal("1"),
             evaluated_at=datetime(2035, 1, 1, tzinfo=UTC),
         )
+
+
+def _binary_and_tree(leaves: list[dict[str, str]]) -> object:
+    current: list[object] = list(leaves)
+    while len(current) > 1:
+        paired: list[object] = []
+        for index in range(0, len(current), 2):
+            if index + 1 == len(current):
+                paired.append(current[index])
+            else:
+                paired.append({"and": [current[index], current[index + 1]]})
+        current = paired
+    return current[0]

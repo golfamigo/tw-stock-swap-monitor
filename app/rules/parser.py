@@ -12,6 +12,8 @@ from jsonschema import Draft202012Validator, ValidationError  # type: ignore[imp
 from app.rules.schema import (
     MAX_AST_NODES,
     MAX_EXPRESSION_DEPTH,
+    MAX_RAW_TRANSPORT_DEPTH,
+    MAX_RAW_TRANSPORT_NODES,
     MAX_RULESET_AST_NODES,
     MAX_RULESET_RULES,
     EvidenceKind,
@@ -161,17 +163,19 @@ def parse_rules(raw_rules: object) -> tuple[Rule, ...]:
         raise RuleTransportError("rules must be a JSON array")
     if len(raw_rules) > MAX_RULESET_RULES:
         raise RuleSafetyError(f"ruleset rule count exceeds {MAX_RULESET_RULES}")
+    rules: list[Rule] = []
     total_nodes = 0
     for raw_rule in raw_rules:
-        if isinstance(raw_rule, dict) and "expression" in raw_rule:
-            total_nodes += _preflight_raw_expression(raw_rule["expression"])
-            if total_nodes > MAX_RULESET_AST_NODES:
-                raise RuleSafetyError(f"ruleset AST node count exceeds {MAX_RULESET_AST_NODES}")
-    rules = tuple(parse_rule(raw_rule) for raw_rule in raw_rules)
-    rule_ids = tuple(rule.rule_id for rule in rules)
+        rule = parse_rule(raw_rule)
+        total_nodes += _count_expression_ast_nodes(rule.expression)
+        if total_nodes > MAX_RULESET_AST_NODES:
+            raise RuleSafetyError(f"ruleset AST node count exceeds {MAX_RULESET_AST_NODES}")
+        rules.append(rule)
+    parsed_rules = tuple(rules)
+    rule_ids = tuple(rule.rule_id for rule in parsed_rules)
     if len(set(rule_ids)) != len(rule_ids):
         raise RuleSemanticError("rule ids must be unique")
-    return rules
+    return parsed_rules
 
 
 def validate_expression_ast(expression: Expression) -> None:
@@ -227,11 +231,11 @@ def _preflight_raw_expression(raw: object) -> int:
     node_count = 0
     while stack:
         node, depth = stack.pop()
-        if depth > MAX_EXPRESSION_DEPTH:
-            raise RuleSafetyError(f"expression depth exceeds {MAX_EXPRESSION_DEPTH}")
+        if depth > MAX_RAW_TRANSPORT_DEPTH:
+            raise RuleSafetyError(f"raw transport depth exceeds {MAX_RAW_TRANSPORT_DEPTH}")
         node_count += 1
-        if node_count > MAX_AST_NODES:
-            raise RuleSafetyError(f"expression node count exceeds {MAX_AST_NODES}")
+        if node_count > MAX_RAW_TRANSPORT_NODES:
+            raise RuleSafetyError(f"raw transport node count exceeds {MAX_RAW_TRANSPORT_NODES}")
         if isinstance(node, Mapping):
             for child in reversed(tuple(node.values())):
                 stack.append((child, depth + 1))
@@ -240,6 +244,21 @@ def _preflight_raw_expression(raw: object) -> int:
             for child in reversed(node):
                 stack.append((child, depth))
             continue
+    return node_count
+
+
+def _count_expression_ast_nodes(expression: Expression) -> int:
+    """Count an already parser-bounded semantic AST without using raw transport containers."""
+
+    stack: list[Expression] = [expression]
+    node_count = 0
+    while stack:
+        node = stack.pop()
+        node_count += 1
+        if node_count > MAX_RULESET_AST_NODES:
+            return node_count
+        if isinstance(node, OperationExpression):
+            stack.extend(reversed(node.operands))
     return node_count
 
 
