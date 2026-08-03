@@ -21,9 +21,9 @@ from app.rules.evidence import (
 )
 from app.rules.schema import (
     EvidenceKind,
-    EvidenceSchema,
     Expression,
     LiteralExpression,
+    M0M1EvidenceRegistry,
     OperationExpression,
     PathExpression,
     ProtectedRuleInputError,
@@ -58,12 +58,9 @@ class RuleInput:
             raise TypeError("protected_source must be a Boolean")
         if not isinstance(self.purpose, EvaluationPurpose):
             raise TypeError("purpose must be an EvaluationPurpose")
-        normalized: dict[str, object] = {}
-        for path, value in self.values.items():
-            if not isinstance(path, str):
-                raise RuleEvaluationError("rule input paths must be strings")
-            normalized[path] = value
-        object.__setattr__(self, "values", MappingProxyType(dict(sorted(normalized.items()))))
+        if self.protected_source:
+            raise ProtectedRuleInputError("a protected source cannot be used for rule evaluation")
+        object.__setattr__(self, "values", M0M1EvidenceRegistry.controlled_values(self.values))
 
 
 @dataclass(slots=True)
@@ -89,32 +86,23 @@ class _Trace:
 def evaluate_ruleset(
     rules: Sequence[Rule],
     *,
-    evidence_schema: EvidenceSchema,
     rule_input: RuleInput,
     threshold: Decimal,
     evaluated_at: datetime,
 ) -> RuleEvaluation:
     """Evaluate parsed rules without mutation, coercion, traversal, or dynamic execution."""
 
-    if not isinstance(evidence_schema, EvidenceSchema):
-        raise TypeError("evidence_schema must be an EvidenceSchema")
     if not isinstance(rule_input, RuleInput):
         raise TypeError("rule_input must be a RuleInput")
     _require_aware(evaluated_at, field_name="evaluated_at")
     normalized_threshold = _require_score(threshold, label="threshold")
-    if rule_input.protected_source and rule_input.purpose in {
-        EvaluationPurpose.SELL,
-        EvaluationPurpose.ACTION,
-    }:
-        raise ProtectedRuleInputError("a protected source cannot be used for sell or action rules")
-
     parsed_rules = tuple(rules)
     if any(not isinstance(rule, Rule) for rule in parsed_rules):
         raise TypeError("rules must contain parsed Rule values")
     rule_ids = tuple(rule.rule_id for rule in parsed_rules)
     if len(set(rule_ids)) != len(rule_ids):
         raise RuleEvaluationError("rules must have unique ids")
-    values = _prepare_values(evidence_schema, rule_input.values)
+    values = _prepare_values(rule_input.values)
     budget = _EvaluationBudget()
     matched_rule_ids: list[str] = []
     failed_rule_ids: list[str] = []
@@ -173,9 +161,8 @@ def evaluate_ruleset(
     )
 
 
-def _prepare_values(
-    evidence_schema: EvidenceSchema, values: Mapping[str, object]
-) -> Mapping[str, EvidenceValue]:
+def _prepare_values(values: Mapping[str, object]) -> Mapping[str, EvidenceValue]:
+    evidence_schema = M0M1EvidenceRegistry.schema()
     normalized: dict[str, EvidenceValue] = {}
     for path, raw_value in values.items():
         try:

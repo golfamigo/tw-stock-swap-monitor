@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -52,11 +52,29 @@ class EvidenceKind(StrEnum):
     NULL = "null"
 
 
+_M0_M1_FIELD_KINDS: dict[str, EvidenceKind] = {
+    # Quote.price and Quote.as_of.
+    "source.last_price": EvidenceKind.DECIMAL,
+    "source.last_price_as_of": EvidenceKind.DATETIME,
+    # IndicatorResult values published by the M0/M1 indicator plugins.
+    "source.same_time_volume_ratio": EvidenceKind.DECIMAL,
+    "source.session_vwap": EvidenceKind.DECIMAL,
+    # MarketDataSnapshot and DataQuality fields.
+    "market.data_quality.bars_complete": EvidenceKind.BOOLEAN,
+    "market.data_quality.confidence": EvidenceKind.DECIMAL,
+    "market.data_quality.source_timestamp": EvidenceKind.DATETIME,
+    "market.data_quality.stale": EvidenceKind.BOOLEAN,
+    "market.is_actionable": EvidenceKind.BOOLEAN,
+    "market.provider": EvidenceKind.STRING,
+    "market.snapshot_id": EvidenceKind.STRING,
+}
+
+
 @dataclass(frozen=True, slots=True)
 class EvidenceSchema:
-    """An immutable allow-list of exact flat evidence paths and their value kinds."""
+    """The immutable M0/M1 allow-list of exact market and indicator evidence paths."""
 
-    fields: Mapping[str, EvidenceKind]
+    fields: Mapping[str, EvidenceKind] = field(default_factory=lambda: _M0_M1_FIELD_KINDS)
 
     def __post_init__(self) -> None:
         if not isinstance(self.fields, Mapping):
@@ -67,6 +85,8 @@ class EvidenceSchema:
             if not isinstance(kind, EvidenceKind) or kind is EvidenceKind.NULL:
                 raise TypeError("evidence schema field kinds must be non-null EvidenceKind values")
             normalized[path] = kind
+        if normalized != _M0_M1_FIELD_KINDS:
+            raise RuleSemanticError("evidence schema is fixed to the M0/M1 registry")
         object.__setattr__(self, "fields", MappingProxyType(dict(sorted(normalized.items()))))
 
     def kind_for(self, path: str) -> EvidenceKind:
@@ -78,6 +98,29 @@ class EvidenceSchema:
             return self.fields[path]
         except KeyError as error:
             raise RuleSemanticError(f"evidence path is not registered: {path}") from error
+
+
+class M0M1EvidenceRegistry:
+    """The only approved field registry and controlled-evidence factory for M0/M1 rules."""
+
+    @classmethod
+    def schema(cls) -> EvidenceSchema:
+        """Return the complete immutable M0/M1 evidence schema."""
+
+        return EvidenceSchema()
+
+    @classmethod
+    def controlled_values(cls, values: Mapping[str, object]) -> Mapping[str, object]:
+        """Validate exact paths before constructing test or application rule evidence."""
+
+        if not isinstance(values, Mapping):
+            raise TypeError("registered rule values must be a mapping")
+        schema = cls.schema()
+        normalized: dict[str, object] = {}
+        for path, value in values.items():
+            schema.kind_for(path)
+            normalized[path] = value
+        return MappingProxyType(dict(sorted(normalized.items())))
 
 
 @dataclass(frozen=True, slots=True)

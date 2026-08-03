@@ -7,13 +7,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Context, Decimal, InvalidOperation, localcontext
 
+from jsonschema import Draft202012Validator, ValidationError  # type: ignore[import-untyped]
+
 from app.rules.schema import (
     MAX_AST_NODES,
     MAX_EXPRESSION_DEPTH,
     EvidenceKind,
-    EvidenceSchema,
     Expression,
     LiteralExpression,
+    M0M1EvidenceRegistry,
     OperationExpression,
     PathExpression,
     Rule,
@@ -44,6 +46,52 @@ _ALLOWED_OPERATORS = frozenset(
 )
 _DECIMAL_CONTEXT = Context(prec=28, rounding=ROUND_HALF_EVEN)
 
+RULE_EXPRESSION_JSON_SCHEMA: dict[str, object] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://rotation-monitor.example/schemas/rule-expression.json",
+    "$ref": "#/$defs/expression",
+    "$defs": {
+        "path": {
+            "type": "object",
+            "required": ["var"],
+            "additionalProperties": False,
+            "properties": {
+                "var": {
+                    "type": "string",
+                    "pattern": (
+                        "^(source|candidate|market|run)\\.[A-Za-z_][A-Za-z0-9_]*"
+                        "(\\.[A-Za-z_][A-Za-z0-9_]*)*$"
+                    ),
+                }
+            },
+        },
+        "literal": {"type": ["string", "number", "boolean", "null"]},
+        "operands": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32,
+            "items": {"$ref": "#/$defs/expression"},
+        },
+        "expression": {
+            "oneOf": [
+                {"$ref": "#/$defs/path"},
+                {"$ref": "#/$defs/literal"},
+                {
+                    "type": "object",
+                    "minProperties": 1,
+                    "maxProperties": 1,
+                    "additionalProperties": False,
+                    "properties": {
+                        operator: {"$ref": "#/$defs/operands"}
+                        for operator in sorted(_ALLOWED_OPERATORS)
+                    },
+                },
+            ]
+        },
+    },
+}
+_RULE_EXPRESSION_VALIDATOR = Draft202012Validator(RULE_EXPRESSION_JSON_SCHEMA)
+
 
 @dataclass(slots=True)
 class _ParseBudget:
@@ -59,20 +107,29 @@ class _ParseBudget:
             raise RuleSafetyError(f"expression node count exceeds {MAX_AST_NODES}")
 
 
-def parse_expression(raw: object, *, evidence_schema: EvidenceSchema) -> Expression:
+def validate_expression_transport(raw: object) -> None:
+    """Apply the documented Draft 2020-12 JSON Schema before semantic validation."""
+
+    try:
+        _RULE_EXPRESSION_VALIDATOR.validate(raw)
+    except ValidationError as error:
+        raise RuleTransportError(
+            "rule expression fails JSON Schema transport validation"
+        ) from error
+
+
+def parse_expression(raw: object) -> Expression:
     """Parse one JSON-shaped expression into a typed AST with fixed safety limits."""
 
-    if not isinstance(evidence_schema, EvidenceSchema):
-        raise TypeError("evidence_schema must be an EvidenceSchema")
+    validate_expression_transport(raw)
     return _parse_expression(
         raw,
-        evidence_schema=evidence_schema,
         budget=_ParseBudget(),
         depth=1,
     )
 
 
-def parse_rule(raw: object, *, evidence_schema: EvidenceSchema) -> Rule:
+def parse_rule(raw: object) -> Rule:
     """Validate one generic configuration rule without changing configuration merge behavior."""
 
     if not isinstance(raw, dict):
@@ -89,16 +146,16 @@ def parse_rule(raw: object, *, evidence_schema: EvidenceSchema) -> Rule:
     weight = _decimal_from_json_number(raw_weight, label="rule weight")
     if weight <= Decimal("0"):
         raise RuleSemanticError("rule weight must be positive")
-    expression = parse_expression(raw["expression"], evidence_schema=evidence_schema)
+    expression = parse_expression(raw["expression"])
     return Rule(rule_id=rule_id, expression=expression, weight=weight)
 
 
-def parse_rules(raw_rules: object, *, evidence_schema: EvidenceSchema) -> tuple[Rule, ...]:
+def parse_rules(raw_rules: object) -> tuple[Rule, ...]:
     """Parse an ordered generic rule list and reject duplicate identifiers."""
 
     if not isinstance(raw_rules, list | tuple):
         raise RuleTransportError("rules must be a JSON array")
-    rules = tuple(parse_rule(raw_rule, evidence_schema=evidence_schema) for raw_rule in raw_rules)
+    rules = tuple(parse_rule(raw_rule) for raw_rule in raw_rules)
     rule_ids = tuple(rule.rule_id for rule in rules)
     if len(set(rule_ids)) != len(rule_ids):
         raise RuleSemanticError("rule ids must be unique")
@@ -108,7 +165,6 @@ def parse_rules(raw_rules: object, *, evidence_schema: EvidenceSchema) -> tuple[
 def _parse_expression(
     raw: object,
     *,
-    evidence_schema: EvidenceSchema,
     budget: _ParseBudget,
     depth: int,
 ) -> Expression:
@@ -132,7 +188,7 @@ def _parse_expression(
         path = raw["var"]
         if not isinstance(path, str):
             raise RuleTransportError("var path must be a string")
-        return PathExpression(path=path, kind=evidence_schema.kind_for(path))
+        return PathExpression(path=path, kind=M0M1EvidenceRegistry.schema().kind_for(path))
     if len(raw) != 1:
         raise RuleTransportError("operator objects must contain exactly one allowed operator")
     operator, raw_operands = next(iter(raw.items()))
@@ -145,7 +201,6 @@ def _parse_expression(
     operands = tuple(
         _parse_expression(
             operand,
-            evidence_schema=evidence_schema,
             budget=budget,
             depth=depth + 1,
         )
