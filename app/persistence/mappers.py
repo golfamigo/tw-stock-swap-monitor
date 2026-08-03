@@ -447,6 +447,8 @@ def recommendation_state_to_model(record: RecommendationStateRecord) -> Recommen
         portfolio_id=record.portfolio_id,
         state=record.state.value,
         remaining_stages_halted=record.remaining_stages_halted,
+        finalization_strategy_run_id=record.finalization_strategy_run_id,
+        finalization_strategy_key=record.finalization_strategy_key,
         revision=record.revision,
         updated_at=_persist_datetime(record.updated_at),
     )
@@ -460,6 +462,8 @@ def recommendation_state_from_model(model: RecommendationStateModel) -> Recommen
         portfolio_id=model.portfolio_id,
         state=RecommendationState(model.state),
         remaining_stages_halted=model.remaining_stages_halted,
+        finalization_strategy_run_id=model.finalization_strategy_run_id,
+        finalization_strategy_key=model.finalization_strategy_key,
         revision=model.revision,
         updated_at=_restore_datetime(model.updated_at),
     )

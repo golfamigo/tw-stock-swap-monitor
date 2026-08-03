@@ -233,6 +233,8 @@ def test_in_memory_attempt_audit_retains_failure_degradation_recovery_and_succes
         logical_scan_run_id=scan.logical_scan_run_id,
         access_context=_context(owner_id),
     )
+    succeeded = replace(succeeded, final_strategy_run_id=final_run.strategy_run_id)
+    repository.record_attempt(attempt=succeeded, access_context=_context(owner_id))
     repository.attach_final_strategy_run(
         logical_scan_run_id=scan.logical_scan_run_id,
         plan=plan,
@@ -240,8 +242,6 @@ def test_in_memory_attempt_audit_retains_failure_degradation_recovery_and_succes
         completed_at=NOW + timedelta(minutes=3),
         access_context=_context(owner_id),
     )
-    succeeded = replace(succeeded, final_strategy_run_id=final_run.strategy_run_id)
-    repository.record_attempt(attempt=succeeded, access_context=_context(owner_id))
 
     assert repository.list_attempts(
         logical_scan_run_id=scan.logical_scan_run_id, access_context=_context(owner_id)
@@ -298,6 +298,8 @@ def test_recovery_chain_requires_the_previous_retryable_attempt_and_stops_after_
         logical_scan_run_id=scan.logical_scan_run_id,
         access_context=_context(owner_id),
     )
+    succeeded = replace(succeeded, final_strategy_run_id=final_run.strategy_run_id)
+    repository.record_attempt(attempt=succeeded, access_context=_context(owner_id))
     repository.attach_final_strategy_run(
         logical_scan_run_id=scan.logical_scan_run_id,
         plan=plan,
@@ -305,8 +307,6 @@ def test_recovery_chain_requires_the_previous_retryable_attempt_and_stops_after_
         completed_at=NOW + timedelta(minutes=1),
         access_context=_context(owner_id),
     )
-    succeeded = replace(succeeded, final_strategy_run_id=final_run.strategy_run_id)
-    repository.record_attempt(attempt=succeeded, access_context=_context(owner_id))
 
     with pytest.raises(ValueError, match="completed logical scans"):
         repository.record_attempt(
@@ -411,6 +411,7 @@ def test_sql_recovery_chain_preserves_auditable_attempt_statuses() -> None:
             final_strategy_run_id=final_strategy_run_id,
         )
         repository.record_attempt(attempt=failed, access_context=_context(owner_id))
+        repository.record_attempt(attempt=succeeded, access_context=_context(owner_id))
         repository.attach_final_strategy_run(
             logical_scan_run_id=scan.logical_scan_run_id,
             plan=plan,
@@ -418,7 +419,6 @@ def test_sql_recovery_chain_preserves_auditable_attempt_statuses() -> None:
             completed_at=NOW + timedelta(minutes=1),
             access_context=_context(owner_id),
         )
-        repository.record_attempt(attempt=succeeded, access_context=_context(owner_id))
         session.commit()
 
         assert repository.list_attempts(

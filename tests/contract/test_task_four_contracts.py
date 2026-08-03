@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
+from app.application.child_intents import ChildIntentPurpose, build_child_intent
 from app.application.configuration import (
     CANONICAL_FORMAT_VERSION,
     ConfigurationLayer,
@@ -1387,11 +1388,6 @@ def test_in_memory_logical_scan_recovers_attempts_and_rejects_a_second_final_run
         recovery_of_attempt_id=first_attempt.scan_attempt_id,
     )
     repository.record_attempt(attempt=first_attempt, access_context=_context(owner_id))
-    repository.record_attempt(attempt=retry_attempt, access_context=_context(owner_id))
-    assert repository.list_attempts(
-        logical_scan_run_id=scan.logical_scan_run_id, access_context=_context(owner_id)
-    ) == (first_attempt, retry_attempt)
-
     completed_run = strategy_runs.record_or_get(
         plan=plan,
         run=_run(plan),
@@ -1399,6 +1395,11 @@ def test_in_memory_logical_scan_recovers_attempts_and_rejects_a_second_final_run
         logical_scan_run_id=scan.logical_scan_run_id,
         access_context=_context(owner_id),
     )
+    retry_attempt = replace(retry_attempt, final_strategy_run_id=completed_run.strategy_run_id)
+    repository.record_attempt(attempt=retry_attempt, access_context=_context(owner_id))
+    assert repository.list_attempts(
+        logical_scan_run_id=scan.logical_scan_run_id, access_context=_context(owner_id)
+    ) == (first_attempt, retry_attempt)
     repository.attach_final_strategy_run(
         logical_scan_run_id=scan.logical_scan_run_id,
         plan=plan,
@@ -2035,6 +2036,103 @@ def test_sql_strategy_run_idempotency_conflict_preserves_outer_pending_work() ->
             stale_race_session.get(persistence_models.InstrumentModel, outer_instrument_id)
             is not None
         )
+
+
+def test_sql_child_intents_require_exact_final_run_linkage_and_recover_unique_races() -> None:
+    persistence_mappers = _load("app.persistence.mappers")
+    persistence_models = _load("app.persistence.models")
+    persistence_repositories = _load("app.persistence.repositories")
+    owner_id = uuid4()
+    portfolio = _portfolio(owner_id)
+    plan = _plan(portfolio)
+    persisted_snapshot = _persisted_snapshot(
+        target_ownership=Ownership(Scope.PORTFOLIO, portfolio.portfolio_id),
+        target_reference_id=plan.rotation_plan_id,
+    )
+    configuration_reference = ConfigurationSnapshotRef(
+        persisted_snapshot.snapshot_id,
+        persisted_snapshot.resolved_snapshot.content_hash,
+        persisted_snapshot.resolved_snapshot.created_at,
+    )
+    final_strategy_key = "a" * 64
+    strategy_run = _run(
+        plan,
+        configuration_snapshot=configuration_reference,
+        outputs={"idempotency": {"final_strategy_key": final_strategy_key}},
+    )
+    first_intent = build_child_intent(
+        child_intent_id=uuid4(),
+        rotation_plan_id=plan.rotation_plan_id,
+        portfolio_id=plan.portfolio_id,
+        strategy_run_id=strategy_run.strategy_run_id,
+        final_strategy_key=final_strategy_key,
+        purpose=ChildIntentPurpose.NOTIFICATION,
+        created_at=NOW,
+    )
+    retried_intent = replace(
+        first_intent,
+        child_intent_id=uuid4(),
+        created_at=NOW + timedelta(minutes=1),
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    persistence_models.Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        session.add_all(
+            (
+                persistence_models.UserModel(user_id=owner_id, created_at=NOW),
+                persistence_models.PortfolioModel(
+                    portfolio_id=portfolio.portfolio_id,
+                    user_id=owner_id,
+                    created_at=NOW,
+                ),
+                persistence_models.RotationPlanModel(
+                    rotation_plan_id=plan.rotation_plan_id,
+                    portfolio_id=plan.portfolio_id,
+                    created_at=NOW,
+                ),
+                persistence_mappers.configuration_snapshot_to_model(persisted_snapshot),
+                persistence_mappers.strategy_run_to_model(
+                    strategy_run, idempotency_key="child-intent-link"
+                ),
+                persistence_mappers.child_intent_to_model(first_intent),
+            )
+        )
+        session.commit()
+        repository = persistence_repositories.SqlAlchemyChildIntentRepository(session)
+        missing_run = replace(first_intent, strategy_run_id=uuid4())
+        mismatched_key = build_child_intent(
+            child_intent_id=uuid4(),
+            rotation_plan_id=plan.rotation_plan_id,
+            portfolio_id=plan.portfolio_id,
+            strategy_run_id=strategy_run.strategy_run_id,
+            final_strategy_key="b" * 64,
+            purpose=ChildIntentPurpose.NOTIFICATION,
+            created_at=NOW,
+        )
+
+        with pytest.raises(ValueError, match="missing strategy run"):
+            repository.record_or_get(intent=missing_run, access_context=_context(owner_id))
+        with pytest.raises(ValueError, match="final strategy key"):
+            repository.record_or_get(intent=mismatched_key, access_context=_context(owner_id))
+
+        original_scalar = session.scalar
+        hide_existing_once = True
+
+        def stale_child_intent_lookup(*args: object, **kwargs: object) -> object:
+            nonlocal hide_existing_once
+            if hide_existing_once and "child_intents" in str(args[0]):
+                hide_existing_once = False
+                return None
+            return original_scalar(*args, **kwargs)  # type: ignore[call-overload]
+
+        with patch.object(session, "scalar", side_effect=stale_child_intent_lookup):
+            recovered = repository.record_or_get(
+                intent=retried_intent, access_context=_context(owner_id)
+            )
+
+        assert recovered == first_intent
+        assert hide_existing_once is False
 
 
 def test_migration_metadata_covers_foundation_tables_and_open_position_partial_index() -> None:

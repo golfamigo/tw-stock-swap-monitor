@@ -35,5 +35,7 @@ class RecommendationStateRepository(Protocol):
         remaining_stages_halted: bool,
         changed_at: datetime,
         access_context: AccessContext,
+        finalization_strategy_run_id: UUID | None = None,
+        finalization_strategy_key: str | None = None,
     ) -> RecommendationStateRecord:
         """Compare against the stored record and persist exactly one coordinator transition."""

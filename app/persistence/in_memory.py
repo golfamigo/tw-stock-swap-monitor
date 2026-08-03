@@ -181,6 +181,8 @@ class InMemoryRecommendationStateRepository(_PortfolioScopedAdapter):
         remaining_stages_halted: bool,
         changed_at: datetime,
         access_context: AccessContext,
+        finalization_strategy_run_id: UUID | None = None,
+        finalization_strategy_key: str | None = None,
     ) -> RecommendationStateRecord:
         self._require_portfolio_mutation(plan.portfolio_id, access_context)
         with self._state_lock:
@@ -201,6 +203,8 @@ class InMemoryRecommendationStateRepository(_PortfolioScopedAdapter):
                 remaining_stages_halted=remaining_stages_halted,
                 revision=previous.revision + 1,
                 updated_at=changed_at,
+                finalization_strategy_run_id=finalization_strategy_run_id,
+                finalization_strategy_key=finalization_strategy_key,
             )
             self._records[plan.rotation_plan_id] = updated
             return updated
@@ -362,6 +366,13 @@ class InMemoryLogicalScanRepository(_PortfolioScopedAdapter):
         stored_run = self._strategy_runs_by_logical_scan.get(logical_scan_run_id)
         if stored_run is None or stored_run.strategy_run_id != strategy_run_id:
             raise ValueError("logical scan final strategy run was not persisted")
+        if not any(
+            attempt.status.value == "SUCCEEDED" and attempt.final_strategy_run_id == strategy_run_id
+            for attempt in self._attempts_by_scan[logical_scan_run_id]
+        ):
+            raise ValueError(
+                "logical scan requires durable final success evidence before completion"
+            )
         completed = replace(
             scan,
             status=LogicalScanStatus.COMPLETED,
@@ -401,12 +412,13 @@ class InMemoryLogicalScanRepository(_PortfolioScopedAdapter):
             if original.status.value != "SUCCEEDED":
                 raise ValueError("scan attempt duplicate reference must target a succeeded attempt")
         if attempt.final_strategy_run_id is not None:
-            if scan.status is not LogicalScanStatus.COMPLETED:
-                raise ValueError("final strategy run reference requires a completed final scan")
-            if scan.final_strategy_run_id != attempt.final_strategy_run_id:
-                raise ValueError("final strategy run reference must be the scan's actual final run")
             stored_run = self._strategy_runs_by_logical_scan.get(scan.logical_scan_run_id)
             if stored_run is None or stored_run.strategy_run_id != attempt.final_strategy_run_id:
+                raise ValueError("final strategy run reference must be the scan's actual final run")
+            if (
+                scan.status is LogicalScanStatus.COMPLETED
+                and scan.final_strategy_run_id != attempt.final_strategy_run_id
+            ):
                 raise ValueError("final strategy run reference must be the scan's actual final run")
 
 
@@ -418,9 +430,11 @@ class InMemoryStrategyRunRepository(_PortfolioScopedAdapter):
         portfolio_owners: Mapping[UUID, UUID],
         *,
         logical_scan_repository: LogicalScanRepository | None = None,
+        child_intent_repository: InMemoryChildIntentRepository | None = None,
     ) -> None:
         super().__init__(portfolio_owners)
         self._runs_by_key: dict[tuple[UUID, str], StrategyRun] = {}
+        self._runs_by_id: dict[UUID, StrategyRun] = {}
         self._logical_scan_by_key: dict[tuple[UUID, str], UUID | None] = {}
         self._runs_by_logical_scan: dict[UUID, StrategyRun] = {}
         self._logical_scan_repository = logical_scan_repository or InMemoryLogicalScanRepository(
@@ -430,6 +444,8 @@ class InMemoryStrategyRunRepository(_PortfolioScopedAdapter):
             self._logical_scan_repository.bind_strategy_run_store(
                 runs_by_logical_scan=self._runs_by_logical_scan
             )
+        if child_intent_repository is not None:
+            child_intent_repository.bind_strategy_run_store(runs_by_id=self._runs_by_id)
 
     def record_or_get(
         self,
@@ -471,6 +487,7 @@ class InMemoryStrategyRunRepository(_PortfolioScopedAdapter):
                     "logical scan already has a final strategy run"
                 )
         self._runs_by_key[key] = run
+        self._runs_by_id[run.strategy_run_id] = run
         self._logical_scan_by_key[key] = logical_scan_run_id
         if logical_scan_run_id is not None:
             self._runs_by_logical_scan[logical_scan_run_id] = run
@@ -493,22 +510,40 @@ class InMemoryChildIntentRepository(_PortfolioScopedAdapter):
         super().__init__(portfolio_owners)
         self._intents_by_key: dict[str, ChildIntent] = {}
         self._intent_keys_by_strategy_run: dict[UUID, list[str]] = {}
+        self._strategy_runs_by_id: Mapping[UUID, StrategyRun] = {}
+        self._intent_lock = Lock()
+
+    def bind_strategy_run_store(self, *, runs_by_id: Mapping[UUID, StrategyRun]) -> None:
+        """Bind intent validation to the immutable strategy-run persistence relation."""
+
+        self._strategy_runs_by_id = runs_by_id
 
     def record_or_get(self, *, intent: ChildIntent, access_context: AccessContext) -> ChildIntent:
         self._require_portfolio_mutation(intent.portfolio_id, access_context)
-        existing = self._intents_by_key.get(intent.intent_key)
-        if existing is not None:
-            self._require_portfolio_read(existing.portfolio_id, access_context)
-            if not same_logical_child_intent(existing=existing, candidate=intent):
-                raise IdempotencyConflictError(
-                    "child intent key already records different evidence"
-                )
-            return existing
-        self._intents_by_key[intent.intent_key] = intent
-        self._intent_keys_by_strategy_run.setdefault(intent.strategy_run_id, []).append(
-            intent.intent_key
-        )
-        return intent
+        with self._intent_lock:
+            strategy_run = self._strategy_runs_by_id.get(intent.strategy_run_id)
+            if strategy_run is None:
+                raise ValueError("child intent references a missing strategy run")
+            if (
+                strategy_run.rotation_plan_id != intent.rotation_plan_id
+                or strategy_run.portfolio_id != intent.portfolio_id
+            ):
+                raise ValueError("child intent strategy run does not match its plan scope")
+            if _final_strategy_key_from_run(strategy_run) != intent.final_strategy_key:
+                raise ValueError("child intent final strategy key does not match strategy run")
+            existing = self._intents_by_key.get(intent.intent_key)
+            if existing is not None:
+                self._require_portfolio_read(existing.portfolio_id, access_context)
+                if not same_logical_child_intent(existing=existing, candidate=intent):
+                    raise IdempotencyConflictError(
+                        "child intent key already records different evidence"
+                    )
+                return existing
+            self._intents_by_key[intent.intent_key] = intent
+            self._intent_keys_by_strategy_run.setdefault(intent.strategy_run_id, []).append(
+                intent.intent_key
+            )
+            return intent
 
     def get(self, *, intent_key: str, access_context: AccessContext) -> ChildIntent:
         try:
@@ -528,6 +563,16 @@ class InMemoryChildIntentRepository(_PortfolioScopedAdapter):
         for intent in intents:
             self._require_portfolio_read(intent.portfolio_id, access_context)
         return intents
+
+
+def _final_strategy_key_from_run(strategy_run: StrategyRun) -> str | None:
+    """Read the immutable final key directly from one persisted strategy run."""
+
+    idempotency = strategy_run.outputs.get("idempotency")
+    if not isinstance(idempotency, Mapping):
+        return None
+    final_strategy_key = idempotency.get("final_strategy_key")
+    return final_strategy_key if isinstance(final_strategy_key, str) else None
 
 
 class InMemoryConfigurationLayerRepository(_PortfolioScopedAdapter):

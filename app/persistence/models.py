@@ -345,6 +345,11 @@ class RecommendationStateModel(Base):
     __table_args__ = (
         CheckConstraint("revision >= 0", name="ck_recommendation_state_revision"),
         CheckConstraint(
+            "(finalization_strategy_run_id IS NULL AND finalization_strategy_key IS NULL) OR "
+            "(finalization_strategy_run_id IS NOT NULL AND finalization_strategy_key IS NOT NULL)",
+            name="ck_recommendation_state_finalization_fence",
+        ),
+        CheckConstraint(
             "state IN ('IDLE', 'WATCHING', 'NEAR_TRIGGER', 'ACTION_PENDING', "
             "'ACTION_NOTIFIED', 'DATA_DEGRADED', 'INVALIDATED', 'PARTIALLY_EXECUTED', "
             "'WAITING_CONFIRMATION', 'STAGE_COMPLETED', 'ROTATION_COMPLETED', 'PAUSED')",
@@ -360,6 +365,10 @@ class RecommendationStateModel(Base):
     )
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     remaining_stages_halted: Mapped[bool] = mapped_column(nullable=False)
+    finalization_strategy_run_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("strategy_runs.strategy_run_id"), nullable=True
+    )
+    finalization_strategy_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     revision: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

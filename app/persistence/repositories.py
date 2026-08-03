@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -191,6 +191,8 @@ class SqlAlchemyRecommendationStateRepository(_SqlAlchemyScopedRepository):
         remaining_stages_halted: bool,
         changed_at: datetime,
         access_context: AccessContext,
+        finalization_strategy_run_id: UUID | None = None,
+        finalization_strategy_key: str | None = None,
     ) -> RecommendationStateRecord:
         self._require_portfolio_mutation(plan.portfolio_id, access_context)
         model = self._session.get(RecommendationStateModel, plan.rotation_plan_id)
@@ -210,6 +212,8 @@ class SqlAlchemyRecommendationStateRepository(_SqlAlchemyScopedRepository):
             remaining_stages_halted=remaining_stages_halted,
             revision=stored.revision + 1,
             updated_at=changed_at,
+            finalization_strategy_run_id=finalization_strategy_run_id,
+            finalization_strategy_key=finalization_strategy_key,
         )
         result = self._session.execute(
             update(RecommendationStateModel)
@@ -224,6 +228,8 @@ class SqlAlchemyRecommendationStateRepository(_SqlAlchemyScopedRepository):
             .values(
                 state=updated.state.value,
                 remaining_stages_halted=updated.remaining_stages_halted,
+                finalization_strategy_run_id=updated.finalization_strategy_run_id,
+                finalization_strategy_key=updated.finalization_strategy_key,
                 revision=updated.revision,
                 updated_at=updated.updated_at.astimezone(UTC),
             )
@@ -575,10 +581,6 @@ class SqlAlchemyLogicalScanRepository(_SqlAlchemyScopedRepository):
             if duplicate.status != "SUCCEEDED":
                 raise ValueError("scan attempt duplicate reference must target a succeeded attempt")
         if attempt.final_strategy_run_id is not None:
-            if scan.status is not LogicalScanStatus.COMPLETED:
-                raise ValueError("final strategy run reference requires a completed final scan")
-            if scan.final_strategy_run_id != attempt.final_strategy_run_id:
-                raise ValueError("final strategy run reference must be the scan's actual final run")
             final_run_id = self._session.scalar(
                 select(StrategyRunModel.strategy_run_id).where(
                     StrategyRunModel.logical_scan_run_id == attempt.logical_scan_run_id,
@@ -586,6 +588,11 @@ class SqlAlchemyLogicalScanRepository(_SqlAlchemyScopedRepository):
                 )
             )
             if final_run_id is None:
+                raise ValueError("final strategy run reference must be the scan's actual final run")
+            if (
+                scan.status is LogicalScanStatus.COMPLETED
+                and scan.final_strategy_run_id != attempt.final_strategy_run_id
+            ):
                 raise ValueError("final strategy run reference must be the scan's actual final run")
 
     def list_attempts(
@@ -625,6 +632,17 @@ class SqlAlchemyLogicalScanRepository(_SqlAlchemyScopedRepository):
         )
         if stored_final != strategy_run_id:
             raise ValueError("logical scan final strategy run was not persisted")
+        final_success = self._session.scalar(
+            select(ScanAttemptModel.scan_attempt_id).where(
+                ScanAttemptModel.logical_scan_run_id == logical_scan_run_id,
+                ScanAttemptModel.status == "SUCCEEDED",
+                ScanAttemptModel.final_strategy_run_id == strategy_run_id,
+            )
+        )
+        if final_success is None:
+            raise ValueError(
+                "logical scan requires durable final success evidence before completion"
+            )
         model.status = LogicalScanStatus.COMPLETED.value
         model.completed_at = completed_at
         self._session.flush()
@@ -822,6 +840,8 @@ class SqlAlchemyChildIntentRepository(_SqlAlchemyScopedRepository):
             or strategy_run.portfolio_id != intent.portfolio_id
         ):
             raise ValueError("child intent strategy run does not match its plan scope")
+        if _final_strategy_key_from_strategy_run_model(strategy_run) != intent.final_strategy_key:
+            raise ValueError("child intent final strategy key does not match strategy run")
         existing = self._session.scalar(
             select(ChildIntentModel).where(ChildIntentModel.intent_key == intent.intent_key)
         )
@@ -833,8 +853,23 @@ class SqlAlchemyChildIntentRepository(_SqlAlchemyScopedRepository):
                     "child intent key already records different evidence"
                 )
             return restored
-        self._session.add(child_intent_to_model(intent))
-        self._session.flush()
+        try:
+            with self._session.begin_nested():
+                self._session.add(child_intent_to_model(intent))
+                self._session.flush()
+        except IntegrityError as error:
+            existing = self._session.scalar(
+                select(ChildIntentModel).where(ChildIntentModel.intent_key == intent.intent_key)
+            )
+            if existing is None:
+                raise error
+            restored = child_intent_from_model(existing)
+            self._require_portfolio_read(restored.portfolio_id, access_context)
+            if not same_logical_child_intent(existing=restored, candidate=intent):
+                raise IdempotencyConflictError(
+                    "child intent key already records different evidence"
+                ) from error
+            return restored
         return intent
 
     def get(self, *, intent_key: str, access_context: AccessContext) -> ChildIntent:
@@ -858,6 +893,16 @@ class SqlAlchemyChildIntentRepository(_SqlAlchemyScopedRepository):
         for intent in intents:
             self._require_portfolio_read(intent.portfolio_id, access_context)
         return intents
+
+
+def _final_strategy_key_from_strategy_run_model(strategy_run: StrategyRunModel) -> str | None:
+    """Read the immutable final key from the run that an intent claims to represent."""
+
+    idempotency = strategy_run_from_model(strategy_run).outputs.get("idempotency")
+    if not isinstance(idempotency, Mapping):
+        return None
+    final_strategy_key = idempotency.get("final_strategy_key")
+    return final_strategy_key if isinstance(final_strategy_key, str) else None
 
 
 def _exact_strategy_run_retry(

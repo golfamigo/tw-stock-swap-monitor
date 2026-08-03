@@ -253,15 +253,18 @@ def _coordinator(
     scans = InMemoryLogicalScanRepository({PORTFOLIO_ID: OWNER_ID})
     configurations = InMemoryConfigurationSnapshotRepository({PORTFOLIO_ID: OWNER_ID})
     configurations.record_or_get(snapshot=_configuration(plan), access_context=_context())
+    child_intents = InMemoryChildIntentRepository({PORTFOLIO_ID: OWNER_ID})
     return RunCoordinator(
         rotation_plans=plans,
         configuration_snapshots=configurations,
         positions=InMemoryPositionRepository({PORTFOLIO_ID: OWNER_ID}),
         recommendation_states=InMemoryRecommendationStateRepository({PORTFOLIO_ID: OWNER_ID}),
-        child_intents=InMemoryChildIntentRepository({PORTFOLIO_ID: OWNER_ID}),
+        child_intents=child_intents,
         logical_scans=scans,
         strategy_runs=InMemoryStrategyRunRepository(
-            {PORTFOLIO_ID: OWNER_ID}, logical_scan_repository=scans
+            {PORTFOLIO_ID: OWNER_ID},
+            logical_scan_repository=scans,
+            child_intent_repository=child_intents,
         ),
         locks=lock if lock is not None else InMemoryLockProvider({PORTFOLIO_ID: OWNER_ID}),
         market_data=provider,

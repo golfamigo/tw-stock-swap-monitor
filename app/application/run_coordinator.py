@@ -346,6 +346,12 @@ class RunCoordinator:
                     strategy_run=stored_run,
                     final_identity=final_identity,
                 )
+                terminal = self._record_recovered_final_attempt(
+                    request=request,
+                    scan=scan,
+                    strategy_run=stored_run,
+                    final_identity=final_identity,
+                )
             except Exception:
                 return self._failed_result(
                     request=request,
@@ -375,15 +381,6 @@ class RunCoordinator:
                     strategy_run=stored_run,
                     final_identity=final_identity,
                 )
-            terminal = self._record_terminal_attempt(
-                request=request,
-                scan=scan,
-                previous_attempt=running_attempt,
-                status=ScanAttemptStatus.SUCCEEDED,
-                snapshot=snapshot,
-                final_identity=final_identity,
-                final_strategy_run_id=stored_run.strategy_run_id,
-            )
             audit = dict(
                 self._audit(
                     request=request,
@@ -462,6 +459,12 @@ class RunCoordinator:
                 strategy_run=strategy_run,
                 final_identity=final_identity,
             )
+            terminal = self._record_recovered_final_attempt(
+                request=request,
+                scan=scan,
+                strategy_run=strategy_run,
+                final_identity=final_identity,
+            )
             self._logical_scans.attach_final_strategy_run(
                 logical_scan_run_id=scan.logical_scan_run_id,
                 plan=plan,
@@ -478,12 +481,6 @@ class RunCoordinator:
                 final_identity=_try_final_identity_from_run(strategy_run),
                 failure_detail=type(error).__name__,
             )
-        terminal = self._record_recovered_final_attempt(
-            request=request,
-            scan=scan,
-            strategy_run=strategy_run,
-            final_identity=final_identity,
-        )
         audit = dict(
             self._audit(
                 request=request,
@@ -515,6 +512,8 @@ class RunCoordinator:
         """Persist or verify the transition and child evidence carried by one final candidate."""
 
         effects = _finalization_evidence(strategy_run)
+        expected_run_id = strategy_run.strategy_run_id
+        expected_key = final_identity.key
         current = self._recommendation_states.get_or_create(
             plan=plan,
             created_at=self._current_time(),
@@ -524,7 +523,13 @@ class RunCoordinator:
             current.state is effects.next_state
             and current.remaining_stages_halted == effects.remaining_stages_halted
         ):
-            pass
+            if (
+                current.finalization_strategy_run_id != expected_run_id
+                or current.finalization_strategy_key != expected_key
+            ):
+                raise RunCoordinatorInvariantError(
+                    "pending finalization belongs to different durable state evidence"
+                )
         elif (
             current.state is effects.previous_state
             and current.remaining_stages_halted == effects.previous_remaining_stages_halted
@@ -536,6 +541,8 @@ class RunCoordinator:
                 remaining_stages_halted=effects.remaining_stages_halted,
                 changed_at=self._current_time(),
                 access_context=request.access_context,
+                finalization_strategy_run_id=expected_run_id,
+                finalization_strategy_key=expected_key,
             )
         else:
             raise RunCoordinatorInvariantError(
@@ -624,9 +631,9 @@ class RunCoordinator:
             logical_scan_run_id=scan.logical_scan_run_id,
             attempt_number=len(attempts) + 1,
             status=ScanAttemptStatus.SUCCEEDED,
-            configuration_snapshot_hash=request.configuration_snapshot.content_hash,
-            configuration_snapshot_id=request.configuration_snapshot.snapshot_id,
-            configuration_snapshot_created_at=request.configuration_snapshot.created_at,
+            configuration_snapshot_hash=strategy_run.configuration_snapshot.content_hash,
+            configuration_snapshot_id=strategy_run.configuration_snapshot.snapshot_id,
+            configuration_snapshot_created_at=strategy_run.configuration_snapshot.created_at,
             market_data_snapshot_id=market_data_snapshot_id,
             market_data_content_hash=market_data_content_hash,
             final_strategy_key=final_identity.key,
@@ -690,6 +697,12 @@ class RunCoordinator:
         )
         if stored_run is None:
             raise RunCoordinatorInvariantError("completed scan is missing its final strategy run")
+        terminal = self._record_recovered_final_attempt(
+            request=request,
+            scan=scan,
+            strategy_run=stored_run,
+            final_identity=_final_identity_from_run(stored_run),
+        )
         return RunCoordinatorResult(
             disposition=RunDisposition.COMPLETED,
             strategy_run=stored_run,
@@ -700,7 +713,7 @@ class RunCoordinator:
                 request=request,
                 scan=scan,
                 final_identity=None,
-                terminal_attempt=None,
+                terminal_attempt=terminal,
                 market_data_actionable=True,
             ),
         )

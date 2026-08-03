@@ -232,14 +232,6 @@ def test_in_memory_final_evidence_requires_an_actual_completed_final_run() -> No
         logical_scan_run_id=scan.logical_scan_run_id,
         access_context=_context(owner_id),
     )
-    repository.attach_final_strategy_run(
-        logical_scan_run_id=scan.logical_scan_run_id,
-        plan=plan,
-        strategy_run_id=final_run.strategy_run_id,
-        completed_at=NOW,
-        access_context=_context(owner_id),
-    )
-
     repository.record_attempt(
         attempt=_attempt(
             logical_scan_run_id=scan.logical_scan_run_id,
@@ -247,6 +239,13 @@ def test_in_memory_final_evidence_requires_an_actual_completed_final_run() -> No
             status=ScanAttemptStatus.SUCCEEDED,
             final_strategy_run_id=final_run.strategy_run_id,
         ),
+        access_context=_context(owner_id),
+    )
+    repository.attach_final_strategy_run(
+        logical_scan_run_id=scan.logical_scan_run_id,
+        plan=plan,
+        strategy_run_id=final_run.strategy_run_id,
+        completed_at=NOW,
         access_context=_context(owner_id),
     )
 
@@ -257,7 +256,7 @@ def test_in_memory_has_no_free_final_strategy_run_registration() -> None:
     assert not hasattr(InMemoryLogicalScanRepository({}), "register_strategy_run_reference")
 
 
-def test_in_memory_rejects_a_running_scan_final_reference() -> None:
+def test_in_memory_rejects_an_unpersisted_running_scan_final_reference() -> None:
     from app.persistence.in_memory import InMemoryLogicalScanRepository
 
     owner_id = uuid4()
@@ -267,7 +266,7 @@ def test_in_memory_rejects_a_running_scan_final_reference() -> None:
         request=_request(plan, minute=0), created_at=NOW, access_context=_context(owner_id)
     )
 
-    with pytest.raises(ValueError, match="completed final"):
+    with pytest.raises(ValueError, match="actual final"):
         repository.record_attempt(
             attempt=_attempt(
                 logical_scan_run_id=scan.logical_scan_run_id,
@@ -320,6 +319,24 @@ def test_in_memory_rejects_nonfinal_and_cross_scan_final_references() -> None:
         idempotency_key=IdempotencyKey("unlinked-final"),
         access_context=_context(owner_id),
     )
+    repository.record_attempt(
+        attempt=_attempt(
+            logical_scan_run_id=first_scan.logical_scan_run_id,
+            attempt_number=1,
+            status=ScanAttemptStatus.SUCCEEDED,
+            final_strategy_run_id=first_final.strategy_run_id,
+        ),
+        access_context=_context(owner_id),
+    )
+    repository.record_attempt(
+        attempt=_attempt(
+            logical_scan_run_id=second_scan.logical_scan_run_id,
+            attempt_number=1,
+            status=ScanAttemptStatus.SUCCEEDED,
+            final_strategy_run_id=second_final.strategy_run_id,
+        ),
+        access_context=_context(owner_id),
+    )
     repository.attach_final_strategy_run(
         logical_scan_run_id=first_scan.logical_scan_run_id,
         plan=plan,
@@ -339,7 +356,7 @@ def test_in_memory_rejects_nonfinal_and_cross_scan_final_references() -> None:
         repository.record_attempt(
             attempt=_attempt(
                 logical_scan_run_id=first_scan.logical_scan_run_id,
-                attempt_number=1,
+                attempt_number=2,
                 status=ScanAttemptStatus.SUCCEEDED,
                 final_strategy_run_id=unlinked.strategy_run_id,
             ),
@@ -349,7 +366,7 @@ def test_in_memory_rejects_nonfinal_and_cross_scan_final_references() -> None:
         repository.record_attempt(
             attempt=_attempt(
                 logical_scan_run_id=second_scan.logical_scan_run_id,
-                attempt_number=1,
+                attempt_number=2,
                 status=ScanAttemptStatus.SUCCEEDED,
                 final_strategy_run_id=first_final.strategy_run_id,
             ),
@@ -430,7 +447,7 @@ def test_sql_repository_rejects_a_forged_final_strategy_run_reference() -> None:
             )
 
 
-def test_sql_rejects_a_staged_final_run_before_scan_completion() -> None:
+def test_sql_accepts_a_persisted_final_run_before_scan_completion() -> None:
     owner_id = uuid4()
     plan = _plan(owner_id)
     engine = create_engine("sqlite+pysqlite:///:memory:")
@@ -449,16 +466,15 @@ def test_sql_rejects_a_staged_final_run_before_scan_completion() -> None:
             logical_scan_run_id=scan.logical_scan_run_id,
         )
 
-        with pytest.raises(ValueError, match="completed final"):
-            repository.record_attempt(
-                attempt=_attempt(
-                    logical_scan_run_id=scan.logical_scan_run_id,
-                    attempt_number=1,
-                    status=ScanAttemptStatus.SUCCEEDED,
-                    final_strategy_run_id=staged_run_id,
-                ),
-                access_context=_context(owner_id),
-            )
+        repository.record_attempt(
+            attempt=_attempt(
+                logical_scan_run_id=scan.logical_scan_run_id,
+                attempt_number=1,
+                status=ScanAttemptStatus.SUCCEEDED,
+                final_strategy_run_id=staged_run_id,
+            ),
+            access_context=_context(owner_id),
+        )
 
 
 def test_sql_accepts_the_completed_scan_actual_final_run_reference() -> None:
@@ -479,14 +495,6 @@ def test_sql_accepts_the_completed_scan_actual_final_run_reference() -> None:
             plan=plan,
             logical_scan_run_id=scan.logical_scan_run_id,
         )
-        repository.attach_final_strategy_run(
-            logical_scan_run_id=scan.logical_scan_run_id,
-            plan=plan,
-            strategy_run_id=final_run_id,
-            completed_at=NOW,
-            access_context=_context(owner_id),
-        )
-
         repository.record_attempt(
             attempt=_attempt(
                 logical_scan_run_id=scan.logical_scan_run_id,
@@ -494,6 +502,13 @@ def test_sql_accepts_the_completed_scan_actual_final_run_reference() -> None:
                 status=ScanAttemptStatus.SUCCEEDED,
                 final_strategy_run_id=final_run_id,
             ),
+            access_context=_context(owner_id),
+        )
+        repository.attach_final_strategy_run(
+            logical_scan_run_id=scan.logical_scan_run_id,
+            plan=plan,
+            strategy_run_id=final_run_id,
+            completed_at=NOW,
             access_context=_context(owner_id),
         )
 
