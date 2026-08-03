@@ -26,6 +26,16 @@ def test_raw_transport_preflight_rejects_extreme_nesting_without_recursion() -> 
         parse_expression(expression)
 
 
+def test_raw_preflight_bounds_malformed_multikey_nesting_before_schema_validation() -> None:
+    expression: object = True
+    for _ in range(2_000):
+        expression = {"not": [expression]}
+    malformed = {"not": [expression], "extra": True}
+
+    with pytest.raises(RuleSafetyError, match="depth"):
+        parse_expression(malformed)
+
+
 def test_parse_rules_rejects_aggregate_ruleset_limit_before_rule_parsing() -> None:
     raw_rules = [{"id": f"rule_{index}", "expression": True} for index in range(513)]
 

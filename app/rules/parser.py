@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Context, Decimal, InvalidOperation, localcontext
 
@@ -232,17 +232,14 @@ def _preflight_raw_expression(raw: object) -> int:
         node_count += 1
         if node_count > MAX_AST_NODES:
             raise RuleSafetyError(f"expression node count exceeds {MAX_AST_NODES}")
-        if not isinstance(node, dict):
+        if isinstance(node, Mapping):
+            for child in reversed(tuple(node.values())):
+                stack.append((child, depth + 1))
             continue
-        if set(node) == {"var"}:
+        if isinstance(node, list):
+            for child in reversed(node):
+                stack.append((child, depth))
             continue
-        if len(node) != 1:
-            continue
-        raw_operands = next(iter(node.values()))
-        if not isinstance(raw_operands, list):
-            continue
-        for operand in reversed(raw_operands):
-            stack.append((operand, depth + 1))
     return node_count
 
 
