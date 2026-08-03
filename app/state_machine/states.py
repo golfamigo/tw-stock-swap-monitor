@@ -1,8 +1,12 @@
 """Code-defined states, events, and validated guard outcomes for recommendations."""
 
+from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
+from uuid import UUID
 
 from app.domain.errors import DomainError
+from app.domain.values import require_timezone_aware
 
 
 class RecommendationState(StrEnum):
@@ -76,3 +80,24 @@ class ConfirmationOutcome(StrEnum):
 
 class TransitionNotAllowed(DomainError):
     """The requested recommendation edge or its validated guard was not allowed."""
+
+
+@dataclass(frozen=True, slots=True)
+class RecommendationStateRecord:
+    """Durable recommendation lifecycle state, independent from execution and positions."""
+
+    rotation_plan_id: UUID
+    portfolio_id: UUID
+    state: RecommendationState
+    remaining_stages_halted: bool
+    revision: int
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, RecommendationState):
+            raise TypeError("state must be a RecommendationState")
+        if not isinstance(self.remaining_stages_halted, bool):
+            raise TypeError("remaining_stages_halted must be a Boolean")
+        if isinstance(self.revision, bool) or self.revision < 0:
+            raise ValueError("revision must be non-negative")
+        require_timezone_aware(self.updated_at, field_name="updated_at")

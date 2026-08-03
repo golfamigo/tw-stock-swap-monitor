@@ -338,6 +338,32 @@ class LogicalScanRunModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class RecommendationStateModel(Base):
+    """Durable recommendation lifecycle, explicitly separate from brokerage execution."""
+
+    __tablename__ = "recommendation_states"
+    __table_args__ = (
+        CheckConstraint("revision >= 0", name="ck_recommendation_state_revision"),
+        CheckConstraint(
+            "state IN ('IDLE', 'WATCHING', 'NEAR_TRIGGER', 'ACTION_PENDING', "
+            "'ACTION_NOTIFIED', 'DATA_DEGRADED', 'INVALIDATED', 'PARTIALLY_EXECUTED', "
+            "'WAITING_CONFIRMATION', 'STAGE_COMPLETED', 'ROTATION_COMPLETED', 'PAUSED')",
+            name="ck_recommendation_state_value",
+        ),
+    )
+
+    rotation_plan_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("rotation_plans.rotation_plan_id"), primary_key=True
+    )
+    portfolio_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("portfolios.portfolio_id"), nullable=False
+    )
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    remaining_stages_halted: Mapped[bool] = mapped_column(nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class ScanAttemptModel(Base):
     """Provider attempt evidence for one logical scan run."""
 
@@ -397,8 +423,18 @@ class ScanAttemptModel(Base):
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     configuration_snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    configuration_snapshot_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("configuration_snapshots.snapshot_id"), nullable=True
+    )
+    configuration_snapshot_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     market_data_snapshot_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     market_data_content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    final_strategy_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    final_strategy_identity_format_version: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
     trigger_correlation_id: Mapped[str] = mapped_column(String(256), nullable=False)
     actor_correlation_id: Mapped[str] = mapped_column(String(256), nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -446,3 +482,29 @@ class StrategyRunModel(Base):
     outputs: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False)
+
+
+class ChildIntentModel(Base):
+    """Persisted notification fingerprints only; no destination or delivery fields exist."""
+
+    __tablename__ = "child_intents"
+    __table_args__ = (
+        UniqueConstraint("intent_key", name="uq_child_intent_key"),
+        UniqueConstraint("strategy_run_id", "purpose", name="uq_child_intent_run_purpose"),
+    )
+
+    child_intent_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    rotation_plan_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("rotation_plans.rotation_plan_id"), nullable=False
+    )
+    portfolio_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("portfolios.portfolio_id"), nullable=False
+    )
+    strategy_run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("strategy_runs.strategy_run_id"), nullable=False
+    )
+    final_strategy_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    final_strategy_identity_format_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(32), nullable=False)
+    intent_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

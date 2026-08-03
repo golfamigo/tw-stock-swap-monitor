@@ -340,6 +340,10 @@ class ScanAttempt:
     recovery_of_attempt_id: UUID | None = None
     duplicate_of_attempt_id: UUID | None = None
     final_strategy_run_id: UUID | None = None
+    configuration_snapshot_id: UUID | None = None
+    configuration_snapshot_created_at: datetime | None = None
+    final_strategy_key: str | None = None
+    final_strategy_identity_format_version: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.attempt_number, bool) or self.attempt_number < 1:
@@ -349,6 +353,18 @@ class ScanAttempt:
         _require_sha256_hash(
             self.configuration_snapshot_hash, field_name="configuration_snapshot_hash"
         )
+        if (self.configuration_snapshot_id is None) != (
+            self.configuration_snapshot_created_at is None
+        ):
+            raise ValueError(
+                "configuration_snapshot_id and "
+                "configuration_snapshot_created_at must be supplied together"
+            )
+        if self.configuration_snapshot_created_at is not None:
+            require_timezone_aware(
+                self.configuration_snapshot_created_at,
+                field_name="configuration_snapshot_created_at",
+            )
         if self.market_data_snapshot_id is not None and not self.market_data_snapshot_id.strip():
             raise ValueError("market_data_snapshot_id must not be blank when supplied")
         if (self.market_data_snapshot_id is None) != (self.market_data_content_hash is None):
@@ -359,6 +375,20 @@ class ScanAttempt:
             _require_sha256_hash(
                 self.market_data_content_hash, field_name="market_data_content_hash"
             )
+        if (self.final_strategy_key is None) != (
+            self.final_strategy_identity_format_version is None
+        ):
+            raise ValueError(
+                "final_strategy_key and "
+                "final_strategy_identity_format_version must be supplied together"
+            )
+        if self.final_strategy_key is not None:
+            _require_sha256_hash(self.final_strategy_key, field_name="final_strategy_key")
+            if (
+                not self.final_strategy_identity_format_version
+                or len(self.final_strategy_identity_format_version) > 16
+            ):
+                raise ValueError("final_strategy_identity_format_version must be non-blank")
         _require_bounded_text(
             self.trigger_correlation_id, field_name="trigger_correlation_id", maximum_length=256
         )
@@ -423,6 +453,19 @@ class ScanAttempt:
         if self.status in {ScanAttemptStatus.FAILED, ScanAttemptStatus.DEGRADED}:
             return ScanAttemptRecoveryDecision.RETRY
         return ScanAttemptRecoveryDecision.FINALIZE
+
+    @property
+    def configuration_snapshot(self) -> ConfigurationSnapshotRef | None:
+        """Reconstruct the immutable configuration reference retained with this attempt."""
+
+        if self.configuration_snapshot_id is None:
+            return None
+        assert self.configuration_snapshot_created_at is not None
+        return ConfigurationSnapshotRef(
+            self.configuration_snapshot_id,
+            self.configuration_snapshot_hash,
+            self.configuration_snapshot_created_at,
+        )
 
 
 def _require_sha256_hash(value: str, *, field_name: str) -> None:

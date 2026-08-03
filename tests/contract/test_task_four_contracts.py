@@ -77,6 +77,8 @@ EXPECTED_FOUNDATION_TABLES = frozenset(
         "logical_scan_runs",
         "scan_attempts",
         "strategy_runs",
+        "recommendation_states",
+        "child_intents",
     }
 )
 

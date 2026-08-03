@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+from app.application.child_intents import ChildIntent, ChildIntentPurpose
 from app.application.configuration import (
     ConfigurationLayer,
     restore_resolved_configuration_snapshot,
@@ -32,11 +33,13 @@ from app.persistence.configuration_payload import (
 )
 from app.persistence.evidence import decode_evidence, encode_evidence
 from app.persistence.models import (
+    ChildIntentModel,
     ConfigurationLayerModel,
     ConfigurationSnapshotModel,
     InstrumentModel,
     LogicalScanRunModel,
     PositionModel,
+    RecommendationStateModel,
     RotationPlanModel,
     ScanAttemptModel,
     StrategyRunModel,
@@ -44,6 +47,7 @@ from app.persistence.models import (
 from app.persistence.records import PersistedConfigurationSnapshot
 from app.schemas.common import ConfigurationLayerScope, ParentVersion
 from app.schemas.configuration import LayerPatchSchema
+from app.state_machine.states import RecommendationState, RecommendationStateRecord
 
 
 def _persist_datetime(value: datetime) -> datetime:
@@ -378,8 +382,16 @@ def scan_attempt_to_model(attempt: ScanAttempt) -> ScanAttemptModel:
         attempt_number=attempt.attempt_number,
         status=attempt.status.value,
         configuration_snapshot_hash=attempt.configuration_snapshot_hash,
+        configuration_snapshot_id=attempt.configuration_snapshot_id,
+        configuration_snapshot_created_at=(
+            _persist_datetime(attempt.configuration_snapshot_created_at)
+            if attempt.configuration_snapshot_created_at is not None
+            else None
+        ),
         market_data_snapshot_id=attempt.market_data_snapshot_id,
         market_data_content_hash=attempt.market_data_content_hash,
+        final_strategy_key=attempt.final_strategy_key,
+        final_strategy_identity_format_version=attempt.final_strategy_identity_format_version,
         trigger_correlation_id=attempt.trigger_correlation_id,
         actor_correlation_id=attempt.actor_correlation_id,
         started_at=_persist_datetime(attempt.started_at),
@@ -403,8 +415,16 @@ def scan_attempt_from_model(model: ScanAttemptModel) -> ScanAttempt:
         attempt_number=model.attempt_number,
         status=ScanAttemptStatus(model.status),
         configuration_snapshot_hash=model.configuration_snapshot_hash,
+        configuration_snapshot_id=model.configuration_snapshot_id,
+        configuration_snapshot_created_at=(
+            _restore_datetime(model.configuration_snapshot_created_at)
+            if model.configuration_snapshot_created_at is not None
+            else None
+        ),
         market_data_snapshot_id=model.market_data_snapshot_id,
         market_data_content_hash=model.market_data_content_hash,
+        final_strategy_key=model.final_strategy_key,
+        final_strategy_identity_format_version=model.final_strategy_identity_format_version,
         trigger_correlation_id=model.trigger_correlation_id,
         actor_correlation_id=model.actor_correlation_id,
         started_at=_restore_datetime(model.started_at),
@@ -416,6 +436,64 @@ def scan_attempt_from_model(model: ScanAttemptModel) -> ScanAttempt:
         recovery_of_attempt_id=model.recovery_of_attempt_id,
         duplicate_of_attempt_id=model.duplicate_of_attempt_id,
         final_strategy_run_id=model.final_strategy_run_id,
+    )
+
+
+def recommendation_state_to_model(record: RecommendationStateRecord) -> RecommendationStateModel:
+    """Project durable recommendation lifecycle state without execution or holding evidence."""
+
+    return RecommendationStateModel(
+        rotation_plan_id=record.rotation_plan_id,
+        portfolio_id=record.portfolio_id,
+        state=record.state.value,
+        remaining_stages_halted=record.remaining_stages_halted,
+        revision=record.revision,
+        updated_at=_persist_datetime(record.updated_at),
+    )
+
+
+def recommendation_state_from_model(model: RecommendationStateModel) -> RecommendationStateRecord:
+    """Restore a typed recommendation state and normalize dialect timestamp behavior."""
+
+    return RecommendationStateRecord(
+        rotation_plan_id=model.rotation_plan_id,
+        portfolio_id=model.portfolio_id,
+        state=RecommendationState(model.state),
+        remaining_stages_halted=model.remaining_stages_halted,
+        revision=model.revision,
+        updated_at=_restore_datetime(model.updated_at),
+    )
+
+
+def child_intent_to_model(intent: ChildIntent) -> ChildIntentModel:
+    """Persist a deterministic child fingerprint with no delivery destination or payload."""
+
+    return ChildIntentModel(
+        child_intent_id=intent.child_intent_id,
+        rotation_plan_id=intent.rotation_plan_id,
+        portfolio_id=intent.portfolio_id,
+        strategy_run_id=intent.strategy_run_id,
+        final_strategy_key=intent.final_strategy_key,
+        final_strategy_identity_format_version=intent.final_strategy_identity_format_version,
+        purpose=intent.purpose.value,
+        intent_key=intent.intent_key,
+        created_at=_persist_datetime(intent.created_at),
+    )
+
+
+def child_intent_from_model(model: ChildIntentModel) -> ChildIntent:
+    """Restore only valid, immutable child-intent evidence."""
+
+    return ChildIntent(
+        child_intent_id=model.child_intent_id,
+        rotation_plan_id=model.rotation_plan_id,
+        portfolio_id=model.portfolio_id,
+        strategy_run_id=model.strategy_run_id,
+        final_strategy_key=model.final_strategy_key,
+        final_strategy_identity_format_version=model.final_strategy_identity_format_version,
+        purpose=ChildIntentPurpose(model.purpose),
+        intent_key=model.intent_key,
+        created_at=_restore_datetime(model.created_at),
     )
 
 

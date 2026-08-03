@@ -9,19 +9,25 @@ from enum import StrEnum
 from types import MappingProxyType
 from uuid import UUID, uuid4
 
+from app.application.child_intents import ChildIntentPurpose, build_child_intent
+from app.application.configuration_snapshots import PersistedConfigurationSnapshot
 from app.application.idempotency import FinalStrategyIdentity, build_scan_lock_key
 from app.data_sources.base import MarketDataProvider
 from app.data_sources.models import MarketDataRequest, MarketDataSnapshot
 from app.domain.access import AccessContext
-from app.domain.entities import LogicalScanRun, RotationPlan, ScanAttempt, StrategyRun
+from app.domain.entities import LogicalScanRun, Position, RotationPlan, ScanAttempt, StrategyRun
 from app.domain.enums import LogicalScanStatus, ScanAttemptStatus
 from app.domain.errors import DomainError
 from app.domain.values import ConfigurationSnapshotRef, require_timezone_aware
+from app.repositories.child_intents import ChildIntentRepository
+from app.repositories.configuration_snapshots import ConfigurationSnapshotRepository
 from app.repositories.locks import LockProvider, ScanLockRequest
 from app.repositories.logical_scans import LogicalScanRepository
+from app.repositories.positions import PositionRepository
+from app.repositories.recommendation_states import RecommendationStateRepository
 from app.repositories.rotation_plans import RotationPlanRepository
 from app.repositories.strategy_runs import StrategyRunRepository
-from app.services.rotation_run import RotationEvaluator, RotationRunService
+from app.services.rotation_run import RotationEvaluation, RotationEvaluator, RotationRunService
 
 
 class TriggerSource(StrEnum):
@@ -44,6 +50,10 @@ class RunDisposition(StrEnum):
 
 class RunCoordinatorInvariantError(DomainError):
     """Persisted scan evidence did not support a safe coordinator action."""
+
+
+class ConfigurationSnapshotValidationError(DomainError):
+    """A request cited configuration evidence that is missing, mismatched, or unauthorized."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,12 +132,16 @@ class RunCoordinatorResult:
 
 
 class RunCoordinator:
-    """Coordinate a pre-provider lock, immutable attempts, and at most one final run."""
+    """Coordinate lock-first provider work, durable recommendation state, and final evidence."""
 
     def __init__(
         self,
         *,
         rotation_plans: RotationPlanRepository,
+        configuration_snapshots: ConfigurationSnapshotRepository,
+        positions: PositionRepository,
+        recommendation_states: RecommendationStateRepository,
+        child_intents: ChildIntentRepository,
         logical_scans: LogicalScanRepository,
         strategy_runs: StrategyRunRepository,
         locks: LockProvider,
@@ -137,7 +151,13 @@ class RunCoordinator:
         new_uuid: Callable[[], UUID] = uuid4,
         max_provider_attempts: int = 2,
     ) -> None:
+        if isinstance(max_provider_attempts, bool) or max_provider_attempts < 1:
+            raise ValueError("max_provider_attempts must be a positive integer")
         self._rotation_plans = rotation_plans
+        self._configuration_snapshots = configuration_snapshots
+        self._positions = positions
+        self._recommendation_states = recommendation_states
+        self._child_intents = child_intents
         self._logical_scans = logical_scans
         self._strategy_runs = strategy_runs
         self._locks = locks
@@ -145,12 +165,10 @@ class RunCoordinator:
         self._run_service = RotationRunService(evaluator)
         self._now = now
         self._new_uuid = new_uuid
-        if isinstance(max_provider_attempts, bool) or max_provider_attempts < 1:
-            raise ValueError("max_provider_attempts must be a positive integer")
         self._max_provider_attempts = max_provider_attempts
 
     def run(self, request: RunCoordinatorRequest) -> RunCoordinatorResult:
-        """Perform one evaluation, acquiring the scan lock before any provider operation."""
+        """Coordinate one recommendation evaluation without fetching before acquiring its lock."""
 
         if not isinstance(request, RunCoordinatorRequest):
             raise TypeError("request must be a RunCoordinatorRequest")
@@ -159,49 +177,22 @@ class RunCoordinator:
         )
         if plan != request.plan:
             raise RunCoordinatorInvariantError("request plan does not match the authorized plan")
+        self._validate_configuration_snapshot(request)
         scan_request = request.scan_lock_request()
         scan_lock_key = build_scan_lock_key(scan_request)
-        existing_scan = self._logical_scans.get_by_lock_key(
-            request=scan_request, access_context=request.access_context
-        )
-        if existing_scan is not None and existing_scan.status is LogicalScanStatus.COMPLETED:
-            return self._completed_result(
-                request=request,
-                scan_request=scan_request,
-                scan=existing_scan,
-                scan_lock_key=scan_lock_key,
-            )
-
         lease = self._locks.acquire_scan_lock(scan_request, access_context=request.access_context)
         if lease is None:
-            duplicate_scan = self._logical_scans.get_by_lock_key(
-                request=scan_request, access_context=request.access_context
-            )
-            if duplicate_scan is not None and duplicate_scan.status is LogicalScanStatus.COMPLETED:
-                return self._completed_result(
-                    request=request,
-                    scan_request=scan_request,
-                    scan=duplicate_scan,
-                    scan_lock_key=scan_lock_key,
-                )
-            return self._duplicate_result(
-                request=request,
-                scan_lock_key=scan_lock_key,
-                scan=duplicate_scan,
-            )
+            return self._duplicate_result(request=request, scan_lock_key=scan_lock_key)
 
         try:
-            recovered_scan = self._logical_scans.get_by_lock_key(
+            scan = self._logical_scans.get_by_lock_key(
                 request=scan_request, access_context=request.access_context
             )
-            if recovered_scan is not None and recovered_scan.status is LogicalScanStatus.COMPLETED:
+            if scan is not None and scan.status is LogicalScanStatus.COMPLETED:
                 return self._completed_result(
-                    request=request,
-                    scan_request=scan_request,
-                    scan=recovered_scan,
-                    scan_lock_key=scan_lock_key,
+                    request=request, scan=scan, scan_lock_key=scan_lock_key
                 )
-            scan = recovered_scan or self._logical_scans.create_or_recover(
+            scan = scan or self._logical_scans.create_or_recover(
                 request=scan_request,
                 created_at=self._current_time(),
                 access_context=request.access_context,
@@ -211,9 +202,7 @@ class RunCoordinator:
                 >= self._max_provider_attempts
             ):
                 return self._retry_exhausted_result(
-                    request=request,
-                    scan=scan,
-                    scan_lock_key=scan_lock_key,
+                    request=request, scan=scan, scan_lock_key=scan_lock_key
                 )
             running_attempt = self._record_running_attempt(request=request, scan=scan)
             try:
@@ -246,6 +235,7 @@ class RunCoordinator:
                     previous_attempt=running_attempt,
                     status=ScanAttemptStatus.DEGRADED,
                     snapshot=snapshot,
+                    final_identity=final_identity,
                     failure_code="MARKET_DATA_DEGRADED",
                     failure_detail="market-data evidence was stale, incomplete, or non-actionable",
                 )
@@ -264,7 +254,20 @@ class RunCoordinator:
                     ),
                 )
             try:
-                strategy_run = self._run_service.build_strategy_run(
+                recommendation_state = self._recommendation_states.get_or_create(
+                    plan=plan,
+                    created_at=self._current_time(),
+                    access_context=request.access_context,
+                )
+                evaluation = self._run_service.evaluate(
+                    plan=plan,
+                    snapshot=snapshot,
+                    configuration_snapshot=request.configuration_snapshot,
+                )
+                sale_source = self._authoritative_sale_source(
+                    evaluation=evaluation, plan=plan, access_context=request.access_context
+                )
+                prepared = self._run_service.build_strategy_run(
                     plan=plan,
                     snapshot=snapshot,
                     configuration_snapshot=request.configuration_snapshot,
@@ -272,13 +275,32 @@ class RunCoordinator:
                     final_strategy_key=final_identity.key,
                     occurred_at=self._current_time(),
                     strategy_run_id=self._new_uuid(),
+                    recommendation_state=recommendation_state,
+                    evaluation=evaluation,
+                    sale_source_position=sale_source,
                 )
                 stored_run = self._strategy_runs.record_or_get(
                     plan=plan,
-                    run=strategy_run,
+                    run=prepared.strategy_run,
                     idempotency_key=final_identity.as_idempotency_key(),
                     logical_scan_run_id=scan.logical_scan_run_id,
                     access_context=request.access_context,
+                )
+                self._recommendation_states.record_transition(
+                    plan=plan,
+                    previous=recommendation_state,
+                    next_state=prepared.transition.next_state,
+                    remaining_stages_halted=prepared.transition.remaining_stages_halted,
+                    changed_at=self._current_time(),
+                    access_context=request.access_context,
+                )
+                notification_intent_key = self._record_notification_intent(
+                    request=request,
+                    plan=plan,
+                    strategy_run=stored_run,
+                    final_identity=final_identity,
+                    evaluation=evaluation,
+                    transition_notified=prepared.transition.notification_intent_recorded,
                 )
             except Exception:
                 return self._failed_result(
@@ -291,7 +313,7 @@ class RunCoordinator:
                         "deterministic evaluation or final-run persistence rejected evidence"
                     ),
                     snapshot=snapshot,
-                    final_strategy_key=final_identity.key,
+                    final_identity=final_identity,
                 )
             terminal = self._record_terminal_attempt(
                 request=request,
@@ -299,30 +321,104 @@ class RunCoordinator:
                 previous_attempt=running_attempt,
                 status=ScanAttemptStatus.SUCCEEDED,
                 snapshot=snapshot,
+                final_identity=final_identity,
                 final_strategy_run_id=stored_run.strategy_run_id,
             )
+            audit = dict(
+                self._audit(
+                    request=request,
+                    scan=scan,
+                    final_identity=final_identity,
+                    terminal_attempt=terminal,
+                    market_data_actionable=True,
+                )
+            )
+            if notification_intent_key is not None:
+                audit["notification_intent_key"] = notification_intent_key
             return RunCoordinatorResult(
                 disposition=RunDisposition.COMPLETED,
                 strategy_run=stored_run,
                 scan_lock_key=scan_lock_key,
                 logical_scan_run_id=scan.logical_scan_run_id,
                 final_strategy_key=final_identity.key,
-                audit=self._audit(
-                    request=request,
-                    scan=scan,
-                    final_identity=final_identity,
-                    terminal_attempt=terminal,
-                    market_data_actionable=True,
-                ),
+                audit=audit,
             )
         finally:
             self._locks.release(lease, access_context=request.access_context)
+
+    def _validate_configuration_snapshot(self, request: RunCoordinatorRequest) -> None:
+        """Fail closed before locking on an invalid immutable configuration reference."""
+
+        try:
+            persisted = self._configuration_snapshots.get(
+                request.configuration_snapshot.snapshot_id, access_context=request.access_context
+            )
+        except Exception as error:
+            raise ConfigurationSnapshotValidationError(
+                "configuration snapshot was unavailable for this actor"
+            ) from error
+        actual = _configuration_reference(persisted)
+        if actual != request.configuration_snapshot:
+            raise ConfigurationSnapshotValidationError(
+                "configuration snapshot reference does not match immutable persisted evidence"
+            )
+        if persisted.target_reference_id != request.plan.rotation_plan_id:
+            raise ConfigurationSnapshotValidationError(
+                "configuration snapshot is not bound to the requested rotation plan"
+            )
+
+    def _authoritative_sale_source(
+        self,
+        *,
+        evaluation: RotationEvaluation,
+        plan: RotationPlan,
+        access_context: AccessContext,
+    ) -> Position | None:
+        if evaluation.sale_source_position_id is None:
+            return None
+        position = self._positions.get(
+            evaluation.sale_source_position_id, access_context=access_context
+        )
+        if position.portfolio_id != plan.portfolio_id:
+            raise RunCoordinatorInvariantError("sale source position does not belong to the plan")
+        return position
+
+    def _record_notification_intent(
+        self,
+        *,
+        request: RunCoordinatorRequest,
+        plan: RotationPlan,
+        strategy_run: StrategyRun,
+        final_identity: FinalStrategyIdentity,
+        evaluation: RotationEvaluation,
+        transition_notified: bool,
+    ) -> str | None:
+        if not transition_notified:
+            return None
+        intent = build_child_intent(
+            child_intent_id=self._new_uuid(),
+            rotation_plan_id=plan.rotation_plan_id,
+            portfolio_id=plan.portfolio_id,
+            strategy_run_id=strategy_run.strategy_run_id,
+            final_strategy_key=final_identity.key,
+            purpose=ChildIntentPurpose.NOTIFICATION,
+            created_at=self._current_time(),
+        )
+        stored = self._child_intents.record_or_get(
+            intent=intent, access_context=request.access_context
+        )
+        if stored.purpose is not ChildIntentPurpose.NOTIFICATION:
+            raise RunCoordinatorInvariantError(
+                "notification transition recorded a different child intent"
+            )
+        if evaluation.event.value != "DECISION_VALIDATED":
+            raise RunCoordinatorInvariantError("notification intent requires a validated decision")
+        return stored.intent_key
 
     def _completed_result(
         self,
         *,
         request: RunCoordinatorRequest,
-        scan_request: ScanLockRequest,
         scan: LogicalScanRun,
         scan_lock_key: str,
     ) -> RunCoordinatorResult:
@@ -332,13 +428,12 @@ class RunCoordinator:
         )
         if stored_run is None:
             raise RunCoordinatorInvariantError("completed scan is missing its final strategy run")
-        final_strategy_key = _final_key_from_run(stored_run)
         return RunCoordinatorResult(
             disposition=RunDisposition.COMPLETED,
             strategy_run=stored_run,
             scan_lock_key=scan_lock_key,
             logical_scan_run_id=scan.logical_scan_run_id,
-            final_strategy_key=final_strategy_key,
+            final_strategy_key=_final_key_from_run(stored_run),
             audit=self._audit(
                 request=request,
                 scan=scan,
@@ -349,26 +444,19 @@ class RunCoordinator:
         )
 
     def _duplicate_result(
-        self,
-        *,
-        request: RunCoordinatorRequest,
-        scan_lock_key: str,
-        scan: LogicalScanRun | None,
+        self, *, request: RunCoordinatorRequest, scan_lock_key: str
     ) -> RunCoordinatorResult:
         disposition = (
             RunDisposition.API_CONFLICT
             if request.trigger_source is TriggerSource.API
             else RunDisposition.SCHEDULER_SKIPPED
         )
-        reference = ExistingResultReference(
-            scan_lock_key=scan_lock_key,
-            logical_scan_run_id=None if scan is None else scan.logical_scan_run_id,
-        )
+        reference = ExistingResultReference(scan_lock_key=scan_lock_key, logical_scan_run_id=None)
         return RunCoordinatorResult(
             disposition=disposition,
             strategy_run=None,
             scan_lock_key=scan_lock_key,
-            logical_scan_run_id=reference.logical_scan_run_id,
+            logical_scan_run_id=None,
             final_strategy_key=None,
             audit={
                 "actor_id": str(request.access_context.actor_user_id),
@@ -395,6 +483,8 @@ class RunCoordinator:
             attempt_number=len(attempts) + 1,
             status=ScanAttemptStatus.RUNNING,
             configuration_snapshot_hash=request.configuration_snapshot.content_hash,
+            configuration_snapshot_id=request.configuration_snapshot.snapshot_id,
+            configuration_snapshot_created_at=request.configuration_snapshot.created_at,
             market_data_snapshot_id=None,
             market_data_content_hash=None,
             trigger_correlation_id=request.correlation_id,
@@ -409,8 +499,6 @@ class RunCoordinator:
     def _provider_attempt_count(
         self, *, request: RunCoordinatorRequest, scan: LogicalScanRun
     ) -> int:
-        """Count persisted pre-provider attempt markers before allowing a bounded retry."""
-
         attempts = self._logical_scans.list_attempts(
             logical_scan_run_id=scan.logical_scan_run_id, access_context=request.access_context
         )
@@ -423,8 +511,6 @@ class RunCoordinator:
         scan: LogicalScanRun,
         scan_lock_key: str,
     ) -> RunCoordinatorResult:
-        """Stop incomplete scans safely without fetching more market data after the retry bound."""
-
         audit = dict(
             self._audit(
                 request=request,
@@ -454,6 +540,7 @@ class RunCoordinator:
         previous_attempt: ScanAttempt,
         status: ScanAttemptStatus,
         snapshot: MarketDataSnapshot,
+        final_identity: FinalStrategyIdentity,
         final_strategy_run_id: UUID | None = None,
         failure_code: str | None = None,
         failure_detail: str | None = None,
@@ -467,8 +554,12 @@ class RunCoordinator:
             attempt_number=len(attempts) + 1,
             status=status,
             configuration_snapshot_hash=request.configuration_snapshot.content_hash,
+            configuration_snapshot_id=request.configuration_snapshot.snapshot_id,
+            configuration_snapshot_created_at=request.configuration_snapshot.created_at,
             market_data_snapshot_id=snapshot.snapshot_id,
             market_data_content_hash=snapshot.content_hash,
+            final_strategy_key=final_identity.key,
+            final_strategy_identity_format_version=final_identity.format_version,
             trigger_correlation_id=request.correlation_id,
             actor_correlation_id=f"actor:{request.access_context.actor_user_id}",
             started_at=previous_attempt.started_at,
@@ -491,13 +582,14 @@ class RunCoordinator:
         failure_code: str,
         failure_detail: str,
         snapshot: MarketDataSnapshot | None = None,
-        final_strategy_key: str | None = None,
+        final_identity: FinalStrategyIdentity | None = None,
     ) -> RunCoordinatorResult:
         terminal = self._failed_terminal_attempt(
             request=request,
             scan=scan,
             running_attempt=running_attempt,
             snapshot=snapshot,
+            final_identity=final_identity,
             failure_code=failure_code,
             failure_detail=failure_detail,
         )
@@ -506,11 +598,11 @@ class RunCoordinator:
             strategy_run=None,
             scan_lock_key=scan_lock_key,
             logical_scan_run_id=scan.logical_scan_run_id,
-            final_strategy_key=final_strategy_key,
+            final_strategy_key=None if final_identity is None else final_identity.key,
             audit=self._audit(
                 request=request,
                 scan=scan,
-                final_identity=None,
+                final_identity=final_identity,
                 terminal_attempt=terminal,
                 market_data_actionable=False,
             ),
@@ -523,6 +615,7 @@ class RunCoordinator:
         scan: LogicalScanRun,
         running_attempt: ScanAttempt,
         snapshot: MarketDataSnapshot | None,
+        final_identity: FinalStrategyIdentity | None,
         failure_code: str,
         failure_detail: str,
     ) -> ScanAttempt:
@@ -535,8 +628,14 @@ class RunCoordinator:
             attempt_number=len(attempts) + 1,
             status=ScanAttemptStatus.FAILED,
             configuration_snapshot_hash=request.configuration_snapshot.content_hash,
+            configuration_snapshot_id=request.configuration_snapshot.snapshot_id,
+            configuration_snapshot_created_at=request.configuration_snapshot.created_at,
             market_data_snapshot_id=None if snapshot is None else snapshot.snapshot_id,
             market_data_content_hash=None if snapshot is None else snapshot.content_hash,
+            final_strategy_key=None if final_identity is None else final_identity.key,
+            final_strategy_identity_format_version=(
+                None if final_identity is None else final_identity.format_version
+            ),
             trigger_correlation_id=request.correlation_id,
             actor_correlation_id=f"actor:{request.access_context.actor_user_id}",
             started_at=running_attempt.started_at,
@@ -567,6 +666,7 @@ class RunCoordinator:
             else terminal_attempt.status.value,
             "attempt_statuses": [attempt.status.value for attempt in attempts],
             "configuration_snapshot_hash": request.configuration_snapshot.content_hash,
+            "configuration_snapshot_id": str(request.configuration_snapshot.snapshot_id),
             "correlation_id": request.correlation_id,
             "market_data_actionable": market_data_actionable,
             "scan_lock_key": scan.scan_lock_key,
@@ -586,6 +686,15 @@ class RunCoordinator:
         value = self._now()
         require_timezone_aware(value, field_name="coordinator clock")
         return value
+
+
+def _configuration_reference(snapshot: PersistedConfigurationSnapshot) -> ConfigurationSnapshotRef:
+    resolved = snapshot.resolved_snapshot
+    return ConfigurationSnapshotRef(
+        snapshot.snapshot_id,
+        resolved.content_hash,
+        resolved.created_at,
+    )
 
 
 def _final_key_from_run(run: StrategyRun) -> str | None:

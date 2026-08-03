@@ -11,6 +11,13 @@ from threading import Event, Thread
 from typing import Never
 from uuid import UUID
 
+from app.application.configuration import (
+    CANONICAL_FORMAT_VERSION,
+    ResolvedConfigurationSnapshot,
+    canonical_content_hash,
+    canonical_json,
+)
+from app.application.configuration_snapshots import PersistedConfigurationSnapshot
 from app.application.idempotency import (
     FINAL_STRATEGY_IDENTITY_FORMAT_VERSION,
     FinalStrategyIdentity,
@@ -32,17 +39,22 @@ from app.data_sources.models import (
 )
 from app.domain.access import AccessContext
 from app.domain.entities import Instrument, RotationPlan
-from app.domain.values import ConfigurationSnapshotRef
+from app.domain.enums import Scope
+from app.domain.values import ConfigurationSnapshotRef, Ownership
 from app.persistence.in_memory import (
+    InMemoryChildIntentRepository,
+    InMemoryConfigurationSnapshotRepository,
     InMemoryLockProvider,
     InMemoryLogicalScanRepository,
+    InMemoryPositionRepository,
+    InMemoryRecommendationStateRepository,
     InMemoryRotationPlanRepository,
     InMemoryStrategyRunRepository,
 )
 from app.repositories.locks import LockLease, LockProvider, ScanLockRequest
 from app.services.rotation_run import RotationEvaluation
 from app.state_machine.machine import TransitionGuards
-from app.state_machine.states import RecommendationEvent, RecommendationState, RuleOutcome
+from app.state_machine.states import RecommendationEvent
 
 NOW = datetime(2026, 8, 1, 1, tzinfo=UTC)
 OWNER_ID = UUID("00000000-0000-0000-0000-000000000801")
@@ -69,6 +81,34 @@ def _plan() -> RotationPlan:
         source_position_ids=(),
         protected_position_ids=(),
         created_at=NOW,
+    )
+
+
+def _configuration(plan: RotationPlan) -> PersistedConfigurationSnapshot:
+    payload = {
+        "configuration_name": "task-nine-concurrency",
+        "settings": {},
+        "rules": [],
+        "keyed_items": [],
+        "extensions": {},
+        "nullable_note": None,
+    }
+    resolved = ResolvedConfigurationSnapshot(
+        payload=payload,
+        parent_versions=(),
+        created_by=OWNER_ID,
+        created_at=NOW,
+        runtime_expires_at=None,
+        canonical_format_version=CANONICAL_FORMAT_VERSION,
+        content_hash=canonical_content_hash(payload),
+        canonical_json=canonical_json(payload),
+    )
+    return PersistedConfigurationSnapshot(
+        snapshot_id=CONFIGURATION_ID,
+        resolved_snapshot=resolved,
+        config_version=1,
+        target_ownership=Ownership(Scope.PORTFOLIO, plan.portfolio_id),
+        target_reference_id=plan.rotation_plan_id,
     )
 
 
@@ -179,9 +219,8 @@ class _DenyingLock:
 
 def _evaluation(*_: object) -> RotationEvaluation:
     return RotationEvaluation(
-        current_state=RecommendationState.NEAR_TRIGGER,
-        event=RecommendationEvent.ACTION_SIGNAL,
-        guards=TransitionGuards(rule_outcome=RuleOutcome.PASSED),
+        event=RecommendationEvent.PLAN_ACTIVATED,
+        guards=TransitionGuards(plan_is_valid=True),
         outputs={"evaluation": "deterministic"},
     )
 
@@ -212,8 +251,14 @@ def _coordinator(
     )
     plans.add(plan, access_context=_context())
     scans = InMemoryLogicalScanRepository({PORTFOLIO_ID: OWNER_ID})
+    configurations = InMemoryConfigurationSnapshotRepository({PORTFOLIO_ID: OWNER_ID})
+    configurations.record_or_get(snapshot=_configuration(plan), access_context=_context())
     return RunCoordinator(
         rotation_plans=plans,
+        configuration_snapshots=configurations,
+        positions=InMemoryPositionRepository({PORTFOLIO_ID: OWNER_ID}),
+        recommendation_states=InMemoryRecommendationStateRepository({PORTFOLIO_ID: OWNER_ID}),
+        child_intents=InMemoryChildIntentRepository({PORTFOLIO_ID: OWNER_ID}),
         logical_scans=scans,
         strategy_runs=InMemoryStrategyRunRepository(
             {PORTFOLIO_ID: OWNER_ID}, logical_scan_repository=scans
@@ -232,9 +277,16 @@ def _request(
     trigger_source: TriggerSource = TriggerSource.API,
     configuration_hash: str = "a" * 64,
 ) -> RunCoordinatorRequest:
+    configuration = _configuration(_plan())
     return RunCoordinatorRequest(
         plan=_plan(),
-        configuration_snapshot=ConfigurationSnapshotRef(CONFIGURATION_ID, configuration_hash, NOW),
+        configuration_snapshot=ConfigurationSnapshotRef(
+            CONFIGURATION_ID,
+            configuration_hash
+            if configuration_hash != "a" * 64
+            else configuration.resolved_snapshot.content_hash,
+            NOW,
+        ),
         market_session_date="2026-08-01",
         scan_window_start=NOW + timedelta(hours=8),
         scan_interval="PT3M",

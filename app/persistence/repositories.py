@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
+from app.application.child_intents import ChildIntent
 from app.application.configuration import ConfigurationLayer
 from app.application.configuration_snapshots import PersistedConfigurationSnapshot
 from app.domain.access import AccessContext
@@ -25,6 +26,8 @@ from app.domain.errors import (
 )
 from app.domain.values import IdempotencyKey, Ownership
 from app.persistence.mappers import (
+    child_intent_from_model,
+    child_intent_to_model,
     configuration_layer_from_model,
     configuration_layer_to_model,
     configuration_snapshot_from_model,
@@ -33,6 +36,8 @@ from app.persistence.mappers import (
     logical_scan_to_model,
     position_from_model,
     position_to_model,
+    recommendation_state_from_model,
+    recommendation_state_to_model,
     rotation_plan_from_model,
     rotation_plan_to_model,
     scan_attempt_from_model,
@@ -42,11 +47,13 @@ from app.persistence.mappers import (
 )
 from app.persistence.models import (
     CandidateGroupModel,
+    ChildIntentModel,
     ConfigurationLayerModel,
     ConfigurationSnapshotModel,
     LogicalScanRunModel,
     PortfolioModel,
     PositionModel,
+    RecommendationStateModel,
     RotationPlanModel,
     ScanAttemptModel,
     StrategyRunModel,
@@ -62,6 +69,7 @@ from app.repositories.locks import ScanLockRequest
 from app.repositories.logical_scans import validate_scan_attempt_append
 from app.repositories.strategy_runs import require_exact_strategy_run_retry
 from app.schemas.common import ConfigurationLayerScope
+from app.state_machine.states import RecommendationState, RecommendationStateRecord
 
 
 class _SqlAlchemyScopedRepository:
@@ -126,6 +134,80 @@ class SqlAlchemyPositionRepository(_SqlAlchemyScopedRepository):
             select(PositionModel).where(PositionModel.portfolio_id == portfolio_id)
         ).all()
         return tuple(position_from_model(model) for model in models)
+
+
+class SqlAlchemyRecommendationStateRepository(_SqlAlchemyScopedRepository):
+    """Durably store one recommendation state record per rotation plan."""
+
+    def get_or_create(
+        self,
+        *,
+        plan: RotationPlan,
+        created_at: datetime,
+        access_context: AccessContext,
+    ) -> RecommendationStateRecord:
+        self._require_portfolio_mutation(plan.portfolio_id, access_context)
+        model = self._session.get(RecommendationStateModel, plan.rotation_plan_id)
+        if model is not None:
+            if model.portfolio_id != plan.portfolio_id:
+                raise ValueError("recommendation state plan portfolio does not match")
+            return recommendation_state_from_model(model)
+        record = RecommendationStateRecord(
+            rotation_plan_id=plan.rotation_plan_id,
+            portfolio_id=plan.portfolio_id,
+            state=RecommendationState.IDLE,
+            remaining_stages_halted=False,
+            revision=0,
+            updated_at=created_at,
+        )
+        self._session.add(recommendation_state_to_model(record))
+        self._session.flush()
+        return record
+
+    def get(
+        self, rotation_plan_id: UUID, *, access_context: AccessContext
+    ) -> RecommendationStateRecord:
+        model = self._session.get(RecommendationStateModel, rotation_plan_id)
+        if model is None:
+            raise NotFoundForActor("recommendation state was not found for actor")
+        self._require_portfolio_read(model.portfolio_id, access_context)
+        return recommendation_state_from_model(model)
+
+    def record_transition(
+        self,
+        *,
+        plan: RotationPlan,
+        previous: RecommendationStateRecord,
+        next_state: RecommendationState,
+        remaining_stages_halted: bool,
+        changed_at: datetime,
+        access_context: AccessContext,
+    ) -> RecommendationStateRecord:
+        self._require_portfolio_mutation(plan.portfolio_id, access_context)
+        model = self._session.get(RecommendationStateModel, plan.rotation_plan_id)
+        if model is None:
+            raise NotFoundForActor("recommendation state was not found for actor")
+        stored = recommendation_state_from_model(model)
+        if stored != previous:
+            raise IdempotencyConflictError(
+                "recommendation state changed before transition could persist"
+            )
+        if stored.portfolio_id != plan.portfolio_id:
+            raise ValueError("recommendation state plan portfolio does not match")
+        updated = RecommendationStateRecord(
+            rotation_plan_id=plan.rotation_plan_id,
+            portfolio_id=plan.portfolio_id,
+            state=next_state,
+            remaining_stages_halted=remaining_stages_halted,
+            revision=stored.revision + 1,
+            updated_at=changed_at,
+        )
+        model.state = updated.state.value
+        model.remaining_stages_halted = updated.remaining_stages_halted
+        model.revision = updated.revision
+        model.updated_at = updated.updated_at.astimezone(UTC)
+        self._session.flush()
+        return updated
 
 
 class SqlAlchemyConfigurationLayerRepository(_SqlAlchemyScopedRepository):
@@ -707,6 +789,57 @@ class SqlAlchemyStrategyRunRepository(_SqlAlchemyScopedRepository):
         ):
             return
         raise ValueError("configuration snapshot target ownership does not authorize plan")
+
+
+class SqlAlchemyChildIntentRepository(_SqlAlchemyScopedRepository):
+    """Persist deterministic notification fingerprints with no delivery capability."""
+
+    def record_or_get(self, *, intent: ChildIntent, access_context: AccessContext) -> ChildIntent:
+        self._require_portfolio_mutation(intent.portfolio_id, access_context)
+        strategy_run = self._session.get(StrategyRunModel, intent.strategy_run_id)
+        if strategy_run is None:
+            raise ValueError("child intent references a missing strategy run")
+        if (
+            strategy_run.rotation_plan_id != intent.rotation_plan_id
+            or strategy_run.portfolio_id != intent.portfolio_id
+        ):
+            raise ValueError("child intent strategy run does not match its plan scope")
+        existing = self._session.scalar(
+            select(ChildIntentModel).where(ChildIntentModel.intent_key == intent.intent_key)
+        )
+        if existing is not None:
+            restored = child_intent_from_model(existing)
+            self._require_portfolio_read(restored.portfolio_id, access_context)
+            if restored != intent:
+                raise IdempotencyConflictError(
+                    "child intent key already records different evidence"
+                )
+            return restored
+        self._session.add(child_intent_to_model(intent))
+        self._session.flush()
+        return intent
+
+    def get(self, *, intent_key: str, access_context: AccessContext) -> ChildIntent:
+        model = self._session.scalar(
+            select(ChildIntentModel).where(ChildIntentModel.intent_key == intent_key)
+        )
+        if model is None:
+            raise NotFoundForActor("child intent was not found for actor")
+        self._require_portfolio_read(model.portfolio_id, access_context)
+        return child_intent_from_model(model)
+
+    def list_for_strategy_run(
+        self, *, strategy_run_id: UUID, access_context: AccessContext
+    ) -> Sequence[ChildIntent]:
+        models = self._session.scalars(
+            select(ChildIntentModel)
+            .where(ChildIntentModel.strategy_run_id == strategy_run_id)
+            .order_by(ChildIntentModel.intent_key)
+        ).all()
+        intents = tuple(child_intent_from_model(model) for model in models)
+        for intent in intents:
+            self._require_portfolio_read(intent.portfolio_id, access_context)
+        return intents
 
 
 def _exact_strategy_run_retry(

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID
 
 import pytest
+from app.domain.entities import Position
+from app.domain.enums import PositionRole, PositionStatus
 from app.domain.errors import ProtectedPositionSaleError
+from app.domain.values import InstrumentRef, Quantity
 from app.state_machine.machine import (
     StateMachine,
     TransitionGuards,
@@ -22,6 +27,25 @@ from app.state_machine.states import (
 )
 
 PROTECTED_POSITION_ID = UUID("00000000-0000-0000-0000-000000000701")
+PORTFOLIO_ID = UUID("00000000-0000-0000-0000-000000000702")
+INSTRUMENT_ID = UUID("00000000-0000-0000-0000-000000000703")
+SAFE_POSITION_ID = UUID("00000000-0000-0000-0000-000000000704")
+
+
+def _sale_source(
+    position_id: UUID = SAFE_POSITION_ID,
+    *,
+    role: PositionRole = PositionRole.NORMAL,
+) -> Position:
+    return Position(
+        position_id=position_id,
+        portfolio_id=PORTFOLIO_ID,
+        instrument=InstrumentRef(INSTRUMENT_ID),
+        quantity=Quantity(Decimal("1")),
+        role=role,
+        status=PositionStatus.OPEN,
+        opened_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
 
 
 def _transition(
@@ -29,16 +53,28 @@ def _transition(
     event: RecommendationEvent,
     *,
     guards: TransitionGuards | None = None,
-    sale_position_id: UUID | None = None,
+    sale_source_position: Position | None = None,
     remaining_stages_halted: bool = False,
 ) -> TransitionResult:
+    protected_events = {
+        RecommendationEvent.ACTION_SIGNAL,
+        RecommendationEvent.DECISION_VALIDATED,
+        RecommendationEvent.NEXT_STAGE_ELIGIBLE,
+    }
     return StateMachine().transition(
         TransitionRequest(
             current_state=state,
             event=event,
             guards=guards or TransitionGuards(),
             protected_position_ids=(PROTECTED_POSITION_ID,),
-            sale_position_id=sale_position_id,
+            plan_portfolio_id=PORTFOLIO_ID,
+            sale_source_position=(
+                sale_source_position
+                if sale_source_position is not None
+                else _sale_source()
+                if event in protected_events
+                else None
+            ),
             remaining_stages_halted=remaining_stages_halted,
         )
     )
@@ -258,7 +294,7 @@ def test_protected_position_is_denied_by_every_sale_or_action_transition_guard(
             state,
             event,
             guards=guards,
-            sale_position_id=PROTECTED_POSITION_ID,
+            sale_source_position=_sale_source(PROTECTED_POSITION_ID),
         )
 
 

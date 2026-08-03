@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from uuid import UUID
 
+from app.domain.entities import Position
+from app.domain.enums import PositionRole
 from app.domain.errors import ProtectedPositionSaleError
 from app.state_machine.states import (
     ConfirmationOutcome,
@@ -36,7 +38,8 @@ class TransitionRequest:
     event: RecommendationEvent
     guards: TransitionGuards
     protected_position_ids: tuple[UUID, ...] = ()
-    sale_position_id: UUID | None = None
+    plan_portfolio_id: UUID | None = None
+    sale_source_position: Position | None = None
     remaining_stages_halted: bool = False
 
     def __post_init__(self) -> None:
@@ -51,8 +54,12 @@ class TransitionRequest:
             raise TypeError("protected_position_ids must contain UUID values")
         if len(set(protected_position_ids)) != len(protected_position_ids):
             raise ValueError("protected_position_ids must be unique")
-        if self.sale_position_id is not None and not isinstance(self.sale_position_id, UUID):
-            raise TypeError("sale_position_id must be a UUID or None")
+        if self.plan_portfolio_id is not None and not isinstance(self.plan_portfolio_id, UUID):
+            raise TypeError("plan_portfolio_id must be a UUID or None")
+        if self.sale_source_position is not None and not isinstance(
+            self.sale_source_position, Position
+        ):
+            raise TypeError("sale_source_position must be a Position or None")
         if not isinstance(self.remaining_stages_halted, bool):
             raise TypeError("remaining_stages_halted must be a Boolean")
         object.__setattr__(self, "protected_position_ids", protected_position_ids)
@@ -268,10 +275,19 @@ class StateMachine:
 
     @classmethod
     def _reject_protected_sale(cls, request: TransitionRequest) -> None:
+        if request.event not in cls._ACTION_OR_SALE_EVENTS:
+            return
+        position = request.sale_source_position
+        if position is None:
+            raise TransitionNotAllowed("transition requires an authoritative sale source position")
         if (
-            request.event in cls._ACTION_OR_SALE_EVENTS
-            and request.sale_position_id is not None
-            and request.sale_position_id in request.protected_position_ids
+            request.plan_portfolio_id is not None
+            and position.portfolio_id != request.plan_portfolio_id
+        ):
+            raise TransitionNotAllowed("sale source position does not belong to the rotation plan")
+        if (
+            position.role is PositionRole.PROTECTED_CORE
+            or position.position_id in request.protected_position_ids
         ):
             raise ProtectedPositionSaleError("protected positions are never eligible for sale")
 

@@ -8,6 +8,7 @@ from datetime import datetime
 from threading import Lock
 from uuid import UUID, uuid4
 
+from app.application.child_intents import ChildIntent
 from app.application.configuration import (
     ConfigurationLayer,
     restore_resolved_configuration_snapshot,
@@ -39,6 +40,7 @@ from app.repositories.locks import LockLease, ScanLockRequest
 from app.repositories.logical_scans import LogicalScanRepository, validate_scan_attempt_append
 from app.repositories.strategy_runs import require_exact_strategy_run_retry
 from app.schemas.common import ConfigurationLayerScope
+from app.state_machine.states import RecommendationState, RecommendationStateRecord
 
 
 class _PortfolioScopedAdapter:
@@ -124,6 +126,77 @@ class InMemoryPositionRepository(_PortfolioScopedAdapter):
     ) -> Sequence[Position]:
         self._require_portfolio_read(portfolio_id, access_context)
         return tuple(item for item in self._positions.values() if item.portfolio_id == portfolio_id)
+
+
+class InMemoryRecommendationStateRepository(_PortfolioScopedAdapter):
+    """Atomic in-memory durable-state adapter for one recommendation lifecycle per plan."""
+
+    def __init__(self, portfolio_owners: Mapping[UUID, UUID]) -> None:
+        super().__init__(portfolio_owners)
+        self._records: dict[UUID, RecommendationStateRecord] = {}
+
+    def get_or_create(
+        self,
+        *,
+        plan: RotationPlan,
+        created_at: datetime,
+        access_context: AccessContext,
+    ) -> RecommendationStateRecord:
+        self._require_portfolio_mutation(plan.portfolio_id, access_context)
+        existing = self._records.get(plan.rotation_plan_id)
+        if existing is not None:
+            if existing.portfolio_id != plan.portfolio_id:
+                raise ValueError("recommendation state plan portfolio does not match")
+            return existing
+        record = RecommendationStateRecord(
+            rotation_plan_id=plan.rotation_plan_id,
+            portfolio_id=plan.portfolio_id,
+            state=RecommendationState.IDLE,
+            remaining_stages_halted=False,
+            revision=0,
+            updated_at=created_at,
+        )
+        self._records[plan.rotation_plan_id] = record
+        return record
+
+    def get(
+        self, rotation_plan_id: UUID, *, access_context: AccessContext
+    ) -> RecommendationStateRecord:
+        try:
+            record = self._records[rotation_plan_id]
+        except KeyError as error:
+            raise NotFoundForActor("recommendation state was not found for actor") from error
+        self._require_portfolio_read(record.portfolio_id, access_context)
+        return record
+
+    def record_transition(
+        self,
+        *,
+        plan: RotationPlan,
+        previous: RecommendationStateRecord,
+        next_state: RecommendationState,
+        remaining_stages_halted: bool,
+        changed_at: datetime,
+        access_context: AccessContext,
+    ) -> RecommendationStateRecord:
+        self._require_portfolio_mutation(plan.portfolio_id, access_context)
+        stored = self.get(plan.rotation_plan_id, access_context=access_context)
+        if previous != stored:
+            raise IdempotencyConflictError(
+                "recommendation state changed before transition could persist"
+            )
+        if previous.portfolio_id != plan.portfolio_id:
+            raise ValueError("recommendation state plan portfolio does not match")
+        updated = RecommendationStateRecord(
+            rotation_plan_id=plan.rotation_plan_id,
+            portfolio_id=plan.portfolio_id,
+            state=next_state,
+            remaining_stages_halted=remaining_stages_halted,
+            revision=previous.revision + 1,
+            updated_at=changed_at,
+        )
+        self._records[plan.rotation_plan_id] = updated
+        return updated
 
 
 class InMemoryRotationPlanRepository(_PortfolioScopedAdapter):
@@ -417,6 +490,50 @@ class InMemoryStrategyRunRepository(_PortfolioScopedAdapter):
         scan = self._logical_scan_repository.get(logical_scan_run_id, access_context=access_context)
         self._require_portfolio_read(scan.portfolio_id, access_context)
         return self._runs_by_logical_scan.get(logical_scan_run_id)
+
+
+class InMemoryChildIntentRepository(_PortfolioScopedAdapter):
+    """Store deterministic child fingerprints without a notification transport or destination."""
+
+    def __init__(self, portfolio_owners: Mapping[UUID, UUID]) -> None:
+        super().__init__(portfolio_owners)
+        self._intents_by_key: dict[str, ChildIntent] = {}
+        self._intent_keys_by_strategy_run: dict[UUID, list[str]] = {}
+
+    def record_or_get(self, *, intent: ChildIntent, access_context: AccessContext) -> ChildIntent:
+        self._require_portfolio_mutation(intent.portfolio_id, access_context)
+        existing = self._intents_by_key.get(intent.intent_key)
+        if existing is not None:
+            self._require_portfolio_read(existing.portfolio_id, access_context)
+            if existing != intent:
+                raise IdempotencyConflictError(
+                    "child intent key already records different evidence"
+                )
+            return existing
+        self._intents_by_key[intent.intent_key] = intent
+        self._intent_keys_by_strategy_run.setdefault(intent.strategy_run_id, []).append(
+            intent.intent_key
+        )
+        return intent
+
+    def get(self, *, intent_key: str, access_context: AccessContext) -> ChildIntent:
+        try:
+            intent = self._intents_by_key[intent_key]
+        except KeyError as error:
+            raise NotFoundForActor("child intent was not found for actor") from error
+        self._require_portfolio_read(intent.portfolio_id, access_context)
+        return intent
+
+    def list_for_strategy_run(
+        self, *, strategy_run_id: UUID, access_context: AccessContext
+    ) -> Sequence[ChildIntent]:
+        intents = tuple(
+            self._intents_by_key[key]
+            for key in self._intent_keys_by_strategy_run.get(strategy_run_id, ())
+        )
+        for intent in intents:
+            self._require_portfolio_read(intent.portfolio_id, access_context)
+        return intents
 
 
 class InMemoryConfigurationLayerRepository(_PortfolioScopedAdapter):
