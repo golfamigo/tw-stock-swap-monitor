@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Context, Decimal, localcontext
+from decimal import Decimal
 
 from app.domain.errors import ProtectedPositionSaleError
 from app.domain.invariants import (
@@ -26,11 +26,12 @@ from app.sizing.costs import (
     add_decimals,
     calculate_purchase_cost,
     calculate_sale_proceeds,
+    floor_divide_decimals,
     multiply_decimals,
     subtract_decimals,
 )
 
-_DECIMAL_CONTEXT = Context(prec=28, rounding=ROUND_HALF_EVEN)
+MAX_SIZING_ADJUSTMENT_SEARCH_STEPS = 4_096
 
 
 class DeterministicSizingEngine:
@@ -128,10 +129,8 @@ class DeterministicSizingEngine:
         self, *, configuration: SizingConfiguration, target_value: Decimal, unit_cost: Decimal
     ) -> Decimal:
         increment = self._quantity_increment(configuration)
-        with localcontext(_DECIMAL_CONTEXT):
-            raw_quantity = target_value / unit_cost
-            increments = (raw_quantity / increment).to_integral_value(rounding=ROUND_DOWN)
-        quantity = increments * increment
+        increments = floor_divide_decimals(target_value, unit_cost)
+        quantity = multiply_decimals(Decimal(increments), increment)
         if quantity < configuration.minimum_quantity:
             return Decimal("0")
         return quantity
@@ -191,17 +190,32 @@ class DeterministicSizingEngine:
         stages: tuple[StageSizing, ...],
     ) -> tuple[StageSizing, ...]:
         quantities = [stage.purchase_quantity.value for stage in stages]
-        while self._total_cash(configuration, quantities, candidate_price) > funding:
-            decrement_index = self._last_reducible_stage(configuration, quantities)
-            if decrement_index is None:
+        for adjustment_index in range(len(quantities) - 1, -1, -1):
+            if self._total_cash(configuration, quantities, candidate_price) <= funding:
+                break
+            if quantities[adjustment_index] < configuration.minimum_quantity:
+                continue
+            adjusted_quantity = self._max_affordable_stage_quantity(
+                configuration=configuration,
+                quantities=quantities,
+                candidate_price=candidate_price,
+                funding=funding,
+                adjustment_index=adjustment_index,
+            )
+            if adjusted_quantity is None:
                 return self._stage_results(
                     configuration,
                     candidate_price,
                     Decimal("0"),
                     tuple(Decimal("0") for _ in stages),
                 )
-            quantities[decrement_index] = self._decrement_quantity(
-                configuration, quantities[decrement_index]
+            quantities[adjustment_index] = adjusted_quantity
+        if self._total_cash(configuration, quantities, candidate_price) > funding:
+            return self._stage_results(
+                configuration,
+                candidate_price,
+                Decimal("0"),
+                tuple(Decimal("0") for _ in stages),
             )
         return tuple(
             self._stage_result(
@@ -215,6 +229,33 @@ class DeterministicSizingEngine:
                 configuration.stages, stages, quantities, strict=True
             )
         )
+
+    def _max_affordable_stage_quantity(
+        self,
+        *,
+        configuration: SizingConfiguration,
+        quantities: list[Decimal],
+        candidate_price: Decimal,
+        funding: Decimal,
+        adjustment_index: int,
+    ) -> Decimal | None:
+        increment = self._quantity_increment(configuration)
+        lower_increments = 0
+        upper_increments = floor_divide_decimals(quantities[adjustment_index], increment)
+        search_steps = 0
+        while lower_increments < upper_increments:
+            if search_steps >= MAX_SIZING_ADJUSTMENT_SEARCH_STEPS:
+                return None
+            search_steps += 1
+            midpoint = (lower_increments + upper_increments + 1) // 2
+            candidate_quantity = multiply_decimals(Decimal(midpoint), increment)
+            candidate_quantities = list(quantities)
+            candidate_quantities[adjustment_index] = candidate_quantity
+            if self._total_cash(configuration, candidate_quantities, candidate_price) <= funding:
+                lower_increments = midpoint
+            else:
+                upper_increments = midpoint - 1
+        return multiply_decimals(Decimal(lower_increments), increment)
 
     def _total_cash(
         self,
@@ -234,16 +275,8 @@ class DeterministicSizingEngine:
             purchase_total = add_decimals(purchase_total, purchase_cost.total_cash)
         return purchase_total
 
-    def _last_reducible_stage(
-        self, configuration: SizingConfiguration, quantities: list[Decimal]
-    ) -> int | None:
-        for index in range(len(quantities) - 1, -1, -1):
-            if quantities[index] >= configuration.minimum_quantity:
-                return index
-        return None
-
     def _decrement_quantity(self, configuration: SizingConfiguration, quantity: Decimal) -> Decimal:
-        next_quantity = quantity - self._quantity_increment(configuration)
+        next_quantity = subtract_decimals(quantity, self._quantity_increment(configuration))
         if next_quantity < configuration.minimum_quantity:
             return Decimal("0")
         return next_quantity

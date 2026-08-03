@@ -241,6 +241,35 @@ def multiply_decimals(left: Decimal, right: Decimal) -> Decimal:
     return _decimal_from_coefficient(left_coefficient * right_coefficient, result_exponent)
 
 
+def floor_divide_decimals(numerator: Decimal, denominator: Decimal) -> int:
+    """Return an exact bounded Decimal floor quotient without ambient-context division."""
+
+    numerator_coefficient, numerator_exponent = _decimal_coefficient_and_exponent(
+        numerator, field_name="numerator"
+    )
+    denominator_coefficient, denominator_exponent = _decimal_coefficient_and_exponent(
+        denominator, field_name="denominator"
+    )
+    if denominator_coefficient <= 0:
+        raise CostError("denominator must be positive")
+    exponent_difference = numerator_exponent - denominator_exponent
+    if abs(exponent_difference) > MAX_ROUNDING_SCALE_DIFFERENCE:
+        raise CostError("Decimal scale difference exceeds the rounding resource limit")
+    if exponent_difference >= 0:
+        _validate_scaled_coefficient(
+            numerator_coefficient, exponent_difference, field_name="numerator"
+        )
+        scaled_numerator = numerator_coefficient * (10**exponent_difference)
+        scaled_denominator = denominator_coefficient
+    else:
+        scaled_numerator = numerator_coefficient
+        _validate_scaled_coefficient(
+            denominator_coefficient, -exponent_difference, field_name="denominator"
+        )
+        scaled_denominator = denominator_coefficient * (10 ** (-exponent_difference))
+    return int(scaled_numerator // scaled_denominator)
+
+
 def _floor_to_quantum(value: Decimal, quantum: Decimal) -> Decimal:
     """Return the exact mathematical floor multiple without context-rounded division."""
 
