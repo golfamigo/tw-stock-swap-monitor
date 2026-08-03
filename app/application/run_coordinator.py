@@ -28,7 +28,7 @@ from app.repositories.recommendation_states import RecommendationStateRepository
 from app.repositories.rotation_plans import RotationPlanRepository
 from app.repositories.strategy_runs import StrategyRunRepository
 from app.services.rotation_run import RotationEvaluation, RotationEvaluator, RotationRunService
-from app.state_machine.states import RecommendationState
+from app.state_machine.states import RecommendationState, RecommendationStateRecord
 
 
 class TriggerSource(StrEnum):
@@ -469,29 +469,39 @@ class RunCoordinator:
 
         try:
             final_identity = _final_identity_from_run(strategy_run)
-            try:
-                notification_intent_key = self._ensure_finalization_effects(
-                    request=request,
-                    plan=plan,
-                    scan=scan,
-                    strategy_run=strategy_run,
-                    final_identity=final_identity,
-                )
-            except _FinalizationSuperseded:
-                return self._finalize_superseded_candidate(
-                    request=request,
-                    plan=plan,
-                    scan=scan,
-                    scan_lock_key=scan_lock_key,
-                    strategy_run=strategy_run,
-                    final_identity=final_identity,
-                )
-            terminal = self._record_recovered_final_attempt(
+            applied = self._existing_applied_finalization(
                 request=request,
+                plan=plan,
                 scan=scan,
                 strategy_run=strategy_run,
                 final_identity=final_identity,
             )
+            if applied is None:
+                try:
+                    notification_intent_key = self._ensure_finalization_effects(
+                        request=request,
+                        plan=plan,
+                        scan=scan,
+                        strategy_run=strategy_run,
+                        final_identity=final_identity,
+                    )
+                except _FinalizationSuperseded:
+                    return self._finalize_superseded_candidate(
+                        request=request,
+                        plan=plan,
+                        scan=scan,
+                        scan_lock_key=scan_lock_key,
+                        strategy_run=strategy_run,
+                        final_identity=final_identity,
+                    )
+                terminal = self._record_recovered_final_attempt(
+                    request=request,
+                    scan=scan,
+                    strategy_run=strategy_run,
+                    final_identity=final_identity,
+                )
+            else:
+                terminal, notification_intent_key = applied
             self._logical_scans.attach_final_strategy_run(
                 logical_scan_run_id=scan.logical_scan_run_id,
                 plan=plan,
@@ -561,11 +571,20 @@ class RunCoordinator:
                 and current.finalization_strategy_key is None
                 and self._is_legacy_pending_finalization(
                     request=request,
+                    current=current,
+                    effects=effects,
                     scan=scan,
                     strategy_run=strategy_run,
                     final_identity=final_identity,
                 )
             ):
+                notification_intent_key = self._existing_notification_intent_key(
+                    request=request,
+                    plan=plan,
+                    strategy_run=strategy_run,
+                    final_identity=final_identity,
+                    notification_intent_recorded=effects.notification_intent_recorded,
+                )
                 self._recommendation_states.record_transition(
                     plan=plan,
                     previous=current,
@@ -576,6 +595,7 @@ class RunCoordinator:
                     finalization_strategy_run_id=expected_run_id,
                     finalization_strategy_key=expected_key,
                 )
+                return notification_intent_key
             else:
                 raise _FinalizationSuperseded(
                     "pending finalization lost to different durable state evidence"
@@ -610,28 +630,130 @@ class RunCoordinator:
         self,
         *,
         request: RunCoordinatorRequest,
+        current: RecommendationStateRecord,
+        effects: _FinalizationEvidence,
         scan: LogicalScanRun,
         strategy_run: StrategyRun,
         final_identity: FinalStrategyIdentity,
     ) -> bool:
-        """Allow only an already-audited 0002 candidate to claim a missing fence."""
+        """Allow only the historic no-terminal-attempt 0002 shape to claim a fence."""
 
-        if scan.status is not LogicalScanStatus.RUNNING:
+        if (
+            scan.status is not LogicalScanStatus.RUNNING
+            or final_identity.scan_lock_key != scan.scan_lock_key
+            or strategy_run.configuration_snapshot.content_hash != scan.configuration_snapshot_hash
+            or current.updated_at <= strategy_run.occurred_at
+            or (
+                effects.previous_state is effects.next_state
+                and (effects.previous_remaining_stages_halted == effects.remaining_stages_halted)
+            )
+        ):
             return False
-        market_data_snapshot_id, market_data_content_hash = _market_evidence_from_run(strategy_run)
-        return any(
+        return not any(
             attempt.status is ScanAttemptStatus.SUCCEEDED
             and attempt.final_strategy_run_id == strategy_run.strategy_run_id
-            and attempt.final_strategy_key == final_identity.key
-            and attempt.final_strategy_identity_format_version == final_identity.format_version
-            and attempt.configuration_snapshot == strategy_run.configuration_snapshot
-            and attempt.market_data_snapshot_id == market_data_snapshot_id
-            and attempt.market_data_content_hash == market_data_content_hash
             for attempt in self._logical_scans.list_attempts(
                 logical_scan_run_id=scan.logical_scan_run_id,
                 access_context=request.access_context,
             )
         )
+
+    def _existing_applied_finalization(
+        self,
+        *,
+        request: RunCoordinatorRequest,
+        plan: RotationPlan,
+        scan: LogicalScanRun,
+        strategy_run: StrategyRun,
+        final_identity: FinalStrategyIdentity,
+    ) -> tuple[ScanAttempt, str | None] | None:
+        """Return immutable applied evidence that can finish attachment without re-adjudicating."""
+
+        market_data_snapshot_id, market_data_content_hash = _market_evidence_from_run(strategy_run)
+        for attempt in reversed(
+            self._logical_scans.list_attempts(
+                logical_scan_run_id=scan.logical_scan_run_id,
+                access_context=request.access_context,
+            )
+        ):
+            if (
+                attempt.status is not ScanAttemptStatus.SUCCEEDED
+                or attempt.final_strategy_run_id != strategy_run.strategy_run_id
+                or attempt.finalization_disposition is FinalizationDisposition.SUPERSEDED
+            ):
+                continue
+            if (
+                attempt.final_strategy_key != final_identity.key
+                or attempt.final_strategy_identity_format_version != final_identity.format_version
+                or attempt.configuration_snapshot != strategy_run.configuration_snapshot
+                or attempt.market_data_snapshot_id != market_data_snapshot_id
+                or attempt.market_data_content_hash != market_data_content_hash
+            ):
+                raise RunCoordinatorInvariantError(
+                    "applied final attempt does not match immutable strategy run evidence"
+                )
+            effects = _finalization_evidence(strategy_run)
+            return (
+                attempt,
+                self._existing_notification_intent_key(
+                    request=request,
+                    plan=plan,
+                    strategy_run=strategy_run,
+                    final_identity=final_identity,
+                    notification_intent_recorded=effects.notification_intent_recorded,
+                ),
+            )
+        return None
+
+    def _existing_notification_intent_key(
+        self,
+        *,
+        request: RunCoordinatorRequest,
+        plan: RotationPlan,
+        strategy_run: StrategyRun,
+        final_identity: FinalStrategyIdentity,
+        notification_intent_recorded: bool,
+    ) -> str | None:
+        """Verify notification evidence already exists without emitting or rewriting an intent."""
+
+        if not notification_intent_recorded:
+            return None
+        expected = build_child_intent(
+            child_intent_id=uuid5(
+                NAMESPACE_URL,
+                f"rotation-child-intent:v1:{final_identity.key}:{strategy_run.strategy_run_id}",
+            ),
+            rotation_plan_id=plan.rotation_plan_id,
+            portfolio_id=plan.portfolio_id,
+            strategy_run_id=strategy_run.strategy_run_id,
+            final_strategy_key=final_identity.key,
+            purpose=ChildIntentPurpose.NOTIFICATION,
+            created_at=strategy_run.occurred_at,
+        )
+        matches = [
+            intent
+            for intent in self._child_intents.list_for_strategy_run(
+                strategy_run_id=strategy_run.strategy_run_id,
+                access_context=request.access_context,
+            )
+            if (
+                intent.rotation_plan_id == expected.rotation_plan_id
+                and intent.portfolio_id == expected.portfolio_id
+                and intent.strategy_run_id == expected.strategy_run_id
+                and intent.final_strategy_key == expected.final_strategy_key
+                and (
+                    intent.final_strategy_identity_format_version
+                    == expected.final_strategy_identity_format_version
+                )
+                and intent.purpose is expected.purpose
+                and intent.intent_key == expected.intent_key
+            )
+        ]
+        if len(matches) != 1:
+            raise RunCoordinatorInvariantError(
+                "applied finalization is missing its durable notification intent"
+            )
+        return matches[0].intent_key
 
     def _record_notification_intent(
         self,

@@ -36,8 +36,14 @@ from app.data_sources.models import (
     Quote,
 )
 from app.domain.access import AccessContext
-from app.domain.entities import Instrument, Position, RotationPlan
-from app.domain.enums import LogicalScanStatus, PositionRole, PositionStatus, Scope
+from app.domain.entities import Instrument, Position, RotationPlan, ScanAttempt
+from app.domain.enums import (
+    FinalizationDisposition,
+    LogicalScanStatus,
+    PositionRole,
+    PositionStatus,
+    Scope,
+)
 from app.domain.values import ConfigurationSnapshotRef, InstrumentRef, Ownership, Quantity
 from app.persistence.in_memory import (
     InMemoryChildIntentRepository,
@@ -271,6 +277,22 @@ class _FailOnceAttachScans(InMemoryLogicalScanRepository):
         return super().attach_final_strategy_run(**kwargs)  # type: ignore[arg-type]
 
 
+class _FailOnceFinalAttemptScans(InMemoryLogicalScanRepository):
+    def __init__(self) -> None:
+        super().__init__({PORTFOLIO_ID: OWNER_ID})
+        self._remaining_failures = 1
+
+    def record_attempt(self, *, attempt: ScanAttempt, access_context: AccessContext) -> None:
+        if (
+            self._remaining_failures
+            and attempt.status.value == "SUCCEEDED"
+            and attempt.final_strategy_run_id is not None
+        ):
+            self._remaining_failures -= 1
+            raise RuntimeError("injected final attempt persistence failure")
+        super().record_attempt(attempt=attempt, access_context=access_context)
+
+
 class _PauseFirstChildIntentWrite(InMemoryChildIntentRepository):
     def __init__(self) -> None:
         super().__init__({PORTFOLIO_ID: OWNER_ID})
@@ -321,6 +343,7 @@ def _parts(
     logical_scans: InMemoryLogicalScanRepository | None = None,
     recommendation_states: InMemoryRecommendationStateRepository | None = None,
     child_intents: InMemoryChildIntentRepository | None = None,
+    strategy_runs: InMemoryStrategyRunRepository | None = None,
     locks: _RecordingLock | None = None,
     provider: _Provider | None = None,
 ) -> _Parts:
@@ -346,7 +369,7 @@ def _parts(
     intents = child_intents or InMemoryChildIntentRepository({PORTFOLIO_ID: OWNER_ID})
     used_locks = locks or _RecordingLock([])
     used_provider = provider or _Provider([selected_snapshot])
-    strategy_runs = InMemoryStrategyRunRepository(
+    used_strategy_runs = strategy_runs or InMemoryStrategyRunRepository(
         {PORTFOLIO_ID: OWNER_ID},
         logical_scan_repository=scans,
         child_intent_repository=intents,
@@ -358,7 +381,7 @@ def _parts(
         recommendation_states=states,
         child_intents=intents,
         logical_scans=scans,
-        strategy_runs=strategy_runs,
+        strategy_runs=used_strategy_runs,
         locks=used_locks,
         market_data=used_provider,
         evaluator=lambda *_: evaluation,
@@ -372,7 +395,7 @@ def _parts(
         configurations,
         scans,
         states,
-        strategy_runs,
+        used_strategy_runs,
         used_locks,
         used_provider,
     )
@@ -742,6 +765,98 @@ def test_success_evidence_is_durable_before_scan_completion_and_attach_recovery(
     assert len(final_successes) == 1
 
 
+def test_applied_finalization_recovers_after_later_state_advance_without_relabeling() -> None:
+    position = _position()
+    plan = _plan()
+    scans = _FailOnceAttachScans()
+    parts = _parts(
+        evaluation=RotationEvaluation(
+            event=RecommendationEvent.DECISION_VALIDATED,
+            guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+            outputs={"attempt": "applied-then-advanced"},
+            sale_source_position_id=position.position_id,
+        ),
+        plan=plan,
+        positions=(position,),
+        logical_scans=scans,
+    )
+    _seed_state(parts.recommendation_states, plan, RecommendationState.ACTION_PENDING)
+    first_request = _request(parts.configuration, plan=plan)
+
+    pending = parts.coordinator.run(first_request)
+
+    assert pending.disposition is RunDisposition.FAILED
+    assert pending.logical_scan_run_id is not None
+    first_run = parts.strategy_runs.get_for_logical_scan(
+        logical_scan_run_id=pending.logical_scan_run_id, access_context=_context()
+    )
+    assert first_run is not None
+    applied_attempts = [
+        attempt
+        for attempt in parts.logical_scans.list_attempts(
+            logical_scan_run_id=pending.logical_scan_run_id, access_context=_context()
+        )
+        if attempt.final_strategy_run_id == first_run.strategy_run_id
+    ]
+    assert len(applied_attempts) == 1
+    assert applied_attempts[0].finalization_disposition is FinalizationDisposition.APPLIED
+    assert (
+        len(
+            parts.child_intents.list_for_strategy_run(
+                strategy_run_id=first_run.strategy_run_id, access_context=_context()
+            )
+        )
+        == 1
+    )
+
+    advanced = _parts(
+        evaluation=RotationEvaluation(
+            event=RecommendationEvent.SIGNAL_INVALIDATED,
+            guards=TransitionGuards(rule_outcome=RuleOutcome.PASSED),
+            outputs={"attempt": "advance-after-applied"},
+        ),
+        plan=plan,
+        positions=(position,),
+        logical_scans=parts.logical_scans,
+        recommendation_states=parts.recommendation_states,
+        child_intents=parts.child_intents,
+        strategy_runs=parts.strategy_runs,
+    )
+    advanced_result = advanced.coordinator.run(
+        replace(
+            _request(advanced.configuration, plan=plan),
+            scan_window_start=first_request.scan_window_start + timedelta(minutes=3),
+        )
+    )
+
+    assert advanced_result.disposition is RunDisposition.COMPLETED
+    assert (
+        parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context()).state
+        is RecommendationState.INVALIDATED
+    )
+
+    recovered = parts.coordinator.run(first_request)
+
+    assert recovered.disposition is RunDisposition.COMPLETED
+    recovered_attempts = [
+        attempt
+        for attempt in parts.logical_scans.list_attempts(
+            logical_scan_run_id=pending.logical_scan_run_id, access_context=_context()
+        )
+        if attempt.final_strategy_run_id == first_run.strategy_run_id
+    ]
+    assert recovered_attempts == applied_attempts
+    assert recovered_attempts[0].finalization_disposition is FinalizationDisposition.APPLIED
+    assert (
+        len(
+            parts.child_intents.list_for_strategy_run(
+                strategy_run_id=first_run.strategy_run_id, access_context=_context()
+            )
+        )
+        == 1
+    )
+
+
 def test_pending_finalization_uses_the_stored_run_configuration_not_a_new_request_reference() -> (
     None
 ):
@@ -907,10 +1022,10 @@ def test_concurrent_scan_candidates_finalize_the_fenced_loser_without_another_in
     )
 
 
-def test_legacy_pending_finalization_backfills_its_missing_fence_before_completion() -> None:
+def test_legacy_pending_finalization_backfills_fence_without_terminal_attempt() -> None:
     position = _position()
     plan = _plan()
-    scans = _FailOnceAttachScans()
+    scans = _FailOnceFinalAttemptScans()
     parts = _parts(
         evaluation=RotationEvaluation(
             event=RecommendationEvent.DECISION_VALIDATED,
@@ -933,11 +1048,19 @@ def test_legacy_pending_finalization_backfills_its_missing_fence_before_completi
         logical_scan_run_id=pending.logical_scan_run_id, access_context=_context()
     )
     assert candidate is not None
+    assert not any(
+        attempt.status.value == "SUCCEEDED"
+        and attempt.final_strategy_run_id == candidate.strategy_run_id
+        for attempt in parts.logical_scans.list_attempts(
+            logical_scan_run_id=pending.logical_scan_run_id, access_context=_context()
+        )
+    )
     legacy_state = parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context())
     parts.recommendation_states._records[plan.rotation_plan_id] = replace(  # type: ignore[attr-defined]
         legacy_state,
         finalization_strategy_run_id=None,
         finalization_strategy_key=None,
+        updated_at=legacy_state.updated_at + timedelta(microseconds=1),
     )
 
     recovered = parts.coordinator.run(request)
@@ -947,6 +1070,76 @@ def test_legacy_pending_finalization_backfills_its_missing_fence_before_completi
     assert backfilled.finalization_strategy_run_id == candidate.strategy_run_id
     assert backfilled.finalization_strategy_key == recovered.final_strategy_key
     assert parts.provider.calls == 1
+    final_attempts = [
+        attempt
+        for attempt in parts.logical_scans.list_attempts(
+            logical_scan_run_id=pending.logical_scan_run_id, access_context=_context()
+        )
+        if attempt.final_strategy_run_id == candidate.strategy_run_id
+    ]
+    assert len(final_attempts) == 1
+    assert final_attempts[0].finalization_disposition is FinalizationDisposition.APPLIED
+    assert (
+        len(
+            parts.child_intents.list_for_strategy_run(
+                strategy_run_id=candidate.strategy_run_id, access_context=_context()
+            )
+        )
+        == 1
+    )
+
+
+def test_mismatched_legacy_pending_finalization_without_terminal_attempt_is_superseded() -> None:
+    position = _position()
+    plan = _plan()
+    scans = _FailOnceFinalAttemptScans()
+    parts = _parts(
+        evaluation=RotationEvaluation(
+            event=RecommendationEvent.DECISION_VALIDATED,
+            guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+            outputs={"attempt": "legacy-mismatched-state"},
+            sale_source_position_id=position.position_id,
+        ),
+        plan=plan,
+        positions=(position,),
+        logical_scans=scans,
+    )
+    _seed_state(parts.recommendation_states, plan, RecommendationState.ACTION_PENDING)
+    request = _request(parts.configuration, plan=plan)
+
+    pending = parts.coordinator.run(request)
+
+    assert pending.disposition is RunDisposition.FAILED
+    assert pending.logical_scan_run_id is not None
+    candidate = parts.strategy_runs.get_for_logical_scan(
+        logical_scan_run_id=pending.logical_scan_run_id, access_context=_context()
+    )
+    assert candidate is not None
+    legacy_state = parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context())
+    parts.recommendation_states._records[plan.rotation_plan_id] = replace(  # type: ignore[attr-defined]
+        legacy_state,
+        state=RecommendationState.WATCHING,
+        remaining_stages_halted=False,
+        finalization_strategy_run_id=None,
+        finalization_strategy_key=None,
+        updated_at=legacy_state.updated_at + timedelta(microseconds=1),
+    )
+
+    recovered = parts.coordinator.run(request)
+
+    assert recovered.disposition is RunDisposition.SUPERSEDED
+    assert recovered.audit["failure_code"] == "FINALIZATION_SUPERSEDED"
+    unchanged = parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context())
+    assert unchanged.state is RecommendationState.WATCHING
+    assert unchanged.finalization_strategy_run_id is None
+    assert (
+        len(
+            parts.child_intents.list_for_strategy_run(
+                strategy_run_id=candidate.strategy_run_id, access_context=_context()
+            )
+        )
+        == 1
+    )
 
 
 def test_unfenced_matching_state_does_not_let_a_new_candidate_claim_legacy_recovery() -> None:
