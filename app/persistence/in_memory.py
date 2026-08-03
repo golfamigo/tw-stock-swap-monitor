@@ -409,6 +409,15 @@ class InMemoryStrategyRunRepository(_PortfolioScopedAdapter):
                 raise
         return run
 
+    def get_for_logical_scan(
+        self, *, logical_scan_run_id: UUID, access_context: AccessContext
+    ) -> StrategyRun | None:
+        """Read a scan's immutable final result after enforcing its portfolio scope."""
+
+        scan = self._logical_scan_repository.get(logical_scan_run_id, access_context=access_context)
+        self._require_portfolio_read(scan.portfolio_id, access_context)
+        return self._runs_by_logical_scan.get(logical_scan_run_id)
+
 
 class InMemoryConfigurationLayerRepository(_PortfolioScopedAdapter):
     """Layer store that filters portfolio-owned layers by the exact plan portfolio."""

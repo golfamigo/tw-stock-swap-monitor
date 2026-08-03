@@ -657,6 +657,26 @@ class SqlAlchemyStrategyRunRepository(_SqlAlchemyScopedRepository):
             )
         return run
 
+    def get_for_logical_scan(
+        self, *, logical_scan_run_id: UUID, access_context: AccessContext
+    ) -> StrategyRun | None:
+        """Return a completed scan's persisted final run after scoped authorization."""
+
+        scan = self._logical_scans.get(logical_scan_run_id, access_context=access_context)
+        model = self._session.scalar(
+            select(StrategyRunModel).where(
+                StrategyRunModel.logical_scan_run_id == scan.logical_scan_run_id
+            )
+        )
+        if model is None:
+            return None
+        if (
+            model.rotation_plan_id != scan.rotation_plan_id
+            or model.portfolio_id != scan.portfolio_id
+        ):
+            raise ValueError("logical scan final strategy run does not match its plan scope")
+        return strategy_run_from_model(model)
+
     def _validate_configuration_snapshot_reference(
         self, run: StrategyRun, *, plan: RotationPlan, plan_owner_id: UUID
     ) -> None:

@@ -35,3 +35,8 @@ class StrategyRunRepository(Protocol):
         access_context: AccessContext,
     ) -> StrategyRun:
         """Return the stored final run when the key has already completed."""
+
+    def get_for_logical_scan(
+        self, *, logical_scan_run_id: UUID, access_context: AccessContext
+    ) -> StrategyRun | None:
+        """Return the final result associated with a completed logical scan, if any."""
