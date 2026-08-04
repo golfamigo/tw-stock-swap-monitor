@@ -60,6 +60,18 @@
 - Test: `tests/unit/sizing/test_engine.py`
 - Test: `tests/integration/test_coordinator_safety_hardening.py`
 
+- [ ] **Step 0: Capture the approved remediation base before any implementation file changes.**
+
+Run this once, after the implementation plan is approved and before writing the first failing test; retain the variable in the same PowerShell session through Task 4:
+
+```powershell
+$remediationBase = (git rev-parse HEAD).Trim()
+if ($remediationBase.Length -ne 40) { throw "Unable to capture remediation base SHA" }
+Write-Output "remediationBase=$remediationBase"
+```
+
+Expected: the printed full SHA identifies the final approved docs head immediately before the first remediation change. It is not a hard-coded plan SHA and it is not committed. If implementation is resumed in a new shell, explicitly reassign `$remediationBase` to the recorded printed value before running Task 4 verification.
+
 - [ ] **Step 1: Add failing pure-domain tests for source authorization and quantity-aware sale authorization.**
 
 ```python
@@ -232,18 +244,41 @@ git commit -m "fix: restrict rotation sale sources"
 - [ ] **Step 1: Add failing constructor and configuration-total tests.**
 
 ```python
-assert SizingStage("first", Decimal("0.30000")).allocation_basis_points == 3000
-assert SizingStage("first", Decimal("0.3")).allocation_weight == Decimal("0.3000")
+api = _api()
+assert api.SizingStage("first", Decimal("0.30000")).allocation_basis_points == 3000
+assert api.SizingStage("first", Decimal("0.3")).allocation_weight == Decimal("0.3000")
 
-with pytest.raises(SizingError, match="basis points"):
-    SizingStage("first", Decimal("0.30001"))
+with localcontext(Context(prec=2)):
+    stage = api.SizingStage("third", Decimal("0.3334"))
+    assert stage.allocation_weight == Decimal("0.3334")
+
+base_request = _request(api)
+configuration = replace(
+    base_request.configuration,
+    stages=(
+        api.SizingStage("first", Decimal("0.3333")),
+        api.SizingStage("second", Decimal("0.3333")),
+        api.SizingStage("third", Decimal("0.3334")),
+    ),
+)
+baseline_result = api.DeterministicSizingEngine().size(
+    replace(base_request, configuration=configuration)
+)
+with localcontext(Context(prec=2)):
+    low_precision_result = api.DeterministicSizingEngine().size(
+        replace(base_request, configuration=configuration)
+    )
+assert low_precision_result == baseline_result
+
+with pytest.raises(api.SizingError, match="basis points"):
+    api.SizingStage("first", Decimal("0.30001"))
 
 assert SizingConfiguration(stages=(bp(3333), bp(3333), bp(3334)), ...)
 with pytest.raises(SizingError, match="10,000"):
     SizingConfiguration(stages=(bp(3333), bp(3333), bp(3333)), ...)
 ```
 
-Set a deliberately small Decimal context around construction and sizing to prove no ambient rounding produces a different bp result. Add a configuration-canonicalization regression that `Decimal("0.3")` and `Decimal("0.3000")` still produce the same existing v1 JSON/hash; do not change configuration production code.
+Import `replace` from `dataclasses` and `Context`/`localcontext` from `decimal`. The shared base request holds fees, slippage, reserve, prices, and cash constant, so the complete sizing result is compared between default context and `Context(prec=2)`. Add a configuration-canonicalization regression that `Decimal("0.3")` and `Decimal("0.3000")` still produce the same existing v1 JSON/hash; do not change configuration production code.
 
 Run: `python -m pytest tests/unit/sizing/test_engine.py tests/unit/config/test_resolution.py -q`  
 Expected: FAIL because stages currently retain raw Decimal weights and sum raw Decimals.
@@ -261,10 +296,11 @@ class SizingStage:
 
     @property
     def allocation_weight(self) -> Decimal:
-        return Decimal(self.allocation_basis_points).scaleb(-4)
+        digits = tuple(int(digit) for digit in str(self.allocation_basis_points))
+        return Decimal((0, digits, -4))
 ```
 
-Implement the dataclass with `init=False` and the exact custom initializer shown above, preserving both current positional and keyword calls such as `SizingStage("first", Decimal("0.3"))` and `SizingStage(stage_id="first", allocation_weight=Decimal("0.3"))`. Reject blank or more-than-256-byte UTF-8 `stage_id` values. Derive the integer without ambient Decimal arithmetic: inspect `Decimal.as_tuple()`, remove only trailing zero coefficient digits, and reject values whose resulting scale cannot represent an integer number of basis points. Do not retain raw Decimal input as a field. The public `allocation_weight` view is always derived from `allocation_basis_points` and renders four fractional places.
+Implement the dataclass with `init=False` and the exact custom initializer shown above, preserving both current positional and keyword calls such as `SizingStage("first", Decimal("0.3"))` and `SizingStage(stage_id="first", allocation_weight=Decimal("0.3"))`. Reject blank or more-than-256-byte UTF-8 `stage_id` values. Derive the integer without ambient Decimal arithmetic: inspect `Decimal.as_tuple()`, remove only trailing zero coefficient digits, and reject values whose resulting scale cannot represent an integer number of basis points. Do not retain raw Decimal input as a field. The public `allocation_weight` view is constructed from the tuple/sign/exponent form shown above, not `scaleb()`, and therefore always renders four fractional places independently of the caller's Decimal context.
 
 `SizingConfiguration.__post_init__` sums `allocation_basis_points` as Python integers and requires exactly `10_000`. `DeterministicSizingEngine` uses `stage.allocation_weight`, which is now the derived exact view, for target calculations.
 
@@ -483,8 +519,9 @@ Expected: pytest, full mypy (including tests), Ruff lint, formatting, and diff c
 - [ ] **Step 2: Check the committed scope before publishing.**
 
 ```powershell
-git log --oneline e269d3a6a18157e7d6b12a4637b20b8a463c9bd3..HEAD
-git diff --check e269d3a6a18157e7d6b12a4637b20b8a463c9bd3..HEAD
+if ([string]::IsNullOrWhiteSpace($remediationBase)) { throw "remediationBase was not captured" }
+git log --oneline "$remediationBase..HEAD"
+git diff --check "$remediationBase..HEAD"
 git status --short
 ```
 
