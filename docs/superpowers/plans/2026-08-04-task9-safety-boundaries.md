@@ -29,8 +29,9 @@
 | `app/services/rotation_run.py` | Carry typed sizing sale quantity into `TransitionRequest`. |
 | `app/application/run_coordinator.py` | Validate repository-loaded sale source with the source invariant. |
 | `app/state_machine/machine.py` | Source-ID and state-event quantity guard enforcement. |
-| `app/sizing/base.py` | Basis-point constructor normalization and compatible Decimal view. |
+| `app/sizing/base.py` | Source-position audit identity, basis-point constructor normalization, and compatible Decimal view. |
 | `app/sizing/engine.py` | Full sale invariant and exact fraction derived from bp. |
+| `app/scoring/base.py` | 256-byte UTF-8 limits for configured, metric, and contribution factor identifiers. |
 | `app/rules/schema.py` | Shared DSL text/identifier limits and typed limit errors. |
 | `app/rules/parser.py` | Incremental expression/ruleset byte measurement and list-depth correction. |
 | `app/rules/engine.py`, `app/rules/evidence.py` | RuleInput/RuleEvaluation limits and runtime-string checks. |
@@ -52,6 +53,7 @@
 - Modify: `app/application/run_coordinator.py`
 - Modify: `app/services/rotation_run.py`
 - Modify: `app/state_machine/machine.py`
+- Modify: `app/sizing/base.py`
 - Modify: `app/sizing/engine.py`
 - Test: `tests/unit/domain/test_invariants.py`
 - Test: `tests/unit/state_machine/test_transitions.py`
@@ -120,9 +122,9 @@ with pytest.raises(TransitionNotAllowed):
 # and oversale all raise their typed domain error.
 ```
 
-Use a plan with one listed OPEN source and a distinct same-portfolio ordinary position. Keep the evaluator input limited to `sale_source_position_id`; the test must prove the coordinator resolves the authoritative repository position instead of accepting a caller object.
+Use a plan with one listed OPEN source and a distinct same-portfolio ordinary position. Keep the evaluator input limited to `sale_source_position_id` plus, only for `DECISION_VALIDATED/PASSED`, an immutable `SizingResult`; the test must prove the coordinator resolves the authoritative repository position instead of accepting a caller object. Add three failure cases: no `SizingResult`, a non-actionable result, and a result whose `source_sale.source_position_id` differs from the repository position. In all cases the durable recommendation state remains unchanged.
 
-- [ ] **Step 4: Thread source IDs and typed sale quantity through the transition contract.**
+- [ ] **Step 4: Thread a provenance-verifiable sizing result through the transition contract.**
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -150,7 +152,41 @@ def _reject_unauthorized_sale_source(self, request: TransitionRequest) -> None:
 
 Do not fabricate a `Quantity` for `ACTION_SIGNAL`. `NEXT_STAGE_ELIGIBLE` only opens the next recommendation stage, so it requires the authorized source but no quantity. `DECISION_VALIDATED` with `SizingOutcome.PASSED` requires a non-`None` `Quantity` obtained from typed sizing evidence; the request constructor rejects a quantity on unrelated events if that would make evidence ambiguous.
 
-Pass `plan` and the typed quantity from `RotationEvaluation` through `RotationRunService.build_strategy_run`. Replace the existing separate `plan_portfolio_id` and `protected_position_ids` request fields with the immutable plan, so the state machine calls the same source and sale invariants as the other two boundaries. Add `sale_quantity: Quantity | None` to `RotationEvaluation`, validate its type, and only permit it for sizing-passed decision validation. The coordinator calls `ensure_authorized_rotation_source(plan, position)` immediately after `PositionRepository.get` and before `build_strategy_run`. The sizing engine replaces its current composition of generic checks with `ensure_authorized_rotation_sale`.
+Add the authoritative position identity to sale audit evidence:
+
+```python
+@dataclass(frozen=True, slots=True)
+class SourceSaleAudit:
+    source_position_id: UUID
+    quantity: Quantity
+    gross_value: Decimal
+    slippage_cost: Decimal
+    fee: Decimal
+    tax: Decimal
+    net_proceeds: Decimal
+```
+
+`RotationEvaluation` carries `sizing_result: SizingResult | None`, never a bare evaluator-supplied `Quantity`. In `RunCoordinator`, after it repository-loads and source-authorizes the `Position`, derive the transition quantity only through this check:
+
+```python
+def _validated_sizing_sale(
+    evaluation: RotationEvaluation, source_position: Position
+) -> Quantity | None:
+    if evaluation.event is not RecommendationEvent.DECISION_VALIDATED:
+        return None
+    if evaluation.guards.sizing_outcome is not SizingOutcome.PASSED:
+        raise RunCoordinatorInvariantError("decision validation requires passed sizing evidence")
+    result = evaluation.sizing_result
+    if result is None or not result.actionable:
+        raise RunCoordinatorInvariantError("passed sizing requires an actionable SizingResult")
+    if result.source_sale.source_position_id != source_position.position_id:
+        raise RunCoordinatorInvariantError("sizing evidence source position does not match")
+    return result.source_sale.quantity
+```
+
+`RotationEvaluation.__post_init__` rejects a `sizing_result` for every other event/guard combination and requires it for `DECISION_VALIDATED + SizingOutcome.PASSED`. The sizing engine constructs `SourceSaleAudit(source_position_id=request.source_position.position_id, ...)` itself. This gives the application boundary all three required proofs: passed sizing outcome, matching source ID, and the exact `SizingResult.source_sale.quantity`. Narrow the non-`None` result before building the passed-sizing `TransitionRequest`; the state machine receives only that verified `Quantity` and reapplies the complete sale invariant.
+
+Pass `plan` and the verified quantity through `RotationRunService.build_strategy_run`. Replace the existing separate `plan_portfolio_id` and `protected_position_ids` request fields with the immutable plan, so the state machine calls the same source and sale invariants as the other two boundaries. The coordinator calls `ensure_authorized_rotation_source(plan, position)` immediately after `PositionRepository.get` and before deriving the typed sizing quantity. The sizing engine replaces its current composition of generic checks with `ensure_authorized_rotation_sale`.
 
 - [ ] **Step 5: Audit all existing `Quantity(0)` uses and retain only non-sale semantics.**
 
@@ -164,7 +200,7 @@ Rejected: `SizingRequest.source_sale_quantity=Quantity(Decimal("0"))` and any
 TransitionRequest.sale_quantity=Quantity(Decimal("0"))` for DECISION_VALIDATED/PASSED.
 ```
 
-Do not replace generic `Quantity` with a positive-only type. Add an explicit sizing and transition regression for zero sale quantity, and keep existing no-purchase stage tests passing.
+Do not replace generic `Quantity` with a positive-only type. The current zero source-sale fixtures in `tests/unit/sizing/test_engine.py` at lines 185, 217, 456, 498, and 538 become invalid public swap requests and must not be retained as such. For each test, either keep the calculation unit-level by calling the existing private target/funding helper, or make the request a real sale with `Quantity(Decimal("1"))` and reduce `available_cash` by the deterministic positive net sale proceeds so its intended total funding remains unchanged. Keep `Quantity(Decimal("0"))` only for resulting non-actionable purchase-stage quantities, which are not sale authorization inputs. Add an explicit sizing and transition regression for zero sale quantity.
 
 - [ ] **Step 6: Run focused checks and create the first independent remediation commit.**
 
@@ -181,7 +217,7 @@ git diff --check
 Expected: all selected tests and static checks pass.
 
 ```powershell
-git add -- app/domain/errors.py app/domain/invariants.py app/application/run_coordinator.py app/services/rotation_run.py app/state_machine/machine.py app/sizing/engine.py tests/unit/domain/test_invariants.py tests/unit/sizing/test_engine.py tests/unit/state_machine/test_transitions.py tests/integration/test_coordinator_safety_hardening.py
+git add -- app/domain/errors.py app/domain/invariants.py app/application/run_coordinator.py app/services/rotation_run.py app/state_machine/machine.py app/sizing/base.py app/sizing/engine.py tests/unit/domain/test_invariants.py tests/unit/sizing/test_engine.py tests/unit/state_machine/test_transitions.py tests/integration/test_coordinator_safety_hardening.py
 git commit -m "fix: restrict rotation sale sources"
 ```
 
@@ -255,13 +291,14 @@ git add -- app/sizing/base.py app/sizing/engine.py tests/unit/sizing/test_engine
 git commit -m "fix: normalize sizing allocations to basis points"
 ```
 
-## Task 3: Bound DSL and StrategyRun payloads before persistence
+## Task 3: Bound factor identifiers, DSL, and StrategyRun payloads before persistence
 
 **Files:**
 - Create: `app/domain/evidence_payload.py`
 - Modify: `app/domain/errors.py`
 - Modify: `app/domain/entities.py`
 - Modify: `app/persistence/evidence.py`
+- Modify: `app/scoring/base.py`
 - Modify: `app/rules/schema.py`
 - Modify: `app/rules/parser.py`
 - Modify: `app/rules/engine.py`
@@ -269,15 +306,21 @@ git commit -m "fix: normalize sizing allocations to basis points"
 - Modify: `docs/rule-dsl.md`
 - Test: `tests/unit/domain/test_evidence_payload.py`
 - Test: `tests/unit/domain/test_ownership.py`
+- Test: `tests/unit/scoring/test_engine.py`
 - Test: `tests/unit/rules/test_resource_bounds.py`
 - Test: `tests/unit/rules/test_validation.py`
 
 - [ ] **Step 1: Add failing byte-limit and structural-preflight tests.**
 
 ```python
-assert measure_payload_bytes({"text": "é" * 8192}, limit=16 * 1024, boundary="test") > 16 * 1024
+payload = {"text": "é" * 8192}
+reference = "".join(
+    json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    .iterencode(payload)
+)
+assert len(reference.encode("utf-8")) > 16 * 1024
 with pytest.raises(CanonicalJsonSizeLimitError, match="boundary=test"):
-    measure_payload_bytes({"text": "é" * 8192}, limit=16 * 1024, boundary="test")
+    measure_json_bytes(payload, limit_bytes=16 * 1024, boundary="test")
 
 with pytest.raises(InvalidStrategyRunEvidenceError, match="depth"):
     StrategyRun(..., outputs=nested_mapping_or_list(33))
@@ -288,7 +331,21 @@ with pytest.raises(InvalidStrategyRunEvidenceError, match="256 KiB"):
 
 Cover exact-boundary acceptance and one-byte-over rejection for UTF-8 literals, identifiers, full expressions, full rulesets, `RuleInput`, `RuleEvaluation`, and `StrategyRun.outputs`. Add lists nested 33 levels to prove lists advance the raw transport depth exactly like mappings. Include cycles, a non-string map key, `float("nan")`, `float("inf")`, a non-finite/unbounded Decimal, an unsupported object, and a timezone-naive datetime in preflight coverage.
 
-Run: `python -m pytest tests/unit/domain/test_evidence_payload.py tests/unit/domain/test_ownership.py tests/unit/rules/test_resource_bounds.py tests/unit/rules/test_validation.py -q`  
+Add focused scoring identifier regressions using an ASCII identifier of 257 bytes (which still satisfies `.isidentifier()`):
+
+```python
+over_limit_factor_id = "f" * 257
+with pytest.raises(ScoringError, match="256"):
+    FactorConfiguration(factor_id=over_limit_factor_id, ...)
+with pytest.raises(ScoringError, match="256"):
+    CandidateMetrics(instrument=instrument, metrics={over_limit_factor_id: Decimal("1")})
+with pytest.raises(ScoringError, match="256"):
+    FactorContribution(factor_id=over_limit_factor_id, status=FactorScoreStatus.MISSING, ...)
+```
+
+Also add exact 256-byte acceptance for all three boundaries. Preserve their current identifier syntax checks; byte length is an additional condition, not a replacement.
+
+Run: `python -m pytest tests/unit/domain/test_evidence_payload.py tests/unit/domain/test_ownership.py tests/unit/scoring/test_engine.py tests/unit/rules/test_resource_bounds.py tests/unit/rules/test_validation.py -q`
 Expected: FAIL because no common preflight/counter or string/ruleset limits exist.
 
 - [ ] **Step 2: Create one pure streaming evidence-payload boundary.**
@@ -306,6 +363,7 @@ class CanonicalJsonSizeLimitError(InvalidStrategyRunEvidenceError):
     def __init__(self, *, boundary: str, limit_bytes: int, observed_at_least_bytes: int) -> None: ...
 
 def preflight_evidence_payload(value: object) -> None: ...
+def measure_json_bytes(value: object, *, limit_bytes: int, boundary: str) -> int: ...
 def measure_encoded_evidence_bytes(value: object, *, limit_bytes: int, boundary: str) -> int: ...
 ```
 
@@ -378,7 +436,7 @@ Use the incrementing JSON counter in `validate_expression_transport` before Draf
 }
 ```
 
-`evidence_value_payload` is one tested helper in `app.rules.evidence` that returns an explicit mapping with `kind`, `is_missing`, and a canonically encoded `value`; it never serializes a dataclass implicitly. Validate `Rule.rule_id` and `SizingStage.stage_id` at 256 UTF-8 bytes, validate fixed registry paths at the same limit, and in `RuleInput` validate identifier-valued registry fields (`market.provider`, `market.snapshot_id`) at 256 bytes while ordinary string evidence remains at 16 KiB. Enum-backed evaluation purpose and recommendation state values are code-defined and do not accept arbitrary caller strings. There is no factor-ID domain type in M0/M1; when it is introduced it must use the same 256-byte identifier validator.
+`evidence_value_payload` is one tested helper in `app.rules.evidence` that returns an explicit mapping with `kind`, `is_missing`, and a canonically encoded `value`; it never serializes a dataclass implicitly. Validate `Rule.rule_id` and `SizingStage.stage_id` at 256 UTF-8 bytes, validate fixed registry paths at the same limit, and in `RuleInput` validate identifier-valued registry fields (`market.provider`, `market.snapshot_id`) at 256 bytes while ordinary string evidence remains at 16 KiB. In `app.scoring.base`, apply the same 256-byte limit to `FactorConfiguration.factor_id`, every `CandidateMetrics.metrics` key, and `FactorContribution.factor_id`, preserving each existing `.isidentifier()` requirement. Enum-backed evaluation purpose and recommendation state values are code-defined and do not accept arbitrary caller strings.
 
 Transport and literal overages raise `RuleTextResourceLimitError`; RuleInput and RuleEvaluation overages raise `RuleEvidenceResourceLimitError`; each wraps only safe boundary/limit/observed-at-least metadata. The outcome on every limit exceedance is never `MISSING`, `False`, zero, truncation, compression, or an actionable rule result.
 
@@ -391,18 +449,18 @@ Update `docs/rule-dsl.md` with the complete UTF-8 table, incremental/rejection b
 Run:
 
 ```powershell
-python -m pytest tests/unit/domain/test_evidence_payload.py tests/unit/domain/test_ownership.py tests/unit/rules/test_resource_bounds.py tests/unit/rules/test_validation.py
+python -m pytest tests/unit/domain/test_evidence_payload.py tests/unit/domain/test_ownership.py tests/unit/scoring/test_engine.py tests/unit/rules/test_resource_bounds.py tests/unit/rules/test_validation.py
 python -m mypy app tests
-python -m ruff check app/domain app/persistence app/rules tests/unit/domain tests/unit/rules
-python -m ruff format --check app/domain app/persistence app/rules tests/unit/domain tests/unit/rules
+python -m ruff check app/domain app/persistence app/rules app/scoring tests/unit/domain tests/unit/rules tests/unit/scoring
+python -m ruff format --check app/domain app/persistence app/rules app/scoring tests/unit/domain tests/unit/rules tests/unit/scoring
 git diff --check
 ```
 
 Expected: all payload boundaries reject safely without retaining or emitting unbounded content.
 
 ```powershell
-git add -- app/domain/evidence_payload.py app/domain/errors.py app/domain/entities.py app/persistence/evidence.py app/rules/schema.py app/rules/parser.py app/rules/engine.py app/rules/evidence.py docs/rule-dsl.md tests/unit/domain/test_evidence_payload.py tests/unit/domain/test_ownership.py tests/unit/rules/test_resource_bounds.py tests/unit/rules/test_validation.py
-git commit -m "fix: bound rule and audit evidence payloads"
+git add -- app/domain/evidence_payload.py app/domain/errors.py app/domain/entities.py app/persistence/evidence.py app/rules/schema.py app/rules/parser.py app/rules/engine.py app/rules/evidence.py app/scoring/base.py docs/rule-dsl.md tests/unit/domain/test_evidence_payload.py tests/unit/domain/test_ownership.py tests/unit/scoring/test_engine.py tests/unit/rules/test_resource_bounds.py tests/unit/rules/test_validation.py
+git commit -m "fix: bound identifiers and audit evidence payloads"
 ```
 
 ## Task 4: Final verification, publication, and Task 9 checkpoint
@@ -425,8 +483,8 @@ Expected: pytest, full mypy (including tests), Ruff lint, formatting, and diff c
 - [ ] **Step 2: Check the committed scope before publishing.**
 
 ```powershell
-git log --oneline 4b8a2ee..HEAD
-git diff --check 4b8a2ee..HEAD
+git log --oneline e269d3a6a18157e7d6b12a4637b20b8a463c9bd3..HEAD
+git diff --check e269d3a6a18157e7d6b12a4637b20b8a463c9bd3..HEAD
 git status --short
 ```
 
@@ -435,7 +493,7 @@ Expected: exactly these independent commits in order:
 ```text
 fix: restrict rotation sale sources
 fix: normalize sizing allocations to basis points
-fix: bound rule and audit evidence payloads
+fix: bound identifiers and audit evidence payloads
 ```
 
 Inspect staged/committed paths for `.env`, `.local.env`, secrets, credentials, absolute local paths, Python caches, or generated artifacts. Do not publish any of them.
