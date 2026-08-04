@@ -43,9 +43,15 @@ The same business predicate is independently enforced at each safety boundary:
 | --- | --- | --- |
 | Run coordinator | Repository-loaded authoritative `Position` | `ensure_authorized_rotation_source` before a strategy run is built. |
 | Sizing engine | Authoritative position and requested `Quantity` | `ensure_authorized_rotation_sale`. |
-| State machine | Authoritative position, `source_position_ids`, and, where supplied, sale quantity | Action/sale events require an authorized source; transitions that carry an authoritative quantity require the complete sale invariant. |
+| State machine | Authoritative position, `source_position_ids`, and typed sizing-sale quantity where the event claims sizing passed | Action/sale events require an authorized source; a sizing-passed transition requires the complete sale invariant. |
 
-`TransitionRequest` will carry the plan's source IDs in addition to protected IDs. It will not invent a quantity for `ACTION_SIGNAL`. A later transition only performs the quantity check if an authoritative quantity is part of its input; otherwise it still enforces source authorization. The coordinator remains responsible for retrieving the position through the repository; evaluator-provided IDs are never trusted as position objects.
+`TransitionRequest` will carry the plan's source IDs in addition to protected IDs, and it will carry an optional typed `sale_quantity`. The event contract is explicit:
+
+- `ACTION_SIGNAL` requires only the authoritative authorized source; it does not invent a quantity before sizing.
+- `DECISION_VALIDATED` with `SizingOutcome.PASSED` requires `sale_quantity`. The application derives it from typed sizing evidence and the state machine applies `ensure_authorized_rotation_sale`; omission is a transition error.
+- `NEXT_STAGE_ELIGIBLE` makes a next stage eligible after fresh rules, but does not itself claim a sized sale. It requires source authorization and no quantity. Any subsequent `DECISION_VALIDATED` again requires the complete quantity check.
+
+The coordinator remains responsible for retrieving the position through the repository; evaluator-provided IDs are never trusted as position objects. A quantity offered to a sizing-passed transition is only accepted as typed sizing evidence, never as an unchecked scalar from a rule payload.
 
 This rejects an ordinary same-portfolio position that is not attached to the plan, every protected position, and every closed position. It does not change position records or execution status.
 
@@ -65,7 +71,7 @@ allocation_basis_points = allocation_weight * 10,000
 
 The result must be an integer in the inclusive range `1..10_000`; no rounding, quantization, or ambient Decimal-context behavior is permitted. Therefore `0.3`, `0.3000`, and `0.30000` all normalize to `3000`, while `0.30001` is rejected.
 
-The stage stores `allocation_basis_points: int` as the sole domain authority. A derived `allocation_weight` view returns the exact four-decimal Decimal fraction for existing consumers. Configuration snapshot payloads use the canonical basis-point form (or the one exact four-decimal representation derived from it), so semantically identical inputs have identical canonical identity.
+The stage stores `allocation_basis_points: int` as the sole domain authority. A derived `allocation_weight` view returns the exact four-decimal Decimal fraction for existing consumers. Resolved configuration snapshots retain their current Decimal representation and existing canonical v1 serialization; basis points are an internal sizing-domain normalization only. The existing v1 Decimal canonicalizer already normalizes trailing zeroes, so semantically identical configuration inputs such as `0.3` and `0.3000` retain identical v1 identity without changing the hash contract.
 
 `SizingConfiguration` verifies:
 
@@ -97,9 +103,11 @@ All limits are UTF-8 bytes. The exact encoded payload is counted, including obje
 | `RuleEvaluation` evidence canonical payload | 128 KiB |
 | `StrategyRun.outputs` canonical payload | 256 KiB |
 
-### Canonical encoder
+### Canonical measurement and existing hashes
 
-A single restricted canonical-JSON encoder is the authority for both size checks and every hash/persistence representation within this remediation. It uses JSON normalization equivalent to:
+Configuration canonical v1 is unchanged. Its NFC normalization, Decimal/datetime/UUID/Enum representations, byte-sorted keys, format-version prefix, zero-byte delimiter, and SHA-256 construction remain its only hash contract. This remediation neither rehashes existing snapshots nor replaces their encoder.
+
+The new incremental counter is a size meter, not a configuration hash encoder. For each new bounded DSL or audit representation, it measures the exact canonical representation that the same boundary would persist or otherwise expose. It uses normalization equivalent to:
 
 ```python
 json.JSONEncoder(
@@ -110,9 +118,9 @@ json.JSONEncoder(
 ).iterencode(payload)
 ```
 
-The encoder consumes chunks incrementally and adds `len(chunk.encode("utf-8"))`. Once a boundary is exceeded it raises a typed resource-limit error immediately. It does not first materialize a complete JSON string, truncate content, compress content, summarize content, or include the rejected raw content in an error.
+The counter consumes chunks incrementally and adds `len(chunk.encode("utf-8"))`. Once a boundary is exceeded it raises a typed resource-limit error immediately. It does not first materialize a complete JSON string, truncate content, compress content, summarize content, or include the rejected raw content in an error. Existing or future hash-bearing payloads may use this counter only when its streamed bytes are proven identical to that payload's established canonical format; otherwise it remains measurement-only.
 
-The encoder rejects cycles, non-string mapping keys, unsupported types, and non-finite numeric values. The public DSL transport allows only JSON-compatible types; the internal audit serializer additionally has explicit canonical encodings for existing supported immutable evidence values such as Decimal, UUID, and timezone-aware datetime. Any size measurement and the eventual canonical representation use the same normalization.
+The counter rejects cycles, non-string mapping keys, unsupported types, and non-finite numeric values. The public DSL transport allows only JSON-compatible types; the internal audit serializer additionally has explicit canonical encodings for existing supported immutable evidence values such as Decimal, UUID, and timezone-aware datetime. Any size measurement and the eventual canonical representation use the same normalization.
 
 ### DSL validation and evidence
 
@@ -120,7 +128,9 @@ Raw transport preflight validates individual strings before JSON Schema evaluati
 
 `EvidenceValue` validates runtime strings before they enter rule traces. `RuleInput` and the final `RuleEvaluation` each validate their complete canonical payloads against 128 KiB. This prevents oversized provider/adapter strings from becoming evidence even when they are not expression literals.
 
-`StrategyRun` validates and freezes `outputs` in the domain constructor, then applies the 256 KiB canonical boundary before any repository or persistence mapper sees it. This makes in-memory, SQL, and future API adapters follow the same audit limit.
+`StrategyRun.outputs` first receives an iterative structural preflight before recursive freeze or canonical measurement. It uses fixed, non-configurable limits of depth 32 and 8,192 nodes; both mappings and lists consume one depth level. The preflight rejects cycles, non-string keys, keys above the 256-byte identifier limit, strings above 16 KiB, unsupported values, non-finite or unbounded Decimal representations, and invalid timezone-aware datetime values. Consequently the existing recursive freeze only receives shallow, finite, supported data and cannot first fail with an uncontrolled `RecursionError`.
+
+After preflight, `StrategyRun` freezes `outputs` and applies the 256 KiB canonical boundary before any repository or persistence mapper sees it. This makes in-memory, SQL, and future API adapters follow the same audit limit.
 
 ### Documentation and API boundary
 
