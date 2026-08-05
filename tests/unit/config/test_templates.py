@@ -172,6 +172,64 @@ def test_template_safety_allows_generic_token_and_recipient_count_keys() -> None
     assert findings == ()
 
 
+def test_template_safety_allows_a_mapping_at_the_exact_depth_limit() -> None:
+    payload: object = {}
+    for index in range(MAX_TEMPLATE_SAFETY_DEPTH):
+        payload = {f"nested_{index}": payload}
+
+    findings = tuple(_template_safety_findings(payload))
+
+    assert findings == ()
+
+
+def test_template_safety_reports_a_mapping_beyond_the_depth_limit_deterministically() -> None:
+    payload: object = {}
+    for index in range(MAX_TEMPLATE_SAFETY_DEPTH + 1):
+        payload = {f"nested_{index}": payload}
+
+    first_findings = tuple(_template_safety_findings(payload))
+    second_findings = tuple(_template_safety_findings(payload))
+
+    assert first_findings == second_findings
+    assert len(first_findings) == 1
+    assert first_findings[0].endswith("exceeds the maximum nesting depth")
+
+
+@pytest.mark.parametrize("container_kind", ("mapping", "list"))
+def test_template_safety_allows_wide_containers_at_the_exact_node_limit(
+    container_kind: str,
+) -> None:
+    if container_kind == "mapping":
+        payload: object = {
+            f"generic_{index}": index for index in range(MAX_TEMPLATE_SAFETY_NODES - 1)
+        }
+    else:
+        payload = list(range(MAX_TEMPLATE_SAFETY_NODES - 1))
+
+    findings = tuple(_template_safety_findings(payload))
+
+    assert findings == ()
+
+
+@pytest.mark.parametrize("container_kind", ("mapping", "list"))
+def test_template_safety_reports_wide_containers_beyond_the_node_limit(
+    container_kind: str,
+) -> None:
+    if container_kind == "mapping":
+        payload: object = {f"generic_{index}": index for index in range(MAX_TEMPLATE_SAFETY_NODES)}
+    else:
+        payload = list(range(MAX_TEMPLATE_SAFETY_NODES))
+
+    first_findings = tuple(_template_safety_findings(payload))
+    second_findings = tuple(_template_safety_findings(payload))
+
+    assert (
+        first_findings
+        == second_findings
+        == ("template safety traversal exceeds the maximum node count",)
+    )
+
+
 def test_template_safety_recursively_rejects_unsafe_keys_and_oversized_text() -> None:
     payload = {
         "settings": {},
