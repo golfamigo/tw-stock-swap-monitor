@@ -95,7 +95,10 @@ def _is_admin_run_once_scope(scope: Scope) -> bool:
     if path == ADMIN_RUN_ONCE_PATH:
         return True
     normalized_root_path = root_path.rstrip("/")
-    if not normalized_root_path or not path.startswith(normalized_root_path):
+    if not normalized_root_path:
+        return False
+    root_path_prefix = f"{normalized_root_path}/"
+    if not path.startswith(root_path_prefix):
         return False
     return path[len(normalized_root_path) :] == ADMIN_RUN_ONCE_PATH
 

@@ -223,6 +223,41 @@ def test_prefixed_run_once_rejects_a_declared_oversized_body_before_parsing(
     assert sent[1]["body"] == b'{"detail":"request body exceeds configured limit"}'
 
 
+def test_unrelated_root_path_prefix_does_not_trigger_the_admin_body_limiter(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ADMIN_API_TOKEN", "test-admin-token")
+    application = create_application(
+        coordinator=cast(RunCoordinator, _SharedCoordinator()),
+        request_builder=cast(RunRequestBuilder, _request_builder),
+    )
+    sent: list[Message] = []
+    scope: ASGIScope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/gatewayadmin/run-once",
+        "raw_path": b"/gatewayadmin/run-once",
+        "query_string": b"",
+        "root_path": "/gateway",
+        "headers": ((b"content-length", str(OVERSIZED_ADMIN_BODY_BYTES).encode("ascii")),),
+        "client": ("testclient", 0),
+        "server": ("testserver", 80),
+    }
+
+    async def receive() -> Message:
+        raise AssertionError("unmatched routes must not parse request bodies")
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    asyncio.run(application(scope, receive, send))
+
+    assert sent[0]["status"] == 404
+
+
 def test_run_once_rejects_oversized_streamed_body_without_content_length(
     monkeypatch: MonkeyPatch,
 ) -> None:
