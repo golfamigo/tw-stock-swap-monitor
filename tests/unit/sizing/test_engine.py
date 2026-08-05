@@ -4,7 +4,7 @@ import importlib
 import importlib.util
 from dataclasses import replace
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Context, Decimal, localcontext
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -20,6 +20,7 @@ from app.domain.errors import (
     UnauthorizedRotationSourceError,
 )
 from app.domain.values import InstrumentRef, Quantity
+from app.sizing.base import SizingError
 from app.sizing.costs import CostError, calculate_purchase_cost, calculate_sale_proceeds
 
 
@@ -132,6 +133,67 @@ def test_sizing_three_configured_stages_accounts_for_costs_reserve_and_decimal_q
     assert result.total_required_cash == Decimal("279.86")
     assert result.total_required_cash <= result.available_cash + result.net_sale_proceeds
     assert result.remaining_cash == Decimal("12.2")
+
+
+def test_sizing_stage_normalizes_exact_allocation_weights_to_basis_points() -> None:
+    api = _api()
+
+    assert api.SizingStage("first", Decimal("0.30000")).allocation_basis_points == 3000
+    assert api.SizingStage("first", Decimal("0.3")).allocation_weight == Decimal("0.3000")
+    with localcontext(Context(prec=2)):
+        stage = api.SizingStage("third", Decimal("0.3334"))
+        assert stage.allocation_basis_points == 3334
+        assert stage.allocation_weight == Decimal("0.3334")
+    with pytest.raises(SizingError, match="basis points"):
+        api.SizingStage("first", Decimal("0.30001"))
+
+
+def test_sizing_configuration_requires_exactly_ten_thousand_allocation_basis_points() -> None:
+    api = _api()
+    configuration = _configuration(api)
+    complete_stages = (
+        api.SizingStage("first", Decimal("0.3333")),
+        api.SizingStage("second", Decimal("0.3333")),
+        api.SizingStage("third", Decimal("0.3334")),
+    )
+
+    normalized = replace(configuration, stages=complete_stages)
+
+    assert tuple(stage.allocation_basis_points for stage in normalized.stages) == (
+        3333,
+        3333,
+        3334,
+    )
+    with pytest.raises(SizingError, match="10,000"):
+        replace(
+            configuration,
+            stages=(
+                api.SizingStage("first", Decimal("0.3333")),
+                api.SizingStage("second", Decimal("0.3333")),
+                api.SizingStage("third", Decimal("0.3333")),
+            ),
+        )
+
+
+def test_sizing_result_is_invariant_to_ambient_decimal_precision() -> None:
+    api = _api()
+    request = _request(api)
+    configuration = replace(
+        request.configuration,
+        stages=(
+            api.SizingStage("first", Decimal("0.3333")),
+            api.SizingStage("second", Decimal("0.3333")),
+            api.SizingStage("third", Decimal("0.3334")),
+        ),
+    )
+    baseline = api.DeterministicSizingEngine().size(replace(request, configuration=configuration))
+
+    with localcontext(Context(prec=2)):
+        low_precision = api.DeterministicSizingEngine().size(
+            replace(request, configuration=configuration)
+        )
+
+    assert low_precision == baseline
 
 
 def test_sizing_prohibits_odd_lots_when_configuration_requires_whole_lots() -> None:

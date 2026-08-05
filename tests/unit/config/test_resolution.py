@@ -53,6 +53,7 @@ def _api() -> dict[str, Any]:
     schemas = _load_module("app.schemas.configuration")
     configuration = _load_module("app.application.configuration")
     return {
+        "CANONICAL_FORMAT_VERSION": configuration.CANONICAL_FORMAT_VERSION,
         "ConfigurationCanonicalizationError": configuration.ConfigurationCanonicalizationError,
         "ConfigurationLayer": configuration.ConfigurationLayer,
         "ConfigurationLayerScope": common.ConfigurationLayerScope,
@@ -521,6 +522,16 @@ def test_canonical_json_and_hash_follow_the_versioned_contract() -> None:
     assert api["canonical_content_hash"](payload) == api["canonical_content_hash"](
         {"z": Decimal("0.0"), "a": payload["a"]}
     )
+
+
+def test_configuration_canonical_v1_keeps_semantically_equivalent_decimal_weights_equal() -> None:
+    api = _api()
+    compact = {"allocation_weight": Decimal("0.3")}
+    padded = {"allocation_weight": Decimal("0.3000")}
+
+    assert api["CANONICAL_FORMAT_VERSION"] == "1"
+    assert api["canonical_json"](compact) == api["canonical_json"](padded)
+    assert api["canonical_content_hash"](compact) == api["canonical_content_hash"](padded)
 
 
 @pytest.mark.parametrize(

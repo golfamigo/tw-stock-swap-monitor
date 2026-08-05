@@ -10,7 +10,7 @@ from uuid import UUID
 
 from app.domain.entities import CandidateGroup, Position, RotationPlan
 from app.domain.values import InstrumentRef, Quantity, require_finite_decimal
-from app.sizing.costs import DecimalRoundingPolicy, FeeTaxProfile, SlippageProfile
+from app.sizing.costs import DecimalRoundingPolicy, FeeTaxProfile, SlippageProfile, add_decimals
 
 
 class SizingError(ValueError):
@@ -32,20 +32,44 @@ class SizingStatus(StrEnum):
     NO_PURCHASE_QUANTITY = "no_purchase_quantity"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class SizingStage:
     """One explicitly ordered positive allocation stage."""
 
     stage_id: str
-    allocation_weight: Decimal
+    allocation_basis_points: int
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.stage_id, str) or not self.stage_id.strip():
+    def __init__(self, stage_id: str, allocation_weight: Decimal) -> None:
+        if not isinstance(stage_id, str) or not stage_id.strip():
             raise SizingError("stage_id must not be blank")
-        require_finite_decimal(self.allocation_weight, field_name="allocation_weight")
-        if self.allocation_weight <= Decimal("0"):
-            raise SizingError("allocation_weight must be positive")
-        object.__setattr__(self, "stage_id", self.stage_id.strip())
+        normalized_stage_id = stage_id.strip()
+        if len(normalized_stage_id.encode("utf-8")) > 256:
+            raise SizingError("stage_id must be at most 256 UTF-8 bytes")
+        require_finite_decimal(allocation_weight, field_name="allocation_weight")
+        if not Decimal("0") < allocation_weight <= Decimal("1"):
+            raise SizingError("allocation_weight must be between zero and one")
+        decimal_tuple = allocation_weight.as_tuple()
+        if not isinstance(decimal_tuple.exponent, int):
+            raise AssertionError("finite allocation_weight must have an integer exponent")
+        coefficient = int("".join(str(digit) for digit in decimal_tuple.digits))
+        exponent = decimal_tuple.exponent
+        while coefficient and coefficient % 10 == 0:
+            coefficient //= 10
+            exponent += 1
+        if exponent < -4:
+            raise SizingError("allocation_weight must be exactly representable in basis points")
+        allocation_basis_points = coefficient * (10 ** (exponent + 4))
+        if not 1 <= allocation_basis_points <= 10_000:
+            raise SizingError("allocation_weight must be between 1 and 10,000 basis points")
+        object.__setattr__(self, "stage_id", normalized_stage_id)
+        object.__setattr__(self, "allocation_basis_points", allocation_basis_points)
+
+    @property
+    def allocation_weight(self) -> Decimal:
+        """Return the exact four-place Decimal view derived from basis points."""
+
+        digits = tuple(int(digit) for digit in str(self.allocation_basis_points))
+        return Decimal((0, digits, -4))
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,8 +94,8 @@ class SizingConfiguration:
         stage_ids = tuple(stage.stage_id for stage in stages)
         if len(set(stage_ids)) != len(stage_ids):
             raise SizingError("stage ids must be unique")
-        if sum((stage.allocation_weight for stage in stages), Decimal("0")) != Decimal("1"):
-            raise SizingError("stage allocation weights must total exactly one")
+        if sum(stage.allocation_basis_points for stage in stages) != 10_000:
+            raise SizingError("stage allocation basis points must total exactly 10,000")
         if not isinstance(self.fee_tax_profile, FeeTaxProfile):
             raise TypeError("fee_tax_profile must be a FeeTaxProfile")
         if not isinstance(self.slippage_profile, SlippageProfile):
@@ -203,9 +227,8 @@ class SizingResult:
             require_finite_decimal(value, field_name=field_name)
             if value < Decimal("0"):
                 raise SizingError(f"{field_name} must not be negative")
-        if (
-            self.actionable
-            and self.total_required_cash > self.available_cash + self.net_sale_proceeds
+        if self.actionable and self.total_required_cash > add_decimals(
+            self.available_cash, self.net_sale_proceeds
         ):
             raise SizingError("actionable sizing result violates funding inequality")
         object.__setattr__(self, "stages", stages)
