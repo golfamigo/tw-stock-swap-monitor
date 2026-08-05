@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
+from app.api.body_size import RequestBodyTooLargeResponse
 from app.api.dependencies import ApiDependencies, get_api_dependencies, require_admin_token
 from app.application.run_coordinator import (
     ExistingResultReference,
@@ -75,6 +76,7 @@ class RunOnceResponse(BaseModel):
     "/run-once",
     response_model=RunOnceResponse,
     dependencies=[Depends(require_admin_token)],
+    responses={413: {"model": RequestBodyTooLargeResponse}},
 )
 def run_once(
     payload: RunOnceRequest,

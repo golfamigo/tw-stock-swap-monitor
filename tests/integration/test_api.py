@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import cast
 from uuid import UUID
@@ -17,9 +18,11 @@ from app.application.run_coordinator import (
 from app.main import create_application
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
+from starlette.types import Message, Scope
 
 PLAN_ID = UUID("00000000-0000-0000-0000-000000001001")
 SCAN_LOCK_KEY = "a" * 64
+OVERSIZED_ADMIN_BODY_BYTES = 32_768
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +132,81 @@ def test_run_once_rejects_every_non_dry_run_request(monkeypatch: MonkeyPatch) ->
     assert coordinator.calls == []
 
 
+def test_run_once_rejects_a_declared_oversized_body_before_parsing(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    client, coordinator = _client(monkeypatch)
+
+    response = client.post(
+        "/admin/run-once",
+        headers={
+            **_headers(),
+            "Content-Length": str(OVERSIZED_ADMIN_BODY_BYTES),
+        },
+        content=b"{}",
+    )
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "request body exceeds configured limit"}
+    assert coordinator.calls == []
+
+
+def test_run_once_rejects_oversized_streamed_body_without_content_length(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ADMIN_API_TOKEN", "test-admin-token")
+    coordinator = _SharedCoordinator()
+    application = create_application(
+        coordinator=cast(RunCoordinator, coordinator),
+        request_builder=cast(RunRequestBuilder, _request_builder),
+    )
+    received: list[Message] = [
+        {
+            "type": "http.request",
+            "body": (
+                b'{"rotation_plan_id":"00000000-0000-0000-0000-000000001001",'
+                b'"dry_run":true,"padding":"'
+            ),
+            "more_body": True,
+        },
+        {
+            "type": "http.request",
+            "body": (b"x" * OVERSIZED_ADMIN_BODY_BYTES) + b'"}',
+            "more_body": False,
+        },
+    ]
+    sent: list[Message] = []
+    scope: Scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/admin/run-once",
+        "raw_path": b"/admin/run-once",
+        "query_string": b"",
+        "root_path": "",
+        "headers": (
+            (b"content-type", b"application/json"),
+            (b"x-admin-token", b"test-admin-token"),
+        ),
+        "client": ("testclient", 0),
+        "server": ("testserver", 80),
+    }
+
+    async def receive() -> Message:
+        return received.pop(0)
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    asyncio.run(application(scope, receive, send))
+
+    assert sent[0]["status"] == 413
+    assert sent[1]["body"] == b'{"detail":"request body exceeds configured limit"}'
+    assert coordinator.calls == []
+
+
 def test_scheduler_and_api_share_one_coordinator_duplicate_key(monkeypatch: MonkeyPatch) -> None:
     client, coordinator = _client(monkeypatch)
 
@@ -189,3 +267,20 @@ def test_an_empty_administrative_token_disables_run_once(monkeypatch: MonkeyPatc
 
     assert response.status_code == 503
     assert coordinator.calls == []
+
+
+def test_default_factory_has_safe_run_once_dependencies_when_token_is_configured(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ADMIN_API_TOKEN", "test-admin-token")
+    client = TestClient(create_application())
+
+    assert client.get("/status").json() == {"status": "ready", "run_once_enabled": True}
+    response = client.post(
+        "/admin/run-once",
+        headers=_headers(),
+        json={"rotation_plan_id": str(PLAN_ID), "dry_run": True},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "dry-run execution context is not configured"}
