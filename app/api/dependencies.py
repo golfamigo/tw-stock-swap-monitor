@@ -44,7 +44,9 @@ class ApiDependencies:
         """Read the sole administrative credential from the deployment environment."""
 
         admin_api_token = os.environ.get("ADMIN_API_TOKEN")
-        if admin_api_token is not None and not admin_api_token.strip():
+        if admin_api_token is not None and (
+            not admin_api_token.strip() or not admin_api_token.isascii()
+        ):
             admin_api_token = None
         return cls(
             coordinator=coordinator,
@@ -94,7 +96,11 @@ def require_admin_token(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="admin run-once is disabled",
         )
-    if x_admin_token is None or not compare_digest(x_admin_token, expected_token):
+    if (
+        x_admin_token is None
+        or not x_admin_token.isascii()
+        or not compare_digest(x_admin_token.encode("ascii"), expected_token.encode("ascii"))
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid administrative credentials",

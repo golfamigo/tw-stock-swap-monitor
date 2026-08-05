@@ -7,7 +7,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, BeforeValidator, ConfigDict
 
 from app.api.body_size import RequestBodyTooLargeResponse
 from app.api.dependencies import ApiDependencies, get_api_dependencies, require_admin_token
@@ -21,13 +21,21 @@ from app.application.run_coordinator import (
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
+def _require_literal_json_true(value: object) -> Literal[True]:
+    """Reject look-alike JSON values before Literal validation can coerce them."""
+
+    if type(value) is not bool or value is not True:
+        raise ValueError("dry_run must be the JSON boolean true")
+    return True
+
+
 class RunOnceRequest(BaseModel):
     """External command that admits only an explicit dry run for one rotation plan."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     rotation_plan_id: UUID
-    dry_run: Literal[True]
+    dry_run: Annotated[Literal[True], BeforeValidator(_require_literal_json_true)]
 
 
 class ExistingResultResponse(BaseModel):

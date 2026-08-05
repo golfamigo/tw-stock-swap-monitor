@@ -155,16 +155,95 @@ def test_run_once_requires_a_plan_identifier(monkeypatch: MonkeyPatch) -> None:
     assert coordinator.calls == []
 
 
-def test_run_once_rejects_every_non_dry_run_request(monkeypatch: MonkeyPatch) -> None:
+@pytest.mark.parametrize("invalid_dry_run", [1, 1.0, "true", False, None])
+def test_run_once_requires_a_literal_json_true_dry_run(
+    monkeypatch: MonkeyPatch, invalid_dry_run: object
+) -> None:
     client, coordinator = _client(monkeypatch)
 
     response = client.post(
         "/admin/run-once",
         headers=_headers(),
-        json={"rotation_plan_id": str(PLAN_ID), "dry_run": False},
+        json={"rotation_plan_id": str(PLAN_ID), "dry_run": invalid_dry_run},
     )
 
     assert response.status_code == 422
+    assert coordinator.calls == []
+
+
+def test_run_once_requires_a_present_dry_run_field(monkeypatch: MonkeyPatch) -> None:
+    client, coordinator = _client(monkeypatch)
+
+    response = client.post(
+        "/admin/run-once",
+        headers=_headers(),
+        json={"rotation_plan_id": str(PLAN_ID)},
+    )
+
+    assert response.status_code == 422
+    assert coordinator.calls == []
+
+
+def test_run_once_rejects_a_non_ascii_request_token(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("ADMIN_API_TOKEN", "test-admin-token")
+    coordinator = _SharedCoordinator()
+    application = create_application(
+        coordinator=cast(RunCoordinator, coordinator),
+        request_builder=cast(RunRequestBuilder, _request_builder),
+    )
+    sent: list[Message] = []
+    scope: ASGIScope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/admin/run-once",
+        "raw_path": b"/admin/run-once",
+        "query_string": b"",
+        "root_path": "",
+        "headers": (
+            (b"content-type", b"application/json"),
+            (b"x-admin-token", b"\xff"),
+        ),
+        "client": ("testclient", 0),
+        "server": ("testserver", 80),
+    }
+
+    async def receive() -> Message:
+        return {
+            "type": "http.request",
+            "body": b'{"rotation_plan_id":"00000000-0000-0000-0000-000000001001","dry_run":true}',
+            "more_body": False,
+        }
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    asyncio.run(application(scope, receive, send))
+
+    assert sent[0]["status"] == 401
+    assert coordinator.calls == []
+
+
+def test_non_ascii_configured_admin_token_disables_run_once(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("ADMIN_API_TOKEN", "é")
+    coordinator = _SharedCoordinator()
+    client = TestClient(
+        create_application(
+            coordinator=cast(RunCoordinator, coordinator),
+            request_builder=cast(RunRequestBuilder, _request_builder),
+        ),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post(
+        "/admin/run-once",
+        headers=_headers(),
+        json={"rotation_plan_id": str(PLAN_ID), "dry_run": True},
+    )
+
+    assert response.status_code == 503
     assert coordinator.calls == []
 
 
