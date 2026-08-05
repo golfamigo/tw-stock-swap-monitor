@@ -76,7 +76,10 @@ class RunOnceResponse(BaseModel):
     "/run-once",
     response_model=RunOnceResponse,
     dependencies=[Depends(require_admin_token)],
-    responses={413: {"model": RequestBodyTooLargeResponse}},
+    responses={
+        409: {"model": RunOnceResponse},
+        413: {"model": RequestBodyTooLargeResponse},
+    },
 )
 def run_once(
     payload: RunOnceRequest,

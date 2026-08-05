@@ -8,7 +8,9 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Never, cast
 from uuid import UUID
 
+import pytest
 from app import main as application_main
+from app.api.body_size import AdminRequestBodyLimitMiddleware
 from app.api.dependencies import RunRequestBuilder
 from app.application.configuration import (
     CANONICAL_FORMAT_VERSION,
@@ -185,6 +187,42 @@ def test_run_once_rejects_a_declared_oversized_body_before_parsing(
     assert coordinator.calls == []
 
 
+def test_prefixed_run_once_rejects_a_declared_oversized_body_before_parsing(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ADMIN_API_TOKEN", "test-admin-token")
+    application = create_application(
+        coordinator=cast(RunCoordinator, _SharedCoordinator()),
+        request_builder=cast(RunRequestBuilder, _request_builder),
+    )
+    sent: list[Message] = []
+    scope: ASGIScope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/gateway/admin/run-once",
+        "raw_path": b"/gateway/admin/run-once",
+        "query_string": b"",
+        "root_path": "/gateway",
+        "headers": ((b"content-length", str(OVERSIZED_ADMIN_BODY_BYTES).encode("ascii")),),
+        "client": ("testclient", 0),
+        "server": ("testserver", 80),
+    }
+
+    async def receive() -> Message:
+        raise AssertionError("declared oversized bodies must not be read")
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    asyncio.run(application(scope, receive, send))
+
+    assert sent[0]["status"] == 413
+    assert sent[1]["body"] == b'{"detail":"request body exceeds configured limit"}'
+
+
 def test_run_once_rejects_oversized_streamed_body_without_content_length(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -216,10 +254,10 @@ def test_run_once_rejects_oversized_streamed_body_without_content_length(
         "http_version": "1.1",
         "method": "POST",
         "scheme": "http",
-        "path": "/admin/run-once",
-        "raw_path": b"/admin/run-once",
+        "path": "/gateway/admin/run-once",
+        "raw_path": b"/gateway/admin/run-once",
         "query_string": b"",
-        "root_path": "",
+        "root_path": "/gateway",
         "headers": (
             (b"content-type", b"application/json"),
             (b"x-admin-token", b"test-admin-token"),
@@ -239,6 +277,27 @@ def test_run_once_rejects_oversized_streamed_body_without_content_length(
     assert sent[0]["status"] == 413
     assert sent[1]["body"] == b'{"detail":"request body exceeds configured limit"}'
     assert coordinator.calls == []
+
+
+def test_admin_openapi_documents_the_typed_duplicate_conflict(monkeypatch: MonkeyPatch) -> None:
+    client, _ = _client(monkeypatch)
+
+    conflict_schema = client.get("/openapi.json").json()["paths"]["/admin/run-once"]["post"][
+        "responses"
+    ]["409"]["content"]["application/json"]["schema"]
+
+    assert conflict_schema == {"$ref": "#/components/schemas/RunOnceResponse"}
+
+
+@pytest.mark.parametrize("maximum_body_bytes", [True, 1.5])
+def test_body_limit_rejects_non_integer_runtime_configuration(
+    maximum_body_bytes: object,
+) -> None:
+    with pytest.raises(TypeError, match="maximum_body_bytes must be an integer"):
+        AdminRequestBodyLimitMiddleware(
+            create_application(),
+            maximum_body_bytes=cast(int, maximum_body_bytes),
+        )
 
 
 def test_scheduler_and_api_share_one_coordinator_duplicate_key(monkeypatch: MonkeyPatch) -> None:

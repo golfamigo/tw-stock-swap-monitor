@@ -30,13 +30,15 @@ class AdminRequestBodyLimitMiddleware:
     """Reject declared and observed oversize admin bodies before FastAPI parses JSON."""
 
     def __init__(self, app: ASGIApp, *, maximum_body_bytes: int) -> None:
-        if isinstance(maximum_body_bytes, bool) or maximum_body_bytes <= 0:
+        if type(maximum_body_bytes) is not int:
+            raise TypeError("maximum_body_bytes must be an integer")
+        if maximum_body_bytes <= 0:
             raise ValueError("maximum_body_bytes must be a positive integer")
         self.app = app
         self.maximum_body_bytes = maximum_body_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["path"] != ADMIN_RUN_ONCE_PATH:
+        if scope["type"] != "http" or not _is_admin_run_once_scope(scope):
             await self.app(scope, receive, send)
             return
         if _declared_body_exceeds_limit(scope, maximum_body_bytes=self.maximum_body_bytes):
@@ -81,6 +83,21 @@ def _declared_body_exceeds_limit(scope: Scope, *, maximum_body_bytes: int) -> bo
         if declared_body_bytes > maximum_body_bytes:
             return True
     return False
+
+
+def _is_admin_run_once_scope(scope: Scope) -> bool:
+    """Match the route whether ASGI path includes the deployment root path or not."""
+
+    path = scope.get("path")
+    root_path = scope.get("root_path", "")
+    if not isinstance(path, str) or not isinstance(root_path, str):
+        return False
+    if path == ADMIN_RUN_ONCE_PATH:
+        return True
+    normalized_root_path = root_path.rstrip("/")
+    if not normalized_root_path or not path.startswith(normalized_root_path):
+        return False
+    return path[len(normalized_root_path) :] == ADMIN_RUN_ONCE_PATH
 
 
 async def _send_body_too_large(send: Send) -> None:
