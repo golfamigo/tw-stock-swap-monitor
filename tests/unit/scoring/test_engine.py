@@ -23,9 +23,9 @@ def _created_at() -> datetime:
     return datetime(2026, 1, 5, 9, tzinfo=UTC)
 
 
-def _authorized_context() -> (
-    tuple[RotationPlan, CandidateGroup, UUID, InstrumentRef, InstrumentRef]
-):
+def _authorized_context() -> tuple[
+    RotationPlan, CandidateGroup, UUID, InstrumentRef, InstrumentRef
+]:
     owner_id = uuid4()
     first_candidate = InstrumentRef(UUID(int=1))
     second_candidate = InstrumentRef(UUID(int=2))
