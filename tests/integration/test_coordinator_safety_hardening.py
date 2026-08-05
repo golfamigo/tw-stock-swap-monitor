@@ -64,6 +64,7 @@ from app.persistence.in_memory import (
 from app.persistence.mappers import scan_attempt_from_model, scan_attempt_to_model
 from app.repositories.locks import LockLease, ScanLockRequest
 from app.services.rotation_run import RotationEvaluation
+from app.sizing import SizingResult, SizingStatus, SourceSaleAudit, StageSizing
 from app.state_machine.machine import TransitionGuards
 from app.state_machine.states import (
     DataOutcome,
@@ -83,6 +84,7 @@ GROUP_ID = UUID("00000000-0000-0000-0000-000000001004")
 INSTRUMENT_ID = UUID("00000000-0000-0000-0000-000000001005")
 CONFIGURATION_ID = UUID("00000000-0000-0000-0000-000000001006")
 POSITION_ID = UUID("00000000-0000-0000-0000-000000001007")
+ORDINARY_POSITION_ID = UUID("00000000-0000-0000-0000-000000001010")
 
 
 def _context() -> AccessContext:
@@ -93,26 +95,73 @@ def _context() -> AccessContext:
     )
 
 
-def _plan(*, protected_position_ids: tuple[UUID, ...] = ()) -> RotationPlan:
+def _plan(
+    *,
+    source_position_ids: tuple[UUID, ...] = (),
+    protected_position_ids: tuple[UUID, ...] = (),
+) -> RotationPlan:
     return RotationPlan(
         rotation_plan_id=PLAN_ID,
         portfolio_id=PORTFOLIO_ID,
         candidate_group_ids=(GROUP_ID,),
-        source_position_ids=(),
+        source_position_ids=source_position_ids,
         protected_position_ids=protected_position_ids,
         created_at=NOW,
     )
 
 
-def _position(*, role: PositionRole = PositionRole.NORMAL) -> Position:
+def _position(
+    *,
+    position_id: UUID = POSITION_ID,
+    role: PositionRole = PositionRole.NORMAL,
+    status: PositionStatus = PositionStatus.OPEN,
+) -> Position:
     return Position(
-        position_id=POSITION_ID,
+        position_id=position_id,
         portfolio_id=PORTFOLIO_ID,
         instrument=InstrumentRef(INSTRUMENT_ID),
         quantity=Quantity(Decimal("1")),
         role=role,
-        status=PositionStatus.OPEN,
+        status=status,
         opened_at=NOW,
+        closed_at=NOW + timedelta(minutes=1) if status is PositionStatus.CLOSED else None,
+    )
+
+
+def _sizing_result(
+    *, source_position_id: UUID = POSITION_ID, actionable: bool = True
+) -> SizingResult:
+    return SizingResult(
+        status=SizingStatus.ACTIONABLE if actionable else SizingStatus.INSUFFICIENT_CASH,
+        actionable=actionable,
+        source_sale=SourceSaleAudit(
+            source_position_id=source_position_id,
+            quantity=Quantity(Decimal("1")),
+            gross_value=Decimal("0"),
+            slippage_cost=Decimal("0"),
+            fee=Decimal("0"),
+            tax=Decimal("0"),
+            net_proceeds=Decimal("0"),
+        ),
+        stages=(
+            StageSizing(
+                stage_id="first",
+                allocation_weight=Decimal("1"),
+                target_value=Decimal("0"),
+                purchase_quantity=Quantity(Decimal("0")),
+                required_purchase_value=Decimal("0"),
+                slippage_cost=Decimal("0"),
+                fee=Decimal("0"),
+                total_cash=Decimal("0"),
+            ),
+        ),
+        available_cash=Decimal("0"),
+        net_sale_proceeds=Decimal("0"),
+        reserve=Decimal("0"),
+        required_purchase_value=Decimal("0"),
+        configured_costs=Decimal("0"),
+        total_required_cash=Decimal("0"),
+        remaining_cash=Decimal("0"),
     )
 
 
@@ -123,7 +172,7 @@ def _configuration(
     created_at: datetime = NOW,
     config_version: int = 1,
 ) -> PersistedConfigurationSnapshot:
-    payload = {
+    payload: dict[str, object] = {
         "configuration_name": "task-nine-hardening",
         "settings": {},
         "rules": [],
@@ -511,7 +560,10 @@ def test_coordinator_rejects_authoritative_protected_sale_sources(
     role: PositionRole, plan_lists_position: bool
 ) -> None:
     position = _position(role=role)
-    plan = _plan(protected_position_ids=(position.position_id,) if plan_lists_position else ())
+    plan = _plan(
+        source_position_ids=(position.position_id,) if role is PositionRole.PROTECTED_CORE else (),
+        protected_position_ids=(position.position_id,) if plan_lists_position else (),
+    )
     evaluation = RotationEvaluation(
         event=RecommendationEvent.ACTION_SIGNAL,
         guards=TransitionGuards(rule_outcome=RuleOutcome.PASSED),
@@ -528,6 +580,87 @@ def test_coordinator_rejects_authoritative_protected_sale_sources(
     assert parts.recommendation_states.get(
         plan.rotation_plan_id, access_context=_context()
     ).state is (RecommendationState.NEAR_TRIGGER)
+
+
+@pytest.mark.parametrize(
+    "position",
+    [
+        pytest.param(_position(position_id=ORDINARY_POSITION_ID), id="ordinary-not-source"),
+        pytest.param(
+            _position(status=PositionStatus.CLOSED),
+            id="closed-listed-source",
+        ),
+    ],
+)
+def test_coordinator_rejects_sale_sources_that_are_not_open_authorized_plan_sources(
+    position: Position,
+) -> None:
+    plan = _plan(
+        source_position_ids=(position.position_id,)
+        if position.status is PositionStatus.CLOSED
+        else ()
+    )
+    evaluation = RotationEvaluation(
+        event=RecommendationEvent.ACTION_SIGNAL,
+        guards=TransitionGuards(rule_outcome=RuleOutcome.PASSED),
+        outputs={"attempt": "unauthorized-source"},
+        sale_source_position_id=position.position_id,
+    )
+    parts = _parts(evaluation=evaluation, plan=plan, positions=(position,))
+    _seed_state(parts.recommendation_states, plan, RecommendationState.NEAR_TRIGGER)
+
+    outcome = parts.coordinator.run(_request(parts.configuration, plan=plan))
+
+    assert outcome.disposition is RunDisposition.FAILED
+    assert outcome.strategy_run is None
+    assert (
+        parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context()).state
+        is RecommendationState.NEAR_TRIGGER
+    )
+
+
+@pytest.mark.parametrize(
+    "sizing_result",
+    [
+        pytest.param(
+            _sizing_result(source_position_id=ORDINARY_POSITION_ID),
+            id="mismatched-source-identity",
+        ),
+        pytest.param(_sizing_result(actionable=False), id="non-actionable-result"),
+    ],
+)
+def test_coordinator_rejects_passed_sizing_without_matching_actionable_sale_evidence(
+    sizing_result: SizingResult,
+) -> None:
+    position = _position()
+    plan = _plan(source_position_ids=(position.position_id,))
+    evaluation = RotationEvaluation(
+        event=RecommendationEvent.DECISION_VALIDATED,
+        guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+        outputs={"attempt": "invalid-sizing-evidence"},
+        sale_source_position_id=position.position_id,
+        sizing_result=sizing_result,
+    )
+    parts = _parts(evaluation=evaluation, plan=plan, positions=(position,))
+    _seed_state(parts.recommendation_states, plan, RecommendationState.ACTION_PENDING)
+
+    outcome = parts.coordinator.run(_request(parts.configuration, plan=plan))
+
+    assert outcome.disposition is RunDisposition.FAILED
+    assert (
+        parts.recommendation_states.get(plan.rotation_plan_id, access_context=_context()).state
+        is RecommendationState.ACTION_PENDING
+    )
+
+
+def test_passed_sizing_evaluation_requires_typed_evidence() -> None:
+    with pytest.raises(ValueError, match="SizingResult"):
+        RotationEvaluation(
+            event=RecommendationEvent.DECISION_VALIDATED,
+            guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+            outputs={"attempt": "missing-sizing-evidence"},
+            sale_source_position_id=POSITION_ID,
+        )
 
 
 def test_recreated_coordinator_uses_durable_state_not_evaluator_controlled_state() -> None:
@@ -716,7 +849,7 @@ def test_degraded_recommendation_requires_fresh_recovery_evaluation() -> None:
 
 def test_finalization_failure_keeps_scan_recoverable_until_state_and_intent_are_persisted() -> None:
     position = _position()
-    plan = _plan()
+    plan = _plan(source_position_ids=(position.position_id,))
     intents = _FailOnceChildIntents()
     parts = _parts(
         evaluation=RotationEvaluation(
@@ -724,6 +857,7 @@ def test_finalization_failure_keeps_scan_recoverable_until_state_and_intent_are_
             guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
             outputs={"attempt": "recover-child-intent"},
             sale_source_position_id=position.position_id,
+            sizing_result=_sizing_result(source_position_id=position.position_id),
         ),
         plan=plan,
         positions=(position,),
@@ -774,7 +908,7 @@ def test_finalization_failure_keeps_scan_recoverable_until_state_and_intent_are_
 
 def test_success_evidence_is_durable_before_scan_completion_and_attach_recovery() -> None:
     position = _position()
-    plan = _plan()
+    plan = _plan(source_position_ids=(position.position_id,))
     scans = _FailOnceAttachScans()
     parts = _parts(
         evaluation=RotationEvaluation(
@@ -782,6 +916,7 @@ def test_success_evidence_is_durable_before_scan_completion_and_attach_recovery(
             guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
             outputs={"attempt": "recover-attach"},
             sale_source_position_id=position.position_id,
+            sizing_result=_sizing_result(source_position_id=position.position_id),
         ),
         plan=plan,
         positions=(position,),
@@ -832,7 +967,7 @@ def test_success_evidence_is_durable_before_scan_completion_and_attach_recovery(
 
 def test_applied_finalization_recovers_after_later_state_advance_without_relabeling() -> None:
     position = _position()
-    plan = _plan()
+    plan = _plan(source_position_ids=(position.position_id,))
     scans = _FailOnceAttachScans()
     parts = _parts(
         evaluation=RotationEvaluation(
@@ -840,6 +975,7 @@ def test_applied_finalization_recovers_after_later_state_advance_without_relabel
             guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
             outputs={"attempt": "applied-then-advanced"},
             sale_source_position_id=position.position_id,
+            sizing_result=_sizing_result(source_position_id=position.position_id),
         ),
         plan=plan,
         positions=(position,),
@@ -926,7 +1062,7 @@ def test_pending_finalization_uses_the_stored_run_configuration_not_a_new_reques
     None
 ):
     position = _position()
-    plan = _plan()
+    plan = _plan(source_position_ids=(position.position_id,))
     first_configuration = _configuration(plan)
     scans = _FailOnceAttachScans()
     parts = _parts(
@@ -935,6 +1071,7 @@ def test_pending_finalization_uses_the_stored_run_configuration_not_a_new_reques
             guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
             outputs={"attempt": "recover-config-reference"},
             sale_source_position_id=position.position_id,
+            sizing_result=_sizing_result(source_position_id=position.position_id),
         ),
         plan=plan,
         positions=(position,),
@@ -984,7 +1121,7 @@ def test_pending_finalization_uses_the_stored_run_configuration_not_a_new_reques
 
 def test_concurrent_scan_candidates_finalize_the_fenced_loser_without_another_intent() -> None:
     position = _position()
-    plan = _plan()
+    plan = _plan(source_position_ids=(position.position_id,))
     intents = _PauseFirstChildIntentWrite()
     parts = _parts(
         evaluation=RotationEvaluation(
@@ -992,6 +1129,7 @@ def test_concurrent_scan_candidates_finalize_the_fenced_loser_without_another_in
             guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
             outputs={"attempt": "state-fence"},
             sale_source_position_id=position.position_id,
+            sizing_result=_sizing_result(source_position_id=position.position_id),
         ),
         plan=plan,
         positions=(position,),
@@ -1089,7 +1227,7 @@ def test_concurrent_scan_candidates_finalize_the_fenced_loser_without_another_in
 
 def test_uniquely_claimed_legacy_finalization_with_coarse_timestamps_backfills_fence() -> None:
     position = _position()
-    plan = _plan()
+    plan = _plan(source_position_ids=(position.position_id,))
     scans = _FailOnceFinalAttemptScans()
     parts = _parts(
         evaluation=RotationEvaluation(
@@ -1097,6 +1235,7 @@ def test_uniquely_claimed_legacy_finalization_with_coarse_timestamps_backfills_f
             guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
             outputs={"attempt": "legacy-fence-backfill"},
             sale_source_position_id=position.position_id,
+            sizing_result=_sizing_result(source_position_id=position.position_id),
         ),
         plan=plan,
         positions=(position,),
@@ -1159,7 +1298,7 @@ def test_uniquely_claimed_legacy_finalization_with_coarse_timestamps_backfills_f
 
 def test_unmarked_legacy_pending_finalization_without_terminal_attempt_is_superseded() -> None:
     position = _position()
-    plan = _plan()
+    plan = _plan(source_position_ids=(position.position_id,))
     scans = _FailOnceFinalAttemptScans()
     parts = _parts(
         evaluation=RotationEvaluation(
@@ -1167,6 +1306,7 @@ def test_unmarked_legacy_pending_finalization_without_terminal_attempt_is_supers
             guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
             outputs={"attempt": "legacy-unmarked"},
             sale_source_position_id=position.position_id,
+            sizing_result=_sizing_result(source_position_id=position.position_id),
         ),
         plan=plan,
         positions=(position,),
@@ -1209,7 +1349,7 @@ def test_unmarked_legacy_pending_finalization_without_terminal_attempt_is_supers
 
 def test_concurrent_non_noop_candidate_cannot_claim_another_legacy_finalization_marker() -> None:
     position = _position()
-    plan = _plan()
+    plan = _plan(source_position_ids=(position.position_id,))
     states = _PauseNextRecommendationStateTransition()
     scans = InMemoryLogicalScanRepository({PORTFOLIO_ID: OWNER_ID})
     intents = InMemoryChildIntentRepository({PORTFOLIO_ID: OWNER_ID})
@@ -1219,6 +1359,7 @@ def test_concurrent_non_noop_candidate_cannot_claim_another_legacy_finalization_
             guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
             outputs={"attempt": "legacy-marker-loser"},
             sale_source_position_id=position.position_id,
+            sizing_result=_sizing_result(source_position_id=position.position_id),
         ),
         plan=plan,
         positions=(position,),
@@ -1233,6 +1374,7 @@ def test_concurrent_non_noop_candidate_cannot_claim_another_legacy_finalization_
             guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
             outputs={"attempt": "legacy-marker-winner"},
             sale_source_position_id=position.position_id,
+            sizing_result=_sizing_result(source_position_id=position.position_id),
         ),
         plan=plan,
         positions=(position,),
@@ -1307,7 +1449,7 @@ def test_concurrent_non_noop_candidate_cannot_claim_another_legacy_finalization_
 
 def test_ambiguous_legacy_pending_finalization_without_terminal_attempt_is_superseded() -> None:
     position = _position()
-    plan = _plan()
+    plan = _plan(source_position_ids=(position.position_id,))
     scans = _FailOnceFinalAttemptScans()
     parts = _parts(
         evaluation=RotationEvaluation(
@@ -1315,6 +1457,7 @@ def test_ambiguous_legacy_pending_finalization_without_terminal_attempt_is_super
             guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
             outputs={"attempt": "legacy-mismatched-state"},
             sale_source_position_id=position.position_id,
+            sizing_result=_sizing_result(source_position_id=position.position_id),
         ),
         plan=plan,
         positions=(position,),
@@ -1361,13 +1504,14 @@ def test_ambiguous_legacy_pending_finalization_without_terminal_attempt_is_super
 
 def test_unfenced_matching_state_does_not_let_a_new_candidate_claim_legacy_recovery() -> None:
     position = _position()
-    plan = _plan()
+    plan = _plan(source_position_ids=(position.position_id,))
     parts = _parts(
         evaluation=RotationEvaluation(
             event=RecommendationEvent.DECISION_VALIDATED,
             guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
             outputs={"attempt": "unfenced-noop"},
             sale_source_position_id=position.position_id,
+            sizing_result=_sizing_result(source_position_id=position.position_id),
         ),
         plan=plan,
         positions=(position,),
@@ -1525,12 +1669,13 @@ def test_recommendation_state_compare_and_set_has_one_concurrent_winner(
 
 def test_action_notified_records_one_deterministic_child_intent_without_delivery() -> None:
     position = _position()
-    plan = _plan()
+    plan = _plan(source_position_ids=(position.position_id,))
     notification = RotationEvaluation(
         event=RecommendationEvent.DECISION_VALIDATED,
         guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
         outputs={"attempt": "notification"},
         sale_source_position_id=position.position_id,
+        sizing_result=_sizing_result(source_position_id=position.position_id),
     )
     parts = _parts(evaluation=notification, plan=plan, positions=(position,))
     _seed_state(parts.recommendation_states, plan, RecommendationState.ACTION_PENDING)

@@ -8,11 +8,13 @@ from app.domain.entities import CandidateGroup, Position, RotationPlan
 from app.domain.enums import PositionRole, PositionStatus, Scope
 from app.domain.errors import (
     CandidateInstrumentUnauthorizedError,
+    NonPositiveSaleQuantityError,
     PlanReferenceUnauthorizedError,
     PositionAlreadyOpenError,
     PositionNotOpenError,
     ProtectedPositionSaleError,
     SaleQuantityExceedsPositionError,
+    UnauthorizedRotationSourceError,
 )
 from app.domain.values import InstrumentRef, Ownership, Quantity
 
@@ -31,6 +33,34 @@ def ensure_position_is_sellable(position: Position, sale_quantity: Quantity) -> 
         raise ProtectedPositionSaleError("protected positions are never eligible for sale")
     if position.status is not PositionStatus.OPEN:
         raise PositionNotOpenError("only OPEN positions are eligible for sale")
+    if sale_quantity.value > position.quantity.value:
+        raise SaleQuantityExceedsPositionError("sale quantity exceeds open position quantity")
+
+
+def ensure_authorized_rotation_source(plan: RotationPlan, position: Position) -> None:
+    """Require a plan-listed, open, non-protected source position for a rotation sale."""
+
+    if position.position_id not in plan.source_position_ids:
+        raise UnauthorizedRotationSourceError("position is not an authorized rotation source")
+    if position.portfolio_id != plan.portfolio_id:
+        raise UnauthorizedRotationSourceError("rotation source is outside the plan portfolio")
+    if position.status is not PositionStatus.OPEN:
+        raise PositionNotOpenError("only OPEN rotation sources are eligible for sale")
+    if (
+        position.role is PositionRole.PROTECTED_CORE
+        or position.position_id in plan.protected_position_ids
+    ):
+        raise ProtectedPositionSaleError("protected positions are never eligible for sale")
+
+
+def ensure_authorized_rotation_sale(
+    plan: RotationPlan, position: Position, sale_quantity: Quantity
+) -> None:
+    """Require an authorized source and a positive sale quantity within its open holding."""
+
+    ensure_authorized_rotation_source(plan, position)
+    if sale_quantity.value <= 0:
+        raise NonPositiveSaleQuantityError("rotation sale quantity must be positive")
     if sale_quantity.value > position.quantity.value:
         raise SaleQuantityExceedsPositionError("sale quantity exceeds open position quantity")
 

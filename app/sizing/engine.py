@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from uuid import UUID
 
-from app.domain.errors import ProtectedPositionSaleError
 from app.domain.invariants import (
+    ensure_authorized_rotation_sale,
     ensure_candidate_instrument_is_authorized,
-    ensure_plan_reference_is_authorized,
-    ensure_position_is_sellable,
 )
 from app.domain.values import Quantity
 from app.sizing.base import (
@@ -42,13 +41,10 @@ class DeterministicSizingEngine:
 
         if not isinstance(request, SizingRequest):
             raise TypeError("request must be a SizingRequest")
-        if request.source_position.position_id in request.plan.protected_position_ids:
-            raise ProtectedPositionSaleError("protected positions are never eligible for sale")
-        ensure_position_is_sellable(request.source_position, request.source_sale_quantity)
-        ensure_plan_reference_is_authorized(
+        ensure_authorized_rotation_sale(
             request.plan,
             request.source_position,
-            portfolio_owner_id=request.portfolio_owner_id,
+            request.source_sale_quantity,
         )
         ensure_candidate_instrument_is_authorized(
             request.plan,
@@ -63,7 +59,9 @@ class DeterministicSizingEngine:
             slippage_profile=request.configuration.slippage_profile,
             rounding=request.configuration.rounding,
         )
-        source_sale = self._source_sale(request.source_sale_quantity, sale_proceeds)
+        source_sale = self._source_sale(
+            request.source_position.position_id, request.source_sale_quantity, sale_proceeds
+        )
         funding = add_decimals(request.available_cash, sale_proceeds.net_proceeds)
         if funding < request.configuration.reserve:
             return self._non_actionable_result(
@@ -287,8 +285,11 @@ class DeterministicSizingEngine:
             return configuration.minimum_quantity
         return configuration.lot_quantity
 
-    def _source_sale(self, quantity: Quantity, proceeds: SaleProceeds) -> SourceSaleAudit:
+    def _source_sale(
+        self, source_position_id: UUID, quantity: Quantity, proceeds: SaleProceeds
+    ) -> SourceSaleAudit:
         return SourceSaleAudit(
+            source_position_id=source_position_id,
             quantity=quantity,
             gross_value=proceeds.gross_value,
             slippage_cost=proceeds.slippage_cost,

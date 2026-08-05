@@ -7,9 +7,14 @@ from decimal import Decimal
 from uuid import UUID
 
 import pytest
-from app.domain.entities import Position
+from app.domain.entities import Position, RotationPlan
 from app.domain.enums import PositionRole, PositionStatus
-from app.domain.errors import ProtectedPositionSaleError
+from app.domain.errors import (
+    NonPositiveSaleQuantityError,
+    PositionNotOpenError,
+    ProtectedPositionSaleError,
+    UnauthorizedRotationSourceError,
+)
 from app.domain.values import InstrumentRef, Quantity
 from app.state_machine.machine import (
     StateMachine,
@@ -32,6 +37,7 @@ PROTECTED_POSITION_ID = UUID("00000000-0000-0000-0000-000000000701")
 PORTFOLIO_ID = UUID("00000000-0000-0000-0000-000000000702")
 INSTRUMENT_ID = UUID("00000000-0000-0000-0000-000000000703")
 SAFE_POSITION_ID = UUID("00000000-0000-0000-0000-000000000704")
+PLAN_ID = UUID("00000000-0000-0000-0000-000000000705")
 
 
 def _sale_source(
@@ -56,6 +62,7 @@ def _transition(
     *,
     guards: TransitionGuards | None = None,
     sale_source_position: Position | None = None,
+    sale_quantity: Quantity | None = None,
     remaining_stages_halted: bool = False,
 ) -> TransitionResult:
     protected_events = {
@@ -68,13 +75,22 @@ def _transition(
             current_state=state,
             event=event,
             guards=guards or TransitionGuards(),
-            protected_position_ids=(PROTECTED_POSITION_ID,),
-            plan_portfolio_id=PORTFOLIO_ID,
+            plan=_rotation_plan(
+                source_position_ids=(SAFE_POSITION_ID,) if event in protected_events else ()
+            ),
             sale_source_position=(
                 sale_source_position
                 if sale_source_position is not None
                 else _sale_source()
                 if event in protected_events
+                else None
+            ),
+            sale_quantity=(
+                sale_quantity
+                if sale_quantity is not None
+                else Quantity(Decimal("1"))
+                if event is RecommendationEvent.DECISION_VALIDATED
+                and (guards or TransitionGuards()).sizing_outcome is SizingOutcome.PASSED
                 else None
             ),
             remaining_stages_halted=remaining_stages_halted,
@@ -320,10 +336,84 @@ def test_protected_position_is_denied_by_every_sale_or_action_transition_guard(
             state,
             event,
             guards=guards,
-            sale_source_position=_sale_source(PROTECTED_POSITION_ID),
+            sale_source_position=_sale_source(role=PositionRole.PROTECTED_CORE),
         )
 
 
 def test_invalid_edges_are_rejected_with_a_typed_error() -> None:
     with pytest.raises(TransitionNotAllowed):
         _transition(RecommendationState.IDLE, RecommendationEvent.ACTION_SIGNAL)
+
+
+def _rotation_plan(*, source_position_ids: tuple[UUID, ...]) -> RotationPlan:
+    return RotationPlan(
+        rotation_plan_id=PLAN_ID,
+        portfolio_id=PORTFOLIO_ID,
+        candidate_group_ids=(INSTRUMENT_ID,),
+        source_position_ids=source_position_ids,
+        protected_position_ids=(PROTECTED_POSITION_ID,),
+        created_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+
+def test_action_signal_rejects_same_portfolio_position_not_authorized_as_source() -> None:
+    request = TransitionRequest(
+        current_state=RecommendationState.NEAR_TRIGGER,
+        event=RecommendationEvent.ACTION_SIGNAL,
+        guards=TransitionGuards(rule_outcome=RuleOutcome.PASSED),
+        plan=_rotation_plan(source_position_ids=()),
+        sale_source_position=_sale_source(),
+    )
+
+    with pytest.raises(UnauthorizedRotationSourceError, match="source"):
+        StateMachine().transition(request)
+
+
+def test_action_signal_rejects_a_closed_listed_source() -> None:
+    source = Position(
+        position_id=SAFE_POSITION_ID,
+        portfolio_id=PORTFOLIO_ID,
+        instrument=InstrumentRef(INSTRUMENT_ID),
+        quantity=Quantity(Decimal("1")),
+        role=PositionRole.NORMAL,
+        status=PositionStatus.CLOSED,
+        opened_at=datetime(2026, 8, 1, tzinfo=UTC),
+        closed_at=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    request = TransitionRequest(
+        current_state=RecommendationState.NEAR_TRIGGER,
+        event=RecommendationEvent.ACTION_SIGNAL,
+        guards=TransitionGuards(rule_outcome=RuleOutcome.PASSED),
+        plan=_rotation_plan(source_position_ids=(SAFE_POSITION_ID,)),
+        sale_source_position=source,
+    )
+
+    with pytest.raises(PositionNotOpenError):
+        StateMachine().transition(request)
+
+
+def test_passed_sizing_transition_requires_positive_sale_quantity() -> None:
+    request = TransitionRequest(
+        current_state=RecommendationState.ACTION_PENDING,
+        event=RecommendationEvent.DECISION_VALIDATED,
+        guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+        plan=_rotation_plan(source_position_ids=(SAFE_POSITION_ID,)),
+        sale_source_position=_sale_source(),
+        sale_quantity=Quantity(Decimal("0")),
+    )
+
+    with pytest.raises(NonPositiveSaleQuantityError):
+        StateMachine().transition(request)
+
+
+def test_passed_sizing_transition_requires_a_sale_quantity() -> None:
+    request = TransitionRequest(
+        current_state=RecommendationState.ACTION_PENDING,
+        event=RecommendationEvent.DECISION_VALIDATED,
+        guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+        plan=_rotation_plan(source_position_ids=(SAFE_POSITION_ID,)),
+        sale_source_position=_sale_source(),
+    )
+
+    with pytest.raises(TransitionNotAllowed, match="sale quantity"):
+        StateMachine().transition(request)

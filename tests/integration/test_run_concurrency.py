@@ -85,7 +85,7 @@ def _plan() -> RotationPlan:
 
 
 def _configuration(plan: RotationPlan) -> PersistedConfigurationSnapshot:
-    payload = {
+    payload: dict[str, object] = {
         "configuration_name": "task-nine-concurrency",
         "settings": {},
         "rules": [],

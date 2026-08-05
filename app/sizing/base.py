@@ -141,6 +141,7 @@ class SizingRequest:
 class SourceSaleAudit:
     """Exact source sale quantity and proceeds, without mutating the Position record."""
 
+    source_position_id: UUID
     quantity: Quantity
     gross_value: Decimal
     slippage_cost: Decimal

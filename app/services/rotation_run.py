@@ -10,7 +10,8 @@ from uuid import UUID
 
 from app.data_sources.models import MarketDataSnapshot
 from app.domain.entities import Position, RotationPlan, StrategyRun
-from app.domain.values import ConfigurationSnapshotRef, require_timezone_aware
+from app.domain.values import ConfigurationSnapshotRef, Quantity, require_timezone_aware
+from app.sizing.base import SizingResult
 from app.state_machine.machine import (
     StateMachine,
     TransitionGuards,
@@ -21,6 +22,7 @@ from app.state_machine.states import (
     DataOutcome,
     RecommendationEvent,
     RecommendationStateRecord,
+    SizingOutcome,
 )
 
 
@@ -32,6 +34,7 @@ class RotationEvaluation:
     guards: TransitionGuards
     outputs: Mapping[str, object]
     sale_source_position_id: UUID | None = None
+    sizing_result: SizingResult | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.event, RecommendationEvent):
@@ -44,6 +47,16 @@ class RotationEvaluation:
             self.sale_source_position_id, UUID
         ):
             raise TypeError("sale_source_position_id must be a UUID or None")
+        if self.sizing_result is not None and not isinstance(self.sizing_result, SizingResult):
+            raise TypeError("sizing_result must be a SizingResult or None")
+        requires_sizing_result = (
+            self.event is RecommendationEvent.DECISION_VALIDATED
+            and self.guards.sizing_outcome is SizingOutcome.PASSED
+        )
+        if requires_sizing_result and self.sizing_result is None:
+            raise ValueError("passed sizing validation requires a SizingResult")
+        if not requires_sizing_result and self.sizing_result is not None:
+            raise ValueError("sizing_result only applies to passed sizing validation")
         object.__setattr__(self, "outputs", MappingProxyType(dict(self.outputs)))
 
 
@@ -98,8 +111,7 @@ class RotationRunService:
                 current_state=recommendation_state.state,
                 event=RecommendationEvent.DATA_DEGRADED,
                 guards=TransitionGuards(data_outcome=DataOutcome.DEGRADED),
-                protected_position_ids=plan.protected_position_ids,
-                plan_portfolio_id=plan.portfolio_id,
+                plan=plan,
                 remaining_stages_halted=recommendation_state.remaining_stages_halted,
             )
         )
@@ -117,6 +129,7 @@ class RotationRunService:
         recommendation_state: RecommendationStateRecord,
         evaluation: RotationEvaluation,
         sale_source_position: Position | None,
+        sale_quantity: Quantity | None,
     ) -> PreparedRotationRun:
         """Use durable state and a repository-sourced position to build immutable run evidence."""
 
@@ -132,9 +145,9 @@ class RotationRunService:
                 current_state=recommendation_state.state,
                 event=evaluation.event,
                 guards=evaluation.guards,
-                protected_position_ids=plan.protected_position_ids,
-                plan_portfolio_id=plan.portfolio_id,
+                plan=plan,
                 sale_source_position=sale_source_position,
+                sale_quantity=sale_quantity,
                 remaining_stages_halted=recommendation_state.remaining_stages_halted,
             )
         )

@@ -2,6 +2,7 @@
 
 import importlib
 import importlib.util
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, cast
@@ -13,8 +14,10 @@ from app.domain.enums import PositionRole, PositionStatus
 from app.domain.errors import (
     CandidateInstrumentUnauthorizedError,
     NonDecimalValueError,
+    NonPositiveSaleQuantityError,
     ProtectedPositionSaleError,
     SaleQuantityExceedsPositionError,
+    UnauthorizedRotationSourceError,
 )
 from app.domain.values import InstrumentRef, Quantity
 from app.sizing.costs import CostError, calculate_purchase_cost, calculate_sale_proceeds
@@ -105,10 +108,12 @@ def _request(api: Any, *, source_role: PositionRole = PositionRole.ROTATION_SOUR
 
 def test_sizing_three_configured_stages_accounts_for_costs_reserve_and_decimal_quantities() -> None:
     api = _api()
+    request = _request(api)
 
-    result = api.DeterministicSizingEngine().size(_request(api))
+    result = api.DeterministicSizingEngine().size(request)
 
     assert result.status is api.SizingStatus.ACTIONABLE
+    assert result.source_sale.source_position_id == request.source_position.position_id
     assert tuple(stage.stage_id for stage in result.stages) == ("first", "second", "third")
     assert tuple(stage.target_value for stage in result.stages) == (
         Decimal("56.01"),
@@ -182,11 +187,11 @@ def test_sizing_full_lot_target_uses_lot_cost_for_quantity_increment() -> None:
         candidate_group=request.candidate_group,
         portfolio_owner_id=request.portfolio_owner_id,
         source_position=request.source_position,
-        source_sale_quantity=Quantity(Decimal("0")),
+        source_sale_quantity=Quantity(Decimal("1")),
         source_sale_price=request.source_sale_price,
         candidate=request.candidate,
         candidate_price=Decimal("10"),
-        available_cash=Decimal("100"),
+        available_cash=Decimal("80"),
         configuration=configuration,
     )
 
@@ -214,8 +219,8 @@ def test_sizing_returns_non_actionable_insufficient_cash_without_negative_quanti
         candidate_group=request.candidate_group,
         portfolio_owner_id=request.portfolio_owner_id,
         source_position=request.source_position,
-        source_sale_quantity=Quantity(Decimal("0")),
-        source_sale_price=request.source_sale_price,
+        source_sale_quantity=Quantity(Decimal("1")),
+        source_sale_price=Decimal("0.01"),
         candidate=request.candidate,
         candidate_price=request.candidate_price,
         available_cash=Decimal("0"),
@@ -237,7 +242,7 @@ def test_sizing_rejects_a_protected_source_before_calculation() -> None:
         api.DeterministicSizingEngine().size(_request(api, source_role=PositionRole.PROTECTED_CORE))
 
 
-def test_sizing_rejects_source_identified_as_protected_by_the_plan_before_calculation() -> None:
+def test_sizing_rejects_position_that_the_plan_categorizes_as_protected_not_source() -> None:
     api = _api()
     request = _request(api)
     protected_plan = RotationPlan(
@@ -261,8 +266,29 @@ def test_sizing_rejects_source_identified_as_protected_by_the_plan_before_calcul
         configuration=request.configuration,
     )
 
-    with pytest.raises(ProtectedPositionSaleError):
+    with pytest.raises(UnauthorizedRotationSourceError):
         api.DeterministicSizingEngine().size(protected_request)
+
+
+def test_sizing_requires_an_explicit_plan_source_and_positive_sale_quantity() -> None:
+    api = _api()
+    request = _request(api)
+    ordinary_position = Position(
+        position_id=uuid4(),
+        portfolio_id=request.plan.portfolio_id,
+        instrument=InstrumentRef(uuid4()),
+        quantity=request.source_position.quantity,
+        role=PositionRole.NORMAL,
+        status=PositionStatus.OPEN,
+        opened_at=_created_at(),
+    )
+
+    with pytest.raises(UnauthorizedRotationSourceError, match="source"):
+        api.DeterministicSizingEngine().size(replace(request, source_position=ordinary_position))
+    with pytest.raises(NonPositiveSaleQuantityError, match="positive"):
+        api.DeterministicSizingEngine().size(
+            replace(request, source_sale_quantity=Quantity(Decimal("0")))
+        )
 
 
 def test_money_quantum_rounds_cost_audit_values_to_the_configured_increment() -> None:
@@ -453,8 +479,8 @@ def test_sizing_preserves_raw_cash_before_half_up_quantization_for_affordability
         candidate_group=request.candidate_group,
         portfolio_owner_id=request.portfolio_owner_id,
         source_position=request.source_position,
-        source_sale_quantity=Quantity(Decimal("0")),
-        source_sale_price=Decimal("0.04"),
+        source_sale_quantity=Quantity(Decimal("1")),
+        source_sale_price=Decimal("0.0001"),
         candidate=request.candidate,
         candidate_price=Decimal("0.04"),
         available_cash=Decimal("0.04"),
@@ -495,8 +521,8 @@ def test_sizing_enforces_raw_aggregate_requirement_after_stage_cost_rounding() -
         candidate_group=request.candidate_group,
         portfolio_owner_id=request.portfolio_owner_id,
         source_position=request.source_position,
-        source_sale_quantity=Quantity(Decimal("0")),
-        source_sale_price=Decimal("0.074"),
+        source_sale_quantity=Quantity(Decimal("1")),
+        source_sale_price=Decimal("0.0001"),
         candidate=request.candidate,
         candidate_price=Decimal("0.074"),
         available_cash=Decimal("0.21"),
@@ -535,11 +561,11 @@ def test_sizing_large_target_uses_exact_floor_and_bounded_adjustment() -> None:
         candidate_group=request.candidate_group,
         portfolio_owner_id=request.portfolio_owner_id,
         source_position=request.source_position,
-        source_sale_quantity=Quantity(Decimal("0")),
+        source_sale_quantity=Quantity(Decimal("1")),
         source_sale_price=Decimal("0.01"),
         candidate=request.candidate,
         candidate_price=Decimal("0.01"),
-        available_cash=Decimal("1E+28"),
+        available_cash=Decimal("9999999999999999999999999999.99"),
         configuration=configuration,
     )
     expected_quantity = Decimal("999999999999999999999999999999")

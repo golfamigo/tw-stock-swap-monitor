@@ -18,7 +18,8 @@ from app.domain.access import AccessContext
 from app.domain.entities import LogicalScanRun, Position, RotationPlan, ScanAttempt, StrategyRun
 from app.domain.enums import FinalizationDisposition, LogicalScanStatus, ScanAttemptStatus
 from app.domain.errors import DomainError
-from app.domain.values import ConfigurationSnapshotRef, require_timezone_aware
+from app.domain.invariants import ensure_authorized_rotation_source
+from app.domain.values import ConfigurationSnapshotRef, Quantity, require_timezone_aware
 from app.repositories.child_intents import ChildIntentRepository
 from app.repositories.configuration_snapshots import ConfigurationSnapshotRepository
 from app.repositories.locks import LockProvider, ScanLockRequest
@@ -30,8 +31,10 @@ from app.repositories.strategy_runs import StrategyRunRepository
 from app.services.rotation_run import RotationEvaluation, RotationEvaluator, RotationRunService
 from app.state_machine.states import (
     LegacyFinalizationClaimStatus,
+    RecommendationEvent,
     RecommendationState,
     RecommendationStateRecord,
+    SizingOutcome,
 )
 
 
@@ -330,6 +333,9 @@ class RunCoordinator:
                 sale_source = self._authoritative_sale_source(
                     evaluation=evaluation, plan=plan, access_context=request.access_context
                 )
+                sale_quantity = self._validated_sizing_sale(
+                    evaluation=evaluation, source_position=sale_source
+                )
                 prepared = self._run_service.build_strategy_run(
                     plan=plan,
                     snapshot=snapshot,
@@ -341,6 +347,7 @@ class RunCoordinator:
                     recommendation_state=recommendation_state,
                     evaluation=evaluation,
                     sale_source_position=sale_source,
+                    sale_quantity=sale_quantity,
                 )
                 stored_run = self._strategy_runs.record_or_get(
                     plan=plan,
@@ -456,9 +463,27 @@ class RunCoordinator:
         position = self._positions.get(
             evaluation.sale_source_position_id, access_context=access_context
         )
-        if position.portfolio_id != plan.portfolio_id:
-            raise RunCoordinatorInvariantError("sale source position does not belong to the plan")
+        ensure_authorized_rotation_source(plan, position)
         return position
+
+    @staticmethod
+    def _validated_sizing_sale(
+        *, evaluation: RotationEvaluation, source_position: Position | None
+    ) -> Quantity | None:
+        if evaluation.event is not RecommendationEvent.DECISION_VALIDATED:
+            return None
+        if evaluation.guards.sizing_outcome is not SizingOutcome.PASSED:
+            return None
+        if source_position is None:
+            raise RunCoordinatorInvariantError(
+                "passed sizing requires an authoritative source position"
+            )
+        sizing_result = evaluation.sizing_result
+        if sizing_result is None or not sizing_result.actionable:
+            raise RunCoordinatorInvariantError("passed sizing requires an actionable SizingResult")
+        if sizing_result.source_sale.source_position_id != source_position.position_id:
+            raise RunCoordinatorInvariantError("sizing evidence source position does not match")
+        return sizing_result.source_sale.quantity
 
     def _recover_pending_finalization(
         self,

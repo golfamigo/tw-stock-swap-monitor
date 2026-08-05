@@ -45,6 +45,14 @@ class SaleQuantityExceedsPositionError(DomainError):
     """A proposed sale would exceed the currently held quantity."""
 
 
+class NonPositiveSaleQuantityError(DomainError):
+    """A rotation sale quantity was zero or negative."""
+
+
+class UnauthorizedRotationSourceError(DomainError):
+    """A position was not explicitly authorized as a rotation plan sale source."""
+
+
 class PlanReferenceUnauthorizedError(DomainError):
     """A plan attempted to use a resource outside its ownership boundary."""
 

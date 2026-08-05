@@ -1,11 +1,13 @@
 """Pure transition table for recommendations, deliberately separate from execution."""
 
 from dataclasses import dataclass
-from uuid import UUID
 
-from app.domain.entities import Position
-from app.domain.enums import PositionRole
-from app.domain.errors import ProtectedPositionSaleError
+from app.domain.entities import Position, RotationPlan
+from app.domain.invariants import (
+    ensure_authorized_rotation_sale,
+    ensure_authorized_rotation_source,
+)
+from app.domain.values import Quantity
 from app.state_machine.states import (
     ConfirmationOutcome,
     DataOutcome,
@@ -37,9 +39,9 @@ class TransitionRequest:
     current_state: RecommendationState
     event: RecommendationEvent
     guards: TransitionGuards
-    protected_position_ids: tuple[UUID, ...] = ()
-    plan_portfolio_id: UUID | None = None
+    plan: RotationPlan
     sale_source_position: Position | None = None
+    sale_quantity: Quantity | None = None
     remaining_stages_halted: bool = False
 
     def __post_init__(self) -> None:
@@ -49,20 +51,21 @@ class TransitionRequest:
             raise TypeError("event must be a RecommendationEvent")
         if not isinstance(self.guards, TransitionGuards):
             raise TypeError("guards must be TransitionGuards")
-        protected_position_ids = tuple(self.protected_position_ids)
-        if any(not isinstance(position_id, UUID) for position_id in protected_position_ids):
-            raise TypeError("protected_position_ids must contain UUID values")
-        if len(set(protected_position_ids)) != len(protected_position_ids):
-            raise ValueError("protected_position_ids must be unique")
-        if self.plan_portfolio_id is not None and not isinstance(self.plan_portfolio_id, UUID):
-            raise TypeError("plan_portfolio_id must be a UUID or None")
+        if not isinstance(self.plan, RotationPlan):
+            raise TypeError("plan must be a RotationPlan")
         if self.sale_source_position is not None and not isinstance(
             self.sale_source_position, Position
         ):
             raise TypeError("sale_source_position must be a Position or None")
+        if self.sale_quantity is not None and not isinstance(self.sale_quantity, Quantity):
+            raise TypeError("sale_quantity must be a Quantity or None")
+        if self.sale_quantity is not None and (
+            self.event is not RecommendationEvent.DECISION_VALIDATED
+            or self.guards.sizing_outcome is not SizingOutcome.PASSED
+        ):
+            raise ValueError("sale_quantity only applies to passed sizing validation")
         if not isinstance(self.remaining_stages_halted, bool):
             raise TypeError("remaining_stages_halted must be a Boolean")
-        object.__setattr__(self, "protected_position_ids", protected_position_ids)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +96,7 @@ class StateMachine:
     def transition(self, request: TransitionRequest) -> TransitionResult:
         """Return the next recommendation state or raise a typed safety error."""
 
-        self._reject_protected_sale(request)
+        self._reject_unauthorized_sale_source(request)
         state = request.current_state
         event = request.event
         guards = request.guards
@@ -274,22 +277,22 @@ class StateMachine:
         raise TransitionNotAllowed("unsupported recommendation event")
 
     @classmethod
-    def _reject_protected_sale(cls, request: TransitionRequest) -> None:
+    def _reject_unauthorized_sale_source(cls, request: TransitionRequest) -> None:
         if request.event not in cls._ACTION_OR_SALE_EVENTS:
             return
         position = request.sale_source_position
         if position is None:
             raise TransitionNotAllowed("transition requires an authoritative sale source position")
+        ensure_authorized_rotation_source(request.plan, position)
         if (
-            request.plan_portfolio_id is not None
-            and position.portfolio_id != request.plan_portfolio_id
+            request.event is RecommendationEvent.DECISION_VALIDATED
+            and request.guards.sizing_outcome is SizingOutcome.PASSED
         ):
-            raise TransitionNotAllowed("sale source position does not belong to the rotation plan")
-        if (
-            position.role is PositionRole.PROTECTED_CORE
-            or position.position_id in request.protected_position_ids
-        ):
-            raise ProtectedPositionSaleError("protected positions are never eligible for sale")
+            if request.sale_quantity is None:
+                raise TransitionNotAllowed(
+                    "validated sizing requires an authoritative sale quantity"
+                )
+            ensure_authorized_rotation_sale(request.plan, position, request.sale_quantity)
 
     @staticmethod
     def _require(condition: bool, description: str) -> None:

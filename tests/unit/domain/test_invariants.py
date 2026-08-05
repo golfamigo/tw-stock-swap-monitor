@@ -8,13 +8,17 @@ from app.domain.enums import PositionRole, PositionStatus
 from app.domain.errors import (
     CandidateInstrumentUnauthorizedError,
     NonPositivePositionQuantityError,
+    NonPositiveSaleQuantityError,
     PlanReferenceUnauthorizedError,
     PositionAlreadyOpenError,
     PositionNotOpenError,
     ProtectedPositionSaleError,
     SaleQuantityExceedsPositionError,
+    UnauthorizedRotationSourceError,
 )
 from app.domain.invariants import (
+    ensure_authorized_rotation_sale,
+    ensure_authorized_rotation_source,
     ensure_candidate_instrument_is_authorized,
     ensure_open_position_representation_is_unique,
     ensure_plan_reference_is_authorized,
@@ -80,6 +84,66 @@ def test_sale_quantity_cannot_exceed_open_position_quantity() -> None:
 
     with pytest.raises(SaleQuantityExceedsPositionError):
         ensure_position_is_sellable(source, Quantity(Decimal("10.01")))
+
+
+def test_rotation_sale_source_must_be_explicitly_attached_to_the_plan() -> None:
+    portfolio_id = uuid4()
+    source = position(portfolio_id=portfolio_id, instrument_id=uuid4())
+    ordinary = position(portfolio_id=portfolio_id, instrument_id=uuid4())
+    rotation_plan = plan(
+        portfolio_id=portfolio_id,
+        group_ids=(uuid4(),),
+        source_position_id=source.position_id,
+    )
+
+    ensure_authorized_rotation_source(rotation_plan, source)
+
+    with pytest.raises(UnauthorizedRotationSourceError, match="source"):
+        ensure_authorized_rotation_source(rotation_plan, ordinary)
+
+
+def test_rotation_sale_source_must_be_open_and_never_protected() -> None:
+    portfolio_id = uuid4()
+    closed = position(
+        portfolio_id=portfolio_id,
+        instrument_id=uuid4(),
+        status=PositionStatus.CLOSED,
+    )
+    closed_plan = plan(
+        portfolio_id=portfolio_id,
+        group_ids=(uuid4(),),
+        source_position_id=closed.position_id,
+    )
+    protected = position(
+        portfolio_id=portfolio_id,
+        instrument_id=uuid4(),
+        role=PositionRole.PROTECTED_CORE,
+    )
+    protected_plan = plan(
+        portfolio_id=portfolio_id,
+        group_ids=(uuid4(),),
+        source_position_id=protected.position_id,
+    )
+
+    with pytest.raises(PositionNotOpenError):
+        ensure_authorized_rotation_source(closed_plan, closed)
+    with pytest.raises(ProtectedPositionSaleError):
+        ensure_authorized_rotation_source(protected_plan, protected)
+
+
+def test_authorized_rotation_sale_requires_positive_quantity_within_source_position() -> None:
+    portfolio_id = uuid4()
+    source = position(portfolio_id=portfolio_id, instrument_id=uuid4())
+    rotation_plan = plan(
+        portfolio_id=portfolio_id,
+        group_ids=(uuid4(),),
+        source_position_id=source.position_id,
+    )
+
+    with pytest.raises(NonPositiveSaleQuantityError):
+        ensure_authorized_rotation_sale(rotation_plan, source, Quantity(Decimal("0")))
+    with pytest.raises(SaleQuantityExceedsPositionError):
+        ensure_authorized_rotation_sale(rotation_plan, source, Quantity(Decimal("10.01")))
 
 
 def test_position_rejects_zero_quantity_while_generic_quantity_remains_valid() -> None:
