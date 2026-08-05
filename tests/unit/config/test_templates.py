@@ -195,6 +195,29 @@ def test_template_safety_reports_a_mapping_beyond_the_depth_limit_deterministica
     assert first_findings[0].endswith("exceeds the maximum nesting depth")
 
 
+def test_template_safety_allows_a_list_at_the_exact_depth_limit() -> None:
+    payload: object = []
+    for _ in range(MAX_TEMPLATE_SAFETY_DEPTH):
+        payload = [payload]
+
+    findings = tuple(_template_safety_findings(payload))
+
+    assert findings == ()
+
+
+def test_template_safety_reports_a_list_beyond_the_depth_limit_deterministically() -> None:
+    payload: object = []
+    for _ in range(MAX_TEMPLATE_SAFETY_DEPTH + 1):
+        payload = [payload]
+
+    first_findings = tuple(_template_safety_findings(payload))
+    second_findings = tuple(_template_safety_findings(payload))
+
+    assert first_findings == second_findings
+    assert len(first_findings) == 1
+    assert first_findings[0].endswith("exceeds the maximum nesting depth")
+
+
 @pytest.mark.parametrize("container_kind", ("mapping", "list"))
 def test_template_safety_allows_wide_containers_at_the_exact_node_limit(
     container_kind: str,
