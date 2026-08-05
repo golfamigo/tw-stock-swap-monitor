@@ -1,5 +1,6 @@
 services:
   api:
+    # API only: runtime configuration is supplied by the deployment environment.
     build: .
     ports:
       - "8000:8000"

@@ -4,6 +4,17 @@
 
 YAML is accepted only as a seed, development, test, export, or import template. Production execution reads a validated immutable configuration snapshot from PostgreSQL. A strategy run stores the complete merged snapshot, not only references to source profiles.
 
+## Generic seed templates
+
+The committed files in `config_templates/` are generic LayerPatchSchema seeds.
+They are intentionally non-operational: market data is mock-only, recommendation
+settings prohibit order, broker, and position mutation, and scoring/sizing remain
+disabled until a reviewed configuration-to-engine binding is introduced. They
+never contain real symbols, holdings, schedules, costs, notification recipients,
+secrets, or live credentials. The unit suite parses each YAML file and validates
+its permitted layer scope; it also parses the strategy seed with the constrained
+rule DSL so schema changes cannot silently drift from the templates.
+
 Each snapshot stores:
 
 ~~~text

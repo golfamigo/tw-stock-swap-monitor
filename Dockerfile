@@ -2,6 +2,9 @@ FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd
 
 WORKDIR /app
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 RUN addgroup --system appuser && adduser --system --ingroup appuser --no-create-home appuser
 
 COPY pyproject.toml README.md ./

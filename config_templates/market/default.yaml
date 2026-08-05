@@ -1,0 +1,4 @@
+settings:
+  market_data_mode: mock_only
+  live_market_data_enabled: false
+extensions: {}

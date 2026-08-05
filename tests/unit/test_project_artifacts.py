@@ -54,6 +54,17 @@ def test_container_uses_an_unprivileged_runtime_user() -> None:
     assert "USER appuser" in dockerfile
 
 
+def test_container_configuration_stays_environment_only_and_does_not_start_workers() -> None:
+    """Compose remains an API-only production artifact with no implicit secret file."""
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    compose = (PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+
+    assert "COPY . ." not in dockerfile
+    assert "env_file:" not in compose
+    assert "worker:" not in compose
+    assert "scheduler:" not in compose
+
+
 def test_setuptools_discovers_application_packages_explicitly() -> None:
     """Packaging configuration explicitly includes the application package tree."""
     with (PROJECT_ROOT / "pyproject.toml").open("rb") as pyproject_file:
