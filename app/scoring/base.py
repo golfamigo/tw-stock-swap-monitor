@@ -11,6 +11,7 @@ from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from app.domain.entities import CandidateGroup, RotationPlan
+from app.domain.evidence_payload import MAX_IDENTIFIER_UTF8_BYTES
 from app.domain.values import InstrumentRef, require_finite_decimal
 
 _DECIMAL_CONTEXT = Context(prec=28, rounding=ROUND_HALF_EVEN)
@@ -85,8 +86,7 @@ class FactorConfiguration:
     normalization: LinearNormalization
 
     def __post_init__(self) -> None:
-        if not isinstance(self.factor_id, str) or not self.factor_id.isidentifier():
-            raise ScoringError("factor_id must be a Python-identifier-like configured key")
+        _require_factor_identifier(self.factor_id, field_name="factor_id")
         require_finite_decimal(self.weight, field_name="factor weight")
         if self.weight <= Decimal("0"):
             raise ScoringError("factor weight must be positive")
@@ -130,8 +130,8 @@ class CandidateMetrics:
         if not isinstance(self.metrics, Mapping):
             raise TypeError("metrics must be a mapping")
         metrics = dict(self.metrics)
-        if any(not isinstance(key, str) or not key.isidentifier() for key in metrics):
-            raise ScoringError("metric keys must be configured identifier-like keys")
+        for key in metrics:
+            _require_factor_identifier(key, field_name="metric key")
         object.__setattr__(self, "metrics", MappingProxyType(metrics))
 
 
@@ -178,8 +178,7 @@ class FactorContribution:
     reason: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.factor_id, str) or not self.factor_id.isidentifier():
-            raise ScoringError("factor contribution requires a configured factor_id")
+        _require_factor_identifier(self.factor_id, field_name="factor contribution factor_id")
         if not isinstance(self.status, FactorScoreStatus):
             raise TypeError("status must be a FactorScoreStatus")
         require_finite_decimal(self.weight, field_name="factor contribution weight")
@@ -261,3 +260,11 @@ class ScoringEngine(Protocol):
 
     def score(self, request: ScoringRequest) -> ScoringResult:
         """Rank only candidates authorized by the supplied plan and candidate group."""
+
+
+def _require_factor_identifier(value: object, *, field_name: str) -> str:
+    if not isinstance(value, str) or not value.isidentifier():
+        raise ScoringError(f"{field_name} must be a Python-identifier-like configured key")
+    if len(value.encode("utf-8")) > MAX_IDENTIFIER_UTF8_BYTES:
+        raise ScoringError(f"{field_name} exceeds the {MAX_IDENTIFIER_UTF8_BYTES}-byte UTF-8 limit")
+    return value

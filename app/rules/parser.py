@@ -9,8 +9,11 @@ from decimal import ROUND_HALF_EVEN, Context, Decimal, InvalidOperation, localco
 
 from jsonschema import Draft202012Validator, ValidationError  # type: ignore[import-untyped]
 
+from app.domain.evidence_payload import CanonicalJsonSizeLimitError, measure_json_bytes
 from app.rules.schema import (
     MAX_AST_NODES,
+    MAX_DSL_EXPRESSION_UTF8_BYTES,
+    MAX_DSL_RULESET_UTF8_BYTES,
     MAX_EXPRESSION_DEPTH,
     MAX_RAW_TRANSPORT_DEPTH,
     MAX_RAW_TRANSPORT_NODES,
@@ -25,8 +28,11 @@ from app.rules.schema import (
     Rule,
     RuleSafetyError,
     RuleSemanticError,
+    RuleTextResourceLimitError,
     RuleTransportError,
     require_bounded_decimal,
+    require_rule_identifier,
+    require_rule_text,
 )
 
 _ALLOWED_OPERATORS = frozenset(
@@ -116,6 +122,11 @@ def validate_expression_transport(raw: object) -> None:
     """Apply the documented Draft 2020-12 JSON Schema before semantic validation."""
 
     _preflight_raw_expression(raw)
+    _measure_rule_text(
+        raw,
+        limit_bytes=MAX_DSL_EXPRESSION_UTF8_BYTES,
+        boundary="expression",
+    )
     try:
         _RULE_EXPRESSION_VALIDATOR.validate(raw)
     except ValidationError as error:
@@ -146,6 +157,7 @@ def parse_rule(raw: object) -> Rule:
     rule_id = raw["id"]
     if not isinstance(rule_id, str) or not rule_id.strip():
         raise RuleTransportError("rule id must be a non-blank string")
+    require_rule_identifier(rule_id, boundary="rule id")
     raw_weight = raw.get("weight", 1)
     if isinstance(raw_weight, bool) or not isinstance(raw_weight, int | float):
         raise RuleTransportError("rule weight must be a JSON number")
@@ -163,6 +175,12 @@ def parse_rules(raw_rules: object) -> tuple[Rule, ...]:
         raise RuleTransportError("rules must be a JSON array")
     if len(raw_rules) > MAX_RULESET_RULES:
         raise RuleSafetyError(f"ruleset rule count exceeds {MAX_RULESET_RULES}")
+    _preflight_raw_transport(raw_rules)
+    _measure_rule_text(
+        raw_rules,
+        limit_bytes=MAX_DSL_RULESET_UTF8_BYTES,
+        boundary="ruleset",
+    )
     rules: list[Rule] = []
     total_nodes = 0
     for raw_rule in raw_rules:
@@ -227,6 +245,12 @@ def validate_expression_ast(expression: Expression) -> None:
 def _preflight_raw_expression(raw: object) -> int:
     """Iteratively enforce raw JSON expression limits before recursive JSON Schema validation."""
 
+    return _preflight_raw_transport(raw)
+
+
+def _preflight_raw_transport(raw: object) -> int:
+    """Validate raw JSON string and tree limits before any schema traversal."""
+
     stack: list[tuple[object, int]] = [(raw, 1)]
     node_count = 0
     while stack:
@@ -237,14 +261,34 @@ def _preflight_raw_expression(raw: object) -> int:
         if node_count > MAX_RAW_TRANSPORT_NODES:
             raise RuleSafetyError(f"raw transport node count exceeds {MAX_RAW_TRANSPORT_NODES}")
         if isinstance(node, Mapping):
-            for child in reversed(tuple(node.values())):
+            for key, child in reversed(tuple(node.items())):
+                require_rule_text(key, boundary="object key")
                 stack.append((child, depth + 1))
             continue
         if isinstance(node, list):
             for child in reversed(node):
-                stack.append((child, depth))
+                stack.append((child, depth + 1))
             continue
+        if isinstance(node, tuple):
+            for child in reversed(node):
+                stack.append((child, depth + 1))
+            continue
+        if isinstance(node, str):
+            require_rule_text(node, boundary="literal")
     return node_count
+
+
+def _measure_rule_text(value: object, *, limit_bytes: int, boundary: str) -> int:
+    try:
+        return measure_json_bytes(value, limit_bytes=limit_bytes, boundary=boundary)
+    except CanonicalJsonSizeLimitError as error:
+        raise RuleTextResourceLimitError(
+            boundary=error.boundary,
+            limit_bytes=error.limit_bytes,
+            observed_at_least_bytes=error.observed_at_least_bytes,
+        ) from error
+    except (TypeError, ValueError) as error:
+        raise RuleTransportError("rule transport must be JSON-compatible") from error
 
 
 def _count_expression_ast_nodes(expression: Expression) -> int:

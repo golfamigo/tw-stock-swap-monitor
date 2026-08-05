@@ -10,6 +10,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import cast
 
+from app.domain.evidence_payload import CanonicalJsonSizeLimitError, measure_json_bytes
 from app.rules.evidence import (
     EvaluatedPath,
     EvidenceStatus,
@@ -18,10 +19,12 @@ from app.rules.evidence import (
     RuleEvidence,
     RulesetStatus,
     canonical_decimal,
+    evidence_value_payload,
 )
 from app.rules.parser import validate_expression_ast
 from app.rules.schema import (
     MAX_EVALUATION_STEPS,
+    MAX_RULE_INPUT_UTF8_BYTES,
     EvidenceKind,
     Expression,
     LiteralExpression,
@@ -31,6 +34,8 @@ from app.rules.schema import (
     ProtectedRuleInputError,
     Rule,
     RuleEvaluationError,
+    RuleEvidenceResourceLimitError,
+    require_rule_evidence_text,
 )
 
 _DECIMAL_CONTEXT = Context(prec=28, rounding=ROUND_HALF_EVEN)
@@ -61,7 +66,35 @@ class RuleInput:
             raise TypeError("purpose must be an EvaluationPurpose")
         if self.protected_source:
             raise ProtectedRuleInputError("a protected source cannot be used for rule evaluation")
-        object.__setattr__(self, "values", M0M1EvidenceRegistry.controlled_values(self.values))
+        normalized_values = M0M1EvidenceRegistry.controlled_values(self.values)
+        schema = M0M1EvidenceRegistry.schema()
+        evidence_payload: dict[str, object] = {}
+        for path, raw_value in normalized_values.items():
+            value = EvidenceValue(
+                kind=schema.kind_for(path),
+                value=cast(Decimal | bool | datetime | str | None, raw_value),
+            )
+            if path in {"market.provider", "market.snapshot_id"}:
+                assert isinstance(value.value, str)
+                require_rule_evidence_text(
+                    value.value,
+                    boundary=f"RuleInput {path}",
+                    identifier=True,
+                )
+            evidence_payload[path] = evidence_value_payload(value)
+        try:
+            measure_json_bytes(
+                {"values": evidence_payload},
+                limit_bytes=MAX_RULE_INPUT_UTF8_BYTES,
+                boundary="RuleInput",
+            )
+        except CanonicalJsonSizeLimitError as error:
+            raise RuleEvidenceResourceLimitError(
+                boundary=error.boundary,
+                limit_bytes=error.limit_bytes,
+                observed_at_least_bytes=error.observed_at_least_bytes,
+            ) from error
+        object.__setattr__(self, "values", normalized_values)
 
 
 @dataclass(slots=True)

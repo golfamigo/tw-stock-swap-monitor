@@ -10,6 +10,8 @@ from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
 
+from app.domain.evidence_payload import MAX_IDENTIFIER_UTF8_BYTES, MAX_STRING_UTF8_BYTES
+
 MAX_EXPRESSION_DEPTH = 16
 MAX_AST_NODES = 128
 MAX_RAW_TRANSPORT_DEPTH = 32
@@ -20,6 +22,10 @@ MAX_EVALUATION_STEPS = 512
 MAX_DECIMAL_COEFFICIENT_DIGITS = 256
 MAX_DECIMAL_ABSOLUTE_EXPONENT = 256
 MAX_DECIMAL_SERIALIZED_CHARACTERS = 512
+MAX_DSL_EXPRESSION_UTF8_BYTES = 128 * 1024
+MAX_DSL_RULESET_UTF8_BYTES = 128 * 1024
+MAX_RULE_INPUT_UTF8_BYTES = 128 * 1024
+MAX_RULE_EVALUATION_UTF8_BYTES = 128 * 1024
 
 _PATH_PATTERN = re.compile(
     r"^(source|candidate|market|run)\.[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$"
@@ -42,8 +48,48 @@ class RuleSafetyError(RuleSemanticError):
     """A fixed expression-depth or AST-size safety limit was exceeded."""
 
 
+class RuleTextResourceLimitError(RuleSafetyError):
+    """Rule transport text exceeded a fixed, non-truncating UTF-8 byte boundary."""
+
+    def __init__(
+        self,
+        *,
+        boundary: str,
+        limit_bytes: int,
+        observed_at_least_bytes: int,
+    ) -> None:
+        self.boundary = boundary
+        self.limit_bytes = limit_bytes
+        self.observed_at_least_bytes = observed_at_least_bytes
+        super().__init__(
+            "rule text resource limit exceeded: "
+            f"boundary={boundary}, limit_bytes={limit_bytes} "
+            f"({limit_bytes // 1024} KiB), observed_at_least_bytes={observed_at_least_bytes}"
+        )
+
+
 class RuleEvaluationError(RuleError):
     """Validated rules could not be evaluated against supplied evidence."""
+
+
+class RuleEvidenceResourceLimitError(RuleEvaluationError):
+    """Runtime rule evidence exceeded a fixed, non-truncating UTF-8 byte boundary."""
+
+    def __init__(
+        self,
+        *,
+        boundary: str,
+        limit_bytes: int,
+        observed_at_least_bytes: int,
+    ) -> None:
+        self.boundary = boundary
+        self.limit_bytes = limit_bytes
+        self.observed_at_least_bytes = observed_at_least_bytes
+        super().__init__(
+            "rule evidence resource limit exceeded: "
+            f"boundary={boundary}, limit_bytes={limit_bytes} "
+            f"({limit_bytes // 1024} KiB), observed_at_least_bytes={observed_at_least_bytes}"
+        )
 
 
 class ProtectedRuleInputError(RuleEvaluationError):
@@ -174,6 +220,7 @@ class Rule:
     def __post_init__(self) -> None:
         if not isinstance(self.rule_id, str) or not self.rule_id.strip():
             raise RuleSemanticError("rule id must be a non-blank string")
+        require_rule_identifier(self.rule_id, boundary="rule id")
         if not isinstance(self.weight, Decimal) or not self.weight.is_finite():
             raise RuleSemanticError("rule weight must be a finite Decimal")
         require_bounded_decimal(self.weight)
@@ -185,10 +232,75 @@ class Rule:
 
 
 def _validate_registered_path(path: object) -> None:
-    if not isinstance(path, str) or _PATH_PATTERN.fullmatch(path) is None:
+    require_rule_text(path, boundary="evidence path")
+    assert isinstance(path, str)
+    if _PATH_PATTERN.fullmatch(path) is None:
         raise RuleSemanticError("evidence paths must use an allowed root and identifier segments")
     if any(segment.startswith("__") for segment in path.split(".")):
         raise RuleSemanticError("dunder-style evidence paths are not permitted")
+
+
+def require_rule_text(value: object, *, boundary: str) -> str:
+    """Validate a general DSL string before schema validation can allocate it further."""
+
+    if not isinstance(value, str):
+        raise RuleSemanticError(f"{boundary} must be a string")
+    _require_utf8_limit(
+        value,
+        boundary=boundary,
+        limit_bytes=MAX_STRING_UTF8_BYTES,
+        error_type=RuleTextResourceLimitError,
+    )
+    return value
+
+
+def require_rule_identifier(value: object, *, boundary: str) -> str:
+    """Validate compact rule identifiers separately from general rule text."""
+
+    if not isinstance(value, str):
+        raise RuleSemanticError(f"{boundary} must be a string")
+    _require_utf8_limit(
+        value,
+        boundary=boundary,
+        limit_bytes=MAX_IDENTIFIER_UTF8_BYTES,
+        error_type=RuleTextResourceLimitError,
+    )
+    return value
+
+
+def require_rule_evidence_text(
+    value: object,
+    *,
+    boundary: str,
+    identifier: bool = False,
+) -> str:
+    """Validate runtime evidence text without reclassifying it as a missing value."""
+
+    if not isinstance(value, str):
+        raise RuleEvaluationError(f"{boundary} must be a string")
+    _require_utf8_limit(
+        value,
+        boundary=boundary,
+        limit_bytes=MAX_IDENTIFIER_UTF8_BYTES if identifier else MAX_STRING_UTF8_BYTES,
+        error_type=RuleEvidenceResourceLimitError,
+    )
+    return value
+
+
+def _require_utf8_limit(
+    value: str,
+    *,
+    boundary: str,
+    limit_bytes: int,
+    error_type: type[RuleTextResourceLimitError | RuleEvidenceResourceLimitError],
+) -> None:
+    observed_bytes = len(value.encode("utf-8"))
+    if observed_bytes > limit_bytes:
+        raise error_type(
+            boundary=boundary,
+            limit_bytes=limit_bytes,
+            observed_at_least_bytes=observed_bytes,
+        )
 
 
 def require_bounded_decimal(value: Decimal) -> Decimal:

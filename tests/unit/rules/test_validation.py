@@ -60,6 +60,27 @@ def test_parse_rules_rejects_duplicate_ids_and_non_decimal_scores() -> None:
         parse_rule({"id": "weighted", "weight": "not-a-number", "expression": True})
 
 
+def test_documented_rule_dsl_example_parses_against_the_m0_m1_registry() -> None:
+    documented_expression = {
+        "and": [
+            {
+                "lt": [
+                    {"var": "source.last_price"},
+                    {"var": "source.session_vwap"},
+                ]
+            },
+            {
+                "gte": [
+                    {"var": "source.same_time_volume_ratio"},
+                    1,
+                ]
+            },
+        ]
+    }
+
+    assert parse_expression(documented_expression).kind.value == "boolean"
+
+
 @pytest.mark.parametrize("purpose", [EvaluationPurpose.SELL, EvaluationPurpose.ACTION])
 def test_protected_source_is_rejected_before_sell_or_action_rule_evaluation(
     purpose: EvaluationPurpose,

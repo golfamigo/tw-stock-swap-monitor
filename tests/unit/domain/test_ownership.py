@@ -22,6 +22,7 @@ from app.domain.errors import (
     NonFiniteDecimalError,
     NotFoundForActor,
 )
+from app.domain.evidence_payload import MAX_STRING_UTF8_BYTES
 from app.domain.values import (
     ConfigurationSnapshotRef,
     InstrumentRef,
@@ -320,6 +321,40 @@ def test_strategy_run_rejects_active_container_cycles(cycle: object) -> None:
             market_data_snapshot_id="market-snapshot",
             state_transition="PENDING->ACTION_NOTIFIED",
             outputs={"cycle": cycle},
+            occurred_at=aware_at(),
+        )
+
+
+def test_strategy_run_rejects_over_depth_list_evidence_before_recursive_freeze() -> None:
+    nested: object = {"value": "safe"}
+    for _ in range(33):
+        nested = [nested]
+
+    with pytest.raises(InvalidStrategyRunEvidenceError, match="depth"):
+        StrategyRun(
+            strategy_run_id=uuid4(),
+            rotation_plan_id=uuid4(),
+            portfolio_id=uuid4(),
+            configuration_snapshot=ConfigurationSnapshotRef(uuid4(), "a" * 64, aware_at()),
+            market_data_snapshot_id="market-snapshot",
+            state_transition="PENDING->ACTION_NOTIFIED",
+            outputs={"nested": nested},
+            occurred_at=aware_at(),
+        )
+
+
+def test_strategy_run_rejects_oversized_encoded_outputs_before_persistence() -> None:
+    outputs = {f"entry_{index}": "a" * MAX_STRING_UTF8_BYTES for index in range(17)}
+
+    with pytest.raises(InvalidStrategyRunEvidenceError, match="StrategyRun.outputs"):
+        StrategyRun(
+            strategy_run_id=uuid4(),
+            rotation_plan_id=uuid4(),
+            portfolio_id=uuid4(),
+            configuration_snapshot=ConfigurationSnapshotRef(uuid4(), "a" * 64, aware_at()),
+            market_data_snapshot_id="market-snapshot",
+            state_transition="PENDING->ACTION_NOTIFIED",
+            outputs=outputs,
             occurred_at=aware_at(),
         )
 

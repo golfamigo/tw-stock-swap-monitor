@@ -23,6 +23,11 @@ from app.domain.errors import (
     PositionHistoryError,
     PositionNotOpenError,
 )
+from app.domain.evidence_payload import (
+    MAX_STRATEGY_RUN_OUTPUT_UTF8_BYTES,
+    measure_encoded_evidence_bytes,
+    preflight_evidence_payload,
+)
 from app.domain.values import (
     ConfigurationSnapshotRef,
     InstrumentRef,
@@ -251,10 +256,17 @@ class StrategyRun:
             raise ValueError("state_transition must not be blank")
         if not isinstance(self.outputs, Mapping):
             raise InvalidStrategyRunEvidenceError("outputs must be a mapping")
+        preflight_evidence_payload(self.outputs)
+        frozen_outputs = _freeze_evidence(self.outputs, active_container_ids=set())
+        measure_encoded_evidence_bytes(
+            frozen_outputs,
+            limit_bytes=MAX_STRATEGY_RUN_OUTPUT_UTF8_BYTES,
+            boundary="StrategyRun.outputs",
+        )
         object.__setattr__(
             self,
             "outputs",
-            _freeze_evidence(self.outputs, active_container_ids=set()),
+            frozen_outputs,
         )
 
     @property

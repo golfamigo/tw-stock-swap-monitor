@@ -11,6 +11,7 @@ import pytest
 from app.domain.entities import CandidateGroup, RotationPlan
 from app.domain.errors import CandidateInstrumentUnauthorizedError, NonDecimalValueError
 from app.domain.values import InstrumentRef
+from app.scoring.base import ScoringError
 
 
 def _api() -> Any:
@@ -22,9 +23,9 @@ def _created_at() -> datetime:
     return datetime(2026, 1, 5, 9, tzinfo=UTC)
 
 
-def _authorized_context() -> tuple[
-    RotationPlan, CandidateGroup, UUID, InstrumentRef, InstrumentRef
-]:
+def _authorized_context() -> (
+    tuple[RotationPlan, CandidateGroup, UUID, InstrumentRef, InstrumentRef]
+):
     owner_id = uuid4()
     first_candidate = InstrumentRef(UUID(int=1))
     second_candidate = InstrumentRef(UUID(int=2))
@@ -190,4 +191,61 @@ def test_scoring_rejects_float_factor_configuration_without_coercion() -> None:
             normalization=api.LinearNormalization(
                 lower_bound=Decimal("0"), upper_bound=Decimal("10")
             ),
+        )
+
+
+def test_scoring_factor_identifiers_have_a_fixed_utf8_byte_limit() -> None:
+    api = _api()
+    _, _, _, first_candidate, _ = _authorized_context()
+    exact_identifier = "f" * 256
+    over_limit_identifier = "f" * 257
+    normalization = api.LinearNormalization(lower_bound=Decimal("0"), upper_bound=Decimal("10"))
+
+    assert (
+        api.FactorConfiguration(
+            factor_id=exact_identifier,
+            weight=Decimal("1"),
+            direction=api.FactorDirection.HIGHER_IS_BETTER,
+            normalization=normalization,
+        ).factor_id
+        == exact_identifier
+    )
+    assert api.CandidateMetrics(
+        instrument=first_candidate,
+        metrics={exact_identifier: Decimal("1")},
+    ).metrics[exact_identifier] == Decimal("1")
+    assert (
+        api.FactorContribution(
+            factor_id=exact_identifier,
+            status=api.FactorScoreStatus.MISSING,
+            weight=Decimal("1"),
+            metric_value=None,
+            normalized_value=None,
+            contribution=None,
+            reason="unavailable",
+        ).factor_id
+        == exact_identifier
+    )
+
+    with pytest.raises(ScoringError, match="256"):
+        api.FactorConfiguration(
+            factor_id=over_limit_identifier,
+            weight=Decimal("1"),
+            direction=api.FactorDirection.HIGHER_IS_BETTER,
+            normalization=normalization,
+        )
+    with pytest.raises(ScoringError, match="256"):
+        api.CandidateMetrics(
+            instrument=first_candidate,
+            metrics={over_limit_identifier: Decimal("1")},
+        )
+    with pytest.raises(ScoringError, match="256"):
+        api.FactorContribution(
+            factor_id=over_limit_identifier,
+            status=api.FactorScoreStatus.MISSING,
+            weight=Decimal("1"),
+            metric_value=None,
+            normalized_value=None,
+            contribution=None,
+            reason="unavailable",
         )
