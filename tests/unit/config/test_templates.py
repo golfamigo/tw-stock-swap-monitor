@@ -23,11 +23,57 @@ MAX_TEMPLATE_SAFETY_TEXT_LENGTH = 512
 AUTOMATIC_EXECUTION_FLAG_KEYS = frozenset(
     {
         "automatic_order_submission_enabled",
-        "automatic_orders_enabled",
         "auto_trading_enabled",
-        "autotrading_enabled",
         "broker_mutation_enabled",
-        "order_submission_enabled",
+        "position_mutation_enabled",
+    }
+)
+ASSET_IDENTIFIER_KEY_NAMES = frozenset({"asset_symbol", "symbol", "ticker"})
+HOLDING_KEY_NAMES = frozenset({"holding", "holdings"})
+CREDENTIAL_KEY_NAMES = frozenset(
+    {
+        "access_key",
+        "access_token",
+        "admin_api_token",
+        "api_key",
+        "bearer_token",
+        "client_secret",
+        "credential",
+        "password",
+        "private_key",
+        "provider_api_key",
+        "provider_credential",
+        "refresh_token",
+        "secret",
+        "token",
+    }
+)
+NOTIFICATION_RECIPIENT_KEY_NAMES = frozenset(
+    {
+        "email_recipient",
+        "notification_destination",
+        "notification_destinations",
+        "notification_recipient",
+        "notification_recipients",
+        "recipient",
+        "recipients",
+        "webhook_destination",
+    }
+)
+NOTIFICATION_DESTINATION_KEY_NAMES = frozenset(
+    {
+        "notification_destination",
+        "notification_destinations",
+        "webhook_destination",
+    }
+)
+_CREDENTIAL_SUFFIXES = frozenset(
+    {
+        ("api", "key"),
+        ("credential",),
+        ("private", "key"),
+        ("secret",),
+        ("token",),
     }
 )
 
@@ -72,6 +118,58 @@ def test_template_safety_rejects_enabled_automatic_execution_flags(flag_key: str
     findings = tuple(_template_safety_findings(payload))
 
     assert any("automatic execution" in finding for finding in findings)
+
+
+@pytest.mark.parametrize("container_key", ("settings", "extensions"))
+def test_template_safety_rejects_enabled_hyphenated_automatic_execution_flags(
+    container_key: str,
+) -> None:
+    payload: dict[str, object] = {"settings": {}, "extensions": {}}
+    container = payload[container_key]
+    assert isinstance(container, dict)
+    container["auto-trading-enabled"] = True
+
+    findings = tuple(_template_safety_findings(payload))
+
+    assert any("automatic execution" in finding for finding in findings)
+
+
+def test_template_safety_rejects_enabled_position_mutation() -> None:
+    payload = {"settings": {"position_mutation_enabled": True}, "extensions": {}}
+
+    findings = tuple(_template_safety_findings(payload))
+
+    assert any("automatic execution" in finding for finding in findings)
+
+
+@pytest.mark.parametrize(
+    ("key", "expected_reason"),
+    (
+        ("api_key", "credential"),
+        ("private_key", "credential"),
+        ("notification_recipient", "notification recipient"),
+        ("notification_destination", "notification destination"),
+    ),
+)
+def test_template_safety_rejects_precise_sensitive_key_names(
+    key: str, expected_reason: str
+) -> None:
+    payload = {"settings": {}, "extensions": {"nested": [{key: "placeholder"}]}}
+
+    findings = tuple(_template_safety_findings(payload))
+
+    assert any(expected_reason in finding for finding in findings)
+
+
+def test_template_safety_allows_generic_token_and_recipient_count_keys() -> None:
+    payload = {
+        "settings": {"token_bucket_size": 10, "recipient_count": 0},
+        "extensions": {"nested": [{"token_bucket_size": 10, "recipient_count": 0}]},
+    }
+
+    findings = tuple(_template_safety_findings(payload))
+
+    assert findings == ()
 
 
 def test_template_safety_recursively_rejects_unsafe_keys_and_oversized_text() -> None:
@@ -133,8 +231,9 @@ def _template_safety_findings(value: object) -> Iterator[str]:
                     yield f"{_path_label(path)} contains a key exceeding the maximum length"
                     next_path = path + ("<oversized-key>",)
                 else:
-                    next_path = path + (key,)
-                    yield from _key_safety_findings(key, next_path)
+                    normalized_key = _normalized_key(key)
+                    next_path = path + (normalized_key,)
+                    yield from _key_safety_findings(normalized_key, next_path)
                 yield from visit(nested_value, next_path, depth + 1)
             return
 
@@ -153,34 +252,37 @@ def _template_safety_findings(value: object) -> Iterator[str]:
     yield from visit(value, (), 0)
 
 
-def _key_safety_findings(key: str, path: tuple[str | int, ...]) -> Iterator[str]:
-    normalized_key = key.casefold().replace("-", "_")
-    key_parts = frozenset(part for part in normalized_key.split("_") if part)
+def _normalized_key(key: str) -> str:
+    """Return the only key normalization used by the bounded traversal."""
+    return key.casefold().replace("-", "_")
+
+
+def _key_safety_findings(normalized_key: str, path: tuple[str | int, ...]) -> Iterator[str]:
     location = _path_label(path)
-    if {"live", "provider"} <= key_parts and key_parts & {
-        "credential",
-        "key",
-        "secret",
-        "token",
-    }:
+    if _provider_credential_environment(normalized_key) == "live":
         yield f"{location} is a live provider credential field"
-    elif {"production", "provider"} <= key_parts and key_parts & {
-        "credential",
-        "key",
-        "secret",
-        "token",
-    }:
+    elif _provider_credential_environment(normalized_key) == "production":
         yield f"{location} is a production provider credential field"
-    elif key_parts & {"symbol", "ticker"}:
+    elif normalized_key in ASSET_IDENTIFIER_KEY_NAMES:
         yield f"{location} is an asset symbol field"
-    elif key_parts & {"holding", "holdings"}:
+    elif normalized_key in HOLDING_KEY_NAMES:
         yield f"{location} is a holding field"
-    elif "recipient" in key_parts:
+    elif normalized_key in NOTIFICATION_DESTINATION_KEY_NAMES:
+        yield f"{location} is a notification destination field"
+    elif normalized_key in NOTIFICATION_RECIPIENT_KEY_NAMES:
         yield f"{location} is a notification recipient field"
-    elif key_parts & {"secret", "credential", "password", "token"}:
+    elif normalized_key in CREDENTIAL_KEY_NAMES:
         yield f"{location} is a secret or credential field"
-    elif {"api", "key"} <= key_parts or {"access", "key"} <= key_parts:
-        yield f"{location} is a credential field"
+
+
+def _provider_credential_environment(normalized_key: str) -> str | None:
+    parts = tuple(part for part in normalized_key.split("_") if part)
+    if len(parts) < 3 or parts[:2] not in {("live", "provider"), ("production", "provider")}:
+        return None
+    suffix_parts = parts[2:]
+    if not any(suffix_parts[: len(suffix)] == suffix for suffix in _CREDENTIAL_SUFFIXES):
+        return None
+    return parts[0]
 
 
 def _scalar_safety_findings(value: str, path: tuple[str | int, ...]) -> Iterator[str]:
@@ -190,24 +292,42 @@ def _scalar_safety_findings(value: str, path: tuple[str | int, ...]) -> Iterator
         return
 
     normalized_value = value.casefold()
+    value_parts = _normalized_value_parts(normalized_value)
     if normalized_value in {"aapl", "2330", "2330.tw"}:
         yield f"{location} contains a real asset symbol"
-    elif "holding" in normalized_value.split() or "holdings" in normalized_value.split():
+    elif any(part in HOLDING_KEY_NAMES for part in value_parts):
         yield f"{location} contains a holding"
     elif "@" in normalized_value and "." in normalized_value.rsplit("@", maxsplit=1)[-1]:
         yield f"{location} contains a notification recipient"
-    elif "live_provider_" in normalized_value and any(
-        marker in normalized_value for marker in ("api_key", "credential", "secret", "token")
-    ):
+    elif _provider_credential_environment("_".join(value_parts)) == "live":
         yield f"{location} contains a live provider credential"
-    elif "production_provider_" in normalized_value and any(
-        marker in normalized_value for marker in ("api_key", "credential", "secret", "token")
-    ):
+    elif _provider_credential_environment("_".join(value_parts)) == "production":
         yield f"{location} contains a production provider credential"
-    elif "secret" in normalized_value:
+    elif any(part in {"secret", "credential", "password"} for part in value_parts):
         yield f"{location} contains a secret"
-    elif "automatic order submission enabled" in normalized_value:
+    elif _has_value_phrase(value_parts, ("api", "key")) or _has_value_phrase(
+        value_parts, ("private", "key")
+    ):
+        yield f"{location} contains a credential"
+    elif _has_value_phrase(value_parts, ("notification", "recipient")):
+        yield f"{location} contains a notification recipient"
+    elif _has_value_phrase(value_parts, ("notification", "destination")):
+        yield f"{location} contains a notification destination"
+    elif _has_value_phrase(value_parts, ("automatic", "order", "submission", "enabled")):
         yield f"{location} enables automatic execution"
+
+
+def _normalized_value_parts(value: str) -> tuple[str, ...]:
+    normalized = value
+    for separator in ("-", "_", "=", ":", "/", "."):
+        normalized = normalized.replace(separator, " ")
+    return tuple(part for part in normalized.split() if part)
+
+
+def _has_value_phrase(value_parts: tuple[str, ...], phrase: tuple[str, ...]) -> bool:
+    return any(
+        value_parts[index : index + len(phrase)] == phrase for index in range(len(value_parts))
+    )
 
 
 def _is_automatic_execution_path(path: tuple[str | int, ...]) -> bool:
