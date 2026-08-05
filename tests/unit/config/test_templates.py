@@ -28,8 +28,20 @@ AUTOMATIC_EXECUTION_FLAG_KEYS = frozenset(
         "position_mutation_enabled",
     }
 )
-ASSET_IDENTIFIER_KEY_NAMES = frozenset({"asset_symbol", "symbol", "ticker"})
-HOLDING_KEY_NAMES = frozenset({"holding", "holdings"})
+SEMANTIC_ASSET_KEY_NAMES = frozenset(
+    {
+        "asset_symbol",
+        "holding",
+        "holding_position",
+        "instrument",
+        "position",
+        "symbol",
+        "ticker",
+    }
+)
+GENERIC_PLACEHOLDER_ASSET_SUFFIXES = frozenset(
+    {"asset", "holding", "instrument", "position", "symbol", "ticker"}
+)
 CREDENTIAL_KEY_NAMES = frozenset(
     {
         "access_key",
@@ -81,10 +93,9 @@ _CREDENTIAL_SUFFIXES = frozenset(
 @pytest.mark.parametrize(
     ("unsafe_value", "expected_reason"),
     (
-        ("AAPL", "real asset symbol"),
-        ("personal holding", "holding"),
+        ("ABC", "ticker-style asset identifier"),
         ("recipient@example.test", "recipient"),
-        ("test-secret-value", "secret"),
+        ("api_key=placeholder", "credential"),
         ("live_provider_api_key=placeholder", "live provider credential"),
         ("automatic order submission enabled", "automatic execution"),
     ),
@@ -140,6 +151,77 @@ def test_template_safety_rejects_enabled_position_mutation() -> None:
     findings = tuple(_template_safety_findings(payload))
 
     assert any("automatic execution" in finding for finding in findings)
+
+
+@pytest.mark.parametrize("container_key", ("settings", "extensions"))
+@pytest.mark.parametrize("flag_key", tuple(sorted(AUTOMATIC_EXECUTION_FLAG_KEYS)))
+@pytest.mark.parametrize("unsafe_value", ("true", 1, 0, "enabled"))
+def test_template_safety_rejects_any_non_false_automatic_execution_flag_value(
+    container_key: str, flag_key: str, unsafe_value: object
+) -> None:
+    payload: dict[str, object] = {"settings": {}, "extensions": {}}
+    container = payload[container_key]
+    assert isinstance(container, dict)
+    container[flag_key] = unsafe_value
+
+    findings = tuple(_template_safety_findings(payload))
+
+    assert any("automatic execution" in finding for finding in findings)
+
+
+@pytest.mark.parametrize("container_key", ("settings", "extensions"))
+def test_template_safety_allows_only_literal_false_automatic_execution_flag_values(
+    container_key: str,
+) -> None:
+    payload: dict[str, object] = {"settings": {}, "extensions": {}}
+    container = payload[container_key]
+    assert isinstance(container, dict)
+    for flag_key in AUTOMATIC_EXECUTION_FLAG_KEYS:
+        container[flag_key] = False
+
+    findings = tuple(_template_safety_findings(payload))
+
+    assert findings == ()
+
+
+@pytest.mark.parametrize(
+    "asset_key", ("symbol", "ticker", "instrument", "holding", "holding_position", "position")
+)
+def test_template_safety_rejects_non_placeholder_values_for_semantic_asset_keys(
+    asset_key: str,
+) -> None:
+    payload = {"settings": {asset_key: "ABC"}, "extensions": {}}
+
+    findings = tuple(_template_safety_findings(payload))
+
+    assert any("placeholder asset value" in finding for finding in findings)
+
+
+def test_template_safety_allows_explicit_generic_placeholder_asset_values() -> None:
+    payload = {
+        "settings": {"symbol": "placeholder-asset"},
+        "extensions": {"instrument": "placeholder-instrument"},
+    }
+
+    findings = tuple(_template_safety_findings(payload))
+
+    assert findings == ()
+
+
+def test_template_safety_allows_explanatory_generic_prose() -> None:
+    payload = {
+        "settings": {
+            "generic_note": "A holding and credential policy is explanatory, not a value."
+        },
+        "extensions": {
+            "explanation": "A secret boundary may be documented without embedding a secret."
+        },
+        "nullable_note": "This generic note does not identify a recipient or position.",
+    }
+
+    findings = tuple(_template_safety_findings(payload))
+
+    assert findings == ()
 
 
 @pytest.mark.parametrize(
@@ -314,7 +396,7 @@ def _template_safety_findings(value: object) -> Iterator[str]:
                 else:
                     normalized_key = _normalized_key(key)
                     next_path = path + (normalized_key,)
-                    yield from _key_safety_findings(normalized_key, next_path)
+                    yield from _key_safety_findings(normalized_key, nested_value, next_path)
                 yield from visit(nested_value, next_path, depth + 1)
             return
 
@@ -327,8 +409,6 @@ def _template_safety_findings(value: object) -> Iterator[str]:
 
         if isinstance(current, str):
             yield from _scalar_safety_findings(current, path)
-        elif current is True and _is_automatic_execution_path(path):
-            yield f"{_path_label(path)} enables automatic execution"
 
     yield from visit(value, (), 0)
 
@@ -338,16 +418,20 @@ def _normalized_key(key: str) -> str:
     return key.casefold().replace("-", "_")
 
 
-def _key_safety_findings(normalized_key: str, path: tuple[str | int, ...]) -> Iterator[str]:
+def _key_safety_findings(
+    normalized_key: str, value: object, path: tuple[str | int, ...]
+) -> Iterator[str]:
     location = _path_label(path)
-    if _provider_credential_environment(normalized_key) == "live":
+    if normalized_key in SEMANTIC_ASSET_KEY_NAMES:
+        if not _is_generic_placeholder_asset_value(value):
+            yield f"{location} requires an explicit generic placeholder asset value"
+    elif _is_automatic_execution_path(path):
+        if type(value) is not bool or value is not False:
+            yield f"{location} enables automatic execution or mutation"
+    elif _provider_credential_environment(normalized_key) == "live":
         yield f"{location} is a live provider credential field"
     elif _provider_credential_environment(normalized_key) == "production":
         yield f"{location} is a production provider credential field"
-    elif normalized_key in ASSET_IDENTIFIER_KEY_NAMES:
-        yield f"{location} is an asset symbol field"
-    elif normalized_key in HOLDING_KEY_NAMES:
-        yield f"{location} is a holding field"
     elif normalized_key in NOTIFICATION_DESTINATION_KEY_NAMES:
         yield f"{location} is a notification destination field"
     elif normalized_key in NOTIFICATION_RECIPIENT_KEY_NAMES:
@@ -366,36 +450,54 @@ def _provider_credential_environment(normalized_key: str) -> str | None:
     return parts[0]
 
 
+def _is_generic_placeholder_asset_value(value: object) -> bool:
+    if type(value) is not str or not value.startswith("placeholder-"):
+        return False
+    return value.removeprefix("placeholder-") in GENERIC_PLACEHOLDER_ASSET_SUFFIXES
+
+
 def _scalar_safety_findings(value: str, path: tuple[str | int, ...]) -> Iterator[str]:
     location = _path_label(path)
     if len(value) > MAX_TEMPLATE_SAFETY_TEXT_LENGTH:
         yield f"{location} exceeds the maximum length"
         return
 
+    if _is_bare_ticker_style_scalar(value):
+        yield f"{location} contains a ticker-style asset identifier"
+        return
+
     normalized_value = value.casefold()
     value_parts = _normalized_value_parts(normalized_value)
-    if normalized_value in {"aapl", "2330", "2330.tw"}:
-        yield f"{location} contains a real asset symbol"
-    elif any(part in HOLDING_KEY_NAMES for part in value_parts):
-        yield f"{location} contains a holding"
-    elif "@" in normalized_value and "." in normalized_value.rsplit("@", maxsplit=1)[-1]:
+    assignment_key = _explicit_assignment_key(value)
+    if "@" in normalized_value and "." in normalized_value.rsplit("@", maxsplit=1)[-1]:
         yield f"{location} contains a notification recipient"
-    elif _provider_credential_environment("_".join(value_parts)) == "live":
+    elif assignment_key is not None and _provider_credential_environment(assignment_key) == "live":
         yield f"{location} contains a live provider credential"
-    elif _provider_credential_environment("_".join(value_parts)) == "production":
-        yield f"{location} contains a production provider credential"
-    elif any(part in {"secret", "credential", "password"} for part in value_parts):
-        yield f"{location} contains a secret"
-    elif _has_value_phrase(value_parts, ("api", "key")) or _has_value_phrase(
-        value_parts, ("private", "key")
+    elif (
+        assignment_key is not None
+        and _provider_credential_environment(assignment_key) == "production"
     ):
+        yield f"{location} contains a production provider credential"
+    elif assignment_key in CREDENTIAL_KEY_NAMES:
         yield f"{location} contains a credential"
-    elif _has_value_phrase(value_parts, ("notification", "recipient")):
+    elif assignment_key in NOTIFICATION_RECIPIENT_KEY_NAMES - NOTIFICATION_DESTINATION_KEY_NAMES:
         yield f"{location} contains a notification recipient"
-    elif _has_value_phrase(value_parts, ("notification", "destination")):
+    elif assignment_key in NOTIFICATION_DESTINATION_KEY_NAMES:
         yield f"{location} contains a notification destination"
     elif _has_value_phrase(value_parts, ("automatic", "order", "submission", "enabled")):
         yield f"{location} enables automatic execution"
+
+
+def _is_bare_ticker_style_scalar(value: str) -> bool:
+    return value.isascii() and value.isalpha() and value.isupper() and 1 <= len(value) <= 5
+
+
+def _explicit_assignment_key(value: str) -> str | None:
+    for separator in ("=", ":"):
+        raw_key, marker, raw_value = value.partition(separator)
+        if marker and raw_key.strip() and raw_value.strip():
+            return _normalized_key(raw_key.strip())
+    return None
 
 
 def _normalized_value_parts(value: str) -> tuple[str, ...]:
