@@ -11,6 +11,7 @@ from app.schemas.common import ConfigurationLayerScope
 from app.schemas.configuration import LayerPatchSchema, ResolvedConfigurationSchema
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+SYNTHETIC_TICKER_SHAPED_TOKEN = "".join(("A", "B", "C"))
 TEMPLATE_SCOPES = {
     "config_templates/market/default.yaml": ConfigurationLayerScope.MARKET,
     "config_templates/strategy/default.yaml": ConfigurationLayerScope.STRATEGY,
@@ -42,6 +43,7 @@ SEMANTIC_ASSET_KEY_NAMES = frozenset(
 GENERIC_PLACEHOLDER_ASSET_SUFFIXES = frozenset(
     {"asset", "holding", "instrument", "position", "symbol", "ticker"}
 )
+GENERIC_CODE_KEY_NAMES = frozenset({"currency", "format"})
 CREDENTIAL_KEY_NAMES = frozenset(
     {
         "access_key",
@@ -93,7 +95,7 @@ _CREDENTIAL_SUFFIXES = frozenset(
 @pytest.mark.parametrize(
     ("unsafe_value", "expected_reason"),
     (
-        ("ABC", "ticker-style asset identifier"),
+        (SYNTHETIC_TICKER_SHAPED_TOKEN, "ticker-style asset identifier"),
         ("recipient@example.test", "recipient"),
         ("api_key=placeholder", "credential"),
         ("live_provider_api_key=placeholder", "live provider credential"),
@@ -190,7 +192,7 @@ def test_template_safety_allows_only_literal_false_automatic_execution_flag_valu
 def test_template_safety_rejects_non_placeholder_values_for_semantic_asset_keys(
     asset_key: str,
 ) -> None:
-    payload = {"settings": {asset_key: "ABC"}, "extensions": {}}
+    payload = {"settings": {asset_key: SYNTHETIC_TICKER_SHAPED_TOKEN}, "extensions": {}}
 
     findings = tuple(_template_safety_findings(payload))
 
@@ -202,6 +204,35 @@ def test_template_safety_allows_explicit_generic_placeholder_asset_values() -> N
         "settings": {"symbol": "placeholder-asset"},
         "extensions": {"instrument": "placeholder-instrument"},
     }
+
+    findings = tuple(_template_safety_findings(payload))
+
+    assert findings == ()
+
+
+@pytest.mark.parametrize("container_key", ("settings", "extensions"))
+def test_template_safety_rejects_ticker_shaped_code_below_a_neutral_key(
+    container_key: str,
+) -> None:
+    payload: dict[str, object] = {"settings": {}, "extensions": {}}
+    container = payload[container_key]
+    assert isinstance(container, dict)
+    container["generic_code"] = SYNTHETIC_TICKER_SHAPED_TOKEN
+
+    findings = tuple(_template_safety_findings(payload))
+
+    assert any("ticker-style asset identifier" in finding for finding in findings)
+
+
+@pytest.mark.parametrize(("code_key", "code_value"), (("currency", "USD"), ("format", "JSON")))
+@pytest.mark.parametrize("container_key", ("settings", "extensions"))
+def test_template_safety_allows_uppercase_generic_codes_in_named_code_contexts(
+    code_key: str, code_value: str, container_key: str
+) -> None:
+    payload: dict[str, object] = {"settings": {}, "extensions": {}}
+    container = payload[container_key]
+    assert isinstance(container, dict)
+    container[code_key] = code_value
 
     findings = tuple(_template_safety_findings(payload))
 
@@ -462,7 +493,7 @@ def _scalar_safety_findings(value: str, path: tuple[str | int, ...]) -> Iterator
         yield f"{location} exceeds the maximum length"
         return
 
-    if _is_bare_ticker_style_scalar(value):
+    if _is_bare_ticker_style_scalar(value) and not _is_named_generic_code_path(path):
         yield f"{location} contains a ticker-style asset identifier"
         return
 
@@ -490,6 +521,10 @@ def _scalar_safety_findings(value: str, path: tuple[str | int, ...]) -> Iterator
 
 def _is_bare_ticker_style_scalar(value: str) -> bool:
     return value.isascii() and value.isalpha() and value.isupper() and 1 <= len(value) <= 5
+
+
+def _is_named_generic_code_path(path: tuple[str | int, ...]) -> bool:
+    return bool(path) and isinstance(path[-1], str) and path[-1] in GENERIC_CODE_KEY_NAMES
 
 
 def _explicit_assignment_key(value: str) -> str | None:
