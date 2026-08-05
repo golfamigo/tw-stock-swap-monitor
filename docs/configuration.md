@@ -4,6 +4,17 @@
 
 YAML is accepted only as a seed, development, test, export, or import template. Production execution reads a validated immutable configuration snapshot from PostgreSQL. A strategy run stores the complete merged snapshot, not only references to source profiles.
 
+## Generic seed templates
+
+The committed files in `config_templates/` are generic LayerPatchSchema seeds.
+They are intentionally non-operational: market data is mock-only, recommendation
+settings prohibit order, broker, and position mutation, and scoring/sizing remain
+disabled until a reviewed configuration-to-engine binding is introduced. They
+never contain real symbols, holdings, schedules, costs, notification recipients,
+secrets, or live credentials. The unit suite parses each YAML file and validates
+its permitted layer scope; it also parses the strategy seed with the constrained
+rule DSL so schema changes cannot silently drift from the templates.
+
 Each snapshot stores:
 
 ~~~text
@@ -11,13 +22,13 @@ config_version       monotonic version for its target resource
 content_hash         SHA-256 of canonical format version and merged payload
 created_at           timezone-aware timestamp
 created_by           user or system principal
-parent_versions      ordered references and hashes of contributing layers
+parent_versions      ordered references, hashes, and hash-format versions of contributing layers
 merged_payload       validated fully resolved configuration
 scope and owner_id   ownership of the snapshot target
 runtime_expires_at   required for a runtime override; otherwise null
 ~~~
 
-The content hash is calculated only after final validation and canonical serialization. A run stores snapshot ID, content hash, parent versions, and the embedded merged payload so a decision remains reproducible after later settings change.
+The content hash is calculated only after final validation and canonical serialization. Before a layer can contribute, its sparse patch is normalized with `mode="python"`, `by_alias=True`, and `exclude_unset=True`; its versioned canonical hash must match the supplied layer hash. Delete directives therefore enter parent evidence only as the stable `$delete` alias. A run stores snapshot ID, content hash, parent versions, and the embedded merged payload so a decision remains reproducible after later settings change.
 
 ## Schema separation
 
@@ -62,7 +73,7 @@ Values normalize as follows:
 | integer / Boolean / null | JSON primitive; Boolean is never treated as an integer |
 | string | NFC-normalized JSON string encoded without ASCII escaping |
 
-Floats, NaN, positive/negative infinity, sets, bytes, arbitrary objects, and naive datetimes are rejected at canonicalization. Thus numerically equal Decimal values such as 1.0 and 1.00 hash identically. The hash input is UTF-8 bytes of canonical format version, one zero-byte delimiter, and canonical JSON; SHA-256 of those bytes is content_hash. A canonicalization change requires a new format version and never silently re-hashes historical snapshots.
+Floats, NaN, positive/negative infinity, sets, bytes, arbitrary objects, and naive datetimes are rejected at canonicalization. Thus numerically equal Decimal values such as 1.0 and 1.00 hash identically. The hash input is UTF-8 bytes of canonical format version, one zero-byte delimiter, and canonical JSON; SHA-256 of those bytes is content_hash. Parent evidence carries the exact hash format version. A resolver rejects an unsupported layer format rather than silently treating it as the current format. A canonicalization change requires a new format version and never silently re-hashes historical snapshots.
 
 ## Configuration ownership and errors
 

@@ -72,7 +72,23 @@ The schema is a transport-level guard. A second semantic validator checks arity,
 
 ## Evaluation constraints
 
-The engine enforces a maximum expression depth of 16, at most 128 AST nodes, and a monotonic evaluation budget. These are non-configurable safety invariants. Missing path values yield MISSING evidence and make that rule neither matched nor failed; they never coerce to zero, empty string, or false. A ruleset aggregation can be INSUFFICIENT when missing evidence means its threshold cannot be evaluated safely.
+The engine enforces a maximum expression depth of 16, at most 128 semantic AST nodes, a ruleset maximum of 512 rules and 512 aggregate semantic AST nodes, and a monotonic 512-step evaluation budget. Before Draft 2020-12 validation, a separate iterative raw-transport preflight limits all JSON Mapping and list subtrees to depth 32 and 512 nodes; both mapping and list children increase depth. This is deliberately larger than the semantic AST budget so valid 16-depth/128-node expressions remain valid. These are non-configurable safety invariants. Decimal evidence, arithmetic results, and scores are limited to 256 coefficient digits, an absolute exponent of 256, and a maximum 512-character canonical form before capture. Missing path values yield MISSING evidence and make that rule neither matched nor failed; they never coerce to zero, empty string, or false. A ruleset aggregation can be INSUFFICIENT when missing evidence means its threshold cannot be evaluated safely.
+
+## UTF-8 resource boundaries
+
+All limits use UTF-8 byte length, not Python character count. The canonical JSON counters use sorted keys, compact separators, `ensure_ascii=False`, and `allow_nan=False`, then count `JSONEncoder.iterencode()` chunks incrementally. JSON keys, quotation marks, escaping, brackets, and separators are included. Counters stop at the first chunk that exceeds the limit and return typed errors containing only the boundary name, limit, and observed-at-least byte count. They do not truncate, summarize, compress, or produce a missing/actionable substitute.
+
+| Boundary | Maximum |
+| --- | ---: |
+| Identifier (`rule_id`, factor ID, stage ID, provider/snapshot identifier evidence) | 256 UTF-8 bytes |
+| General string literal or runtime evidence string | 16 KiB UTF-8 |
+| One DSL expression canonical JSON | 128 KiB UTF-8 |
+| Complete DSL ruleset canonical JSON | 128 KiB UTF-8 |
+| Normalized `RuleInput` canonical payload | 128 KiB UTF-8 |
+| Complete `RuleEvaluation` audit evidence | 128 KiB UTF-8 |
+| Complete `StrategyRun.outputs` reversible evidence envelope | 256 KiB UTF-8 |
+
+The DSL validates text and complete transport payloads before JSON Schema traversal. Runtime evidence validates the same bounds after its registered path and typed value have been normalized. A limit exceedance is a typed resource-limit error, never `MISSING`, `False`, zero, or an actionable result. The application/API pre-parser HTTP request-body limit is deliberately deferred to Task 10; these limits protect validated payloads after parsing and do not replace an HTTP gateway limit.
 
 ## Evidence result
 
@@ -84,7 +100,7 @@ Each RuleEvaluation includes result status, total score, threshold, matched rule
 {
   "and": [
     { "lt": [{ "var": "source.last_price" }, { "var": "source.session_vwap" }] },
-    { "gte": [{ "var": "source.scans_below_vwap" }, { "var": "source.required_below_scans" }] }
+    { "gte": [{ "var": "source.same_time_volume_ratio" }, 1] }
   ]
 }
 ~~~

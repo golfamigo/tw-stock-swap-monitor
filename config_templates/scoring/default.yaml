@@ -1,0 +1,4 @@
+settings:
+  scoring_mode: disabled_until_configured
+  deterministic_ranking_only: true
+extensions: {}

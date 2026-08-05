@@ -1,0 +1,1 @@
+"""Concrete market-data adapters."""

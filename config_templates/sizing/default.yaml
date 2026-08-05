@@ -1,0 +1,4 @@
+settings:
+  sizing_mode: disabled_until_configured
+  recommendation_only: true
+extensions: {}

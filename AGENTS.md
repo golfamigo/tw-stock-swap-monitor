@@ -1,12 +1,24 @@
 # Project Agent Instructions
 
-## Non-negotiable safety
+## Safety and testing
 
-- The system must not submit brokerage orders or store broker credentials.
-- Never hard-code asset symbols, holdings, thresholds, schedules, allocation stages, costs, model names, or notification destinations. Use validated configuration.
-- Keep domain logic independent from FastAPI, Pydantic, SQLAlchemy, and infrastructure adapters.
-- Treat all external data and LLM output as untrusted; preserve audit evidence and enforce deterministic invariants.
+- This is recommendation-only software: never submit orders, add broker access,
+  mutate positions, or enable real market data in M0/M1.
+- Use generic, deterministic fixtures only. Do not place real symbols, holdings,
+  schedules, costs, notification destinations, credentials, tokens, or secrets
+  in source, templates, test data, logs, or documentation.
+- Keep `.local.env` local and ignored. Read runtime values from environment
+  variables; Zeabur production values belong only in Zeabur environment settings.
+- Before claiming a change passes, run the relevant tests plus `mypy app tests`,
+  `ruff check .`, `ruff format --check .`, and `git diff --check` when the task
+  calls for the full quality gate.
 
-## GitHub identity procedure
+## Boundaries and GitHub identity
 
-The GitHub CLI normally uses the local account jctixtw-star. Before any GitHub write operation for golfamigo/tw-stock-swap-monitor, switch explicitly to the golfamigo account and verify the active account. Immediately after the operation, switch back to jctixtw-star and verify the restoration. Never expose tokens, credential values, or keyring contents in output.
+- Keep domain logic independent from FastAPI, Pydantic, SQLAlchemy, and
+  infrastructure adapters. Treat external data and LLM output as untrusted and
+  preserve deterministic audit evidence.
+- Do not perform GitHub writes without explicit authorization. Before an
+  authorized `gh` write for `golfamigo/tw-stock-swap-monitor`, switch to and
+  verify the `golfamigo` account; afterwards restore and verify
+  `jctixtw-star`. Never expose tokens, credential values, or keyring contents.

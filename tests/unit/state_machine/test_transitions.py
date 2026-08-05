@@ -1,0 +1,419 @@
+"""State-transition safety contracts for recommendation lifecycle only."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from decimal import Decimal
+from uuid import UUID
+
+import pytest
+from app.domain.entities import Position, RotationPlan
+from app.domain.enums import PositionRole, PositionStatus
+from app.domain.errors import (
+    NonPositiveSaleQuantityError,
+    PositionNotOpenError,
+    ProtectedPositionSaleError,
+    UnauthorizedRotationSourceError,
+)
+from app.domain.values import InstrumentRef, Quantity
+from app.state_machine.machine import (
+    StateMachine,
+    TransitionGuards,
+    TransitionRequest,
+    TransitionResult,
+)
+from app.state_machine.states import (
+    DataOutcome,
+    LegacyFinalizationClaimStatus,
+    RecommendationEvent,
+    RecommendationState,
+    RecommendationStateRecord,
+    RuleOutcome,
+    SizingOutcome,
+    TransitionNotAllowed,
+)
+
+PROTECTED_POSITION_ID = UUID("00000000-0000-0000-0000-000000000701")
+PORTFOLIO_ID = UUID("00000000-0000-0000-0000-000000000702")
+INSTRUMENT_ID = UUID("00000000-0000-0000-0000-000000000703")
+SAFE_POSITION_ID = UUID("00000000-0000-0000-0000-000000000704")
+PLAN_ID = UUID("00000000-0000-0000-0000-000000000705")
+
+
+def _sale_source(
+    position_id: UUID = SAFE_POSITION_ID,
+    *,
+    role: PositionRole = PositionRole.NORMAL,
+) -> Position:
+    return Position(
+        position_id=position_id,
+        portfolio_id=PORTFOLIO_ID,
+        instrument=InstrumentRef(INSTRUMENT_ID),
+        quantity=Quantity(Decimal("1")),
+        role=role,
+        status=PositionStatus.OPEN,
+        opened_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+
+def _transition(
+    state: RecommendationState,
+    event: RecommendationEvent,
+    *,
+    guards: TransitionGuards | None = None,
+    sale_source_position: Position | None = None,
+    sale_quantity: Quantity | None = None,
+    remaining_stages_halted: bool = False,
+) -> TransitionResult:
+    protected_events = {
+        RecommendationEvent.ACTION_SIGNAL,
+        RecommendationEvent.DECISION_VALIDATED,
+        RecommendationEvent.NEXT_STAGE_ELIGIBLE,
+    }
+    return StateMachine().transition(
+        TransitionRequest(
+            current_state=state,
+            event=event,
+            guards=guards or TransitionGuards(),
+            plan=_rotation_plan(
+                source_position_ids=(SAFE_POSITION_ID,) if event in protected_events else ()
+            ),
+            sale_source_position=(
+                sale_source_position
+                if sale_source_position is not None
+                else _sale_source()
+                if event in protected_events
+                else None
+            ),
+            sale_quantity=(
+                sale_quantity
+                if sale_quantity is not None
+                else Quantity(Decimal("1"))
+                if event is RecommendationEvent.DECISION_VALIDATED
+                and (guards or TransitionGuards()).sizing_outcome is SizingOutcome.PASSED
+                else None
+            ),
+            remaining_stages_halted=remaining_stages_halted,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("strategy_run_id", "final_strategy_key"),
+    [
+        pytest.param(UUID("00000000-0000-0000-0000-000000000704"), None, id="run-only"),
+        pytest.param(None, "a" * 64, id="key-only"),
+    ],
+)
+def test_non_claimed_legacy_provenance_rejects_partial_run_key_evidence(
+    strategy_run_id: UUID | None, final_strategy_key: str | None
+) -> None:
+    with pytest.raises(ValueError, match="legacy finalization claim"):
+        RecommendationStateRecord(
+            rotation_plan_id=UUID("00000000-0000-0000-0000-000000000705"),
+            portfolio_id=PORTFOLIO_ID,
+            state=RecommendationState.ACTION_NOTIFIED,
+            remaining_stages_halted=False,
+            revision=1,
+            updated_at=datetime(2026, 8, 1, tzinfo=UTC),
+            legacy_finalization_claim_status=LegacyFinalizationClaimStatus.NO_CLAIM,
+            legacy_finalization_strategy_run_id=strategy_run_id,
+            legacy_finalization_strategy_key=final_strategy_key,
+        )
+
+
+@pytest.mark.parametrize(
+    "state", [RecommendationState.ACTION_PENDING, RecommendationState.ACTION_NOTIFIED]
+)
+def test_pending_and_notified_actions_are_invalidated_before_confirmation(
+    state: RecommendationState,
+) -> None:
+    result = _transition(
+        state,
+        RecommendationEvent.SIGNAL_INVALIDATED,
+        guards=TransitionGuards(rule_outcome=RuleOutcome.PASSED),
+    )
+
+    assert result.next_state is RecommendationState.INVALIDATED
+    assert result.remaining_stages_halted
+    assert not result.execution_status_changed
+    assert not result.positions_changed
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_state", "expected_halted"),
+    [
+        (RecommendationState.WATCHING, RecommendationState.DATA_DEGRADED, False),
+        (RecommendationState.NEAR_TRIGGER, RecommendationState.DATA_DEGRADED, False),
+        (RecommendationState.ACTION_PENDING, RecommendationState.DATA_DEGRADED, False),
+        (RecommendationState.ACTION_NOTIFIED, RecommendationState.DATA_DEGRADED, False),
+        (RecommendationState.STAGE_COMPLETED, RecommendationState.DATA_DEGRADED, False),
+        (RecommendationState.PARTIALLY_EXECUTED, RecommendationState.WAITING_CONFIRMATION, True),
+    ],
+)
+def test_data_degraded_from_every_active_recommendation_state(
+    state: RecommendationState,
+    expected_state: RecommendationState,
+    expected_halted: bool,
+) -> None:
+    result = _transition(
+        state,
+        RecommendationEvent.DATA_DEGRADED,
+        guards=TransitionGuards(data_outcome=DataOutcome.DEGRADED),
+    )
+
+    assert result.next_state is expected_state
+    assert result.remaining_stages_halted is expected_halted
+    assert not result.positions_changed
+
+
+def test_data_recovery_requires_a_fresh_full_evaluation_and_never_restores_action() -> None:
+    with pytest.raises(TransitionNotAllowed, match="fresh full evaluation"):
+        _transition(
+            RecommendationState.DATA_DEGRADED,
+            RecommendationEvent.DATA_RECOVERED,
+            guards=TransitionGuards(data_outcome=DataOutcome.FRESH_COMPLETE),
+        )
+
+    recovered = _transition(
+        RecommendationState.DATA_DEGRADED,
+        RecommendationEvent.DATA_RECOVERED,
+        guards=TransitionGuards(data_outcome=DataOutcome.FRESH_FULL_EVALUATION),
+    )
+
+    assert recovered.next_state is RecommendationState.WATCHING
+    assert recovered.requires_fresh_full_evaluation
+
+
+@pytest.mark.parametrize(
+    "event",
+    [RecommendationEvent.SIGNAL_INVALIDATED, RecommendationEvent.DATA_DEGRADED],
+)
+def test_partial_execution_halts_remaining_stages_when_invalidated_or_degraded(
+    event: RecommendationEvent,
+) -> None:
+    guards = (
+        TransitionGuards(rule_outcome=RuleOutcome.PASSED)
+        if event is RecommendationEvent.SIGNAL_INVALIDATED
+        else TransitionGuards(data_outcome=DataOutcome.DEGRADED)
+    )
+
+    result = _transition(RecommendationState.PARTIALLY_EXECUTED, event, guards=guards)
+
+    assert result.next_state is RecommendationState.WAITING_CONFIRMATION
+    assert result.remaining_stages_halted
+    assert not result.positions_changed
+
+
+@pytest.mark.parametrize(
+    "state",
+    [RecommendationState.DATA_DEGRADED, RecommendationState.INVALIDATED],
+)
+def test_late_confirmation_cannot_revive_a_stale_recommendation(state: RecommendationState) -> None:
+    result = _transition(
+        state,
+        RecommendationEvent.EXECUTION_CONFIRMED,
+        guards=TransitionGuards(confirmation_is_valid=True),
+    )
+
+    assert result.next_state is RecommendationState.WAITING_CONFIRMATION
+    assert result.remaining_stages_halted
+    assert not result.notification_intent_recorded
+    assert not result.positions_changed
+
+
+def test_authorized_resume_requires_fresh_evaluation_and_returns_to_watching() -> None:
+    with pytest.raises(TransitionNotAllowed, match="authorized"):
+        _transition(
+            RecommendationState.WAITING_CONFIRMATION,
+            RecommendationEvent.RESUME_REMAINING_STAGES,
+            guards=TransitionGuards(rule_outcome=RuleOutcome.FRESH_FULL_EVALUATION),
+            remaining_stages_halted=True,
+        )
+
+    resumed = _transition(
+        RecommendationState.WAITING_CONFIRMATION,
+        RecommendationEvent.RESUME_REMAINING_STAGES,
+        guards=TransitionGuards(
+            rule_outcome=RuleOutcome.FRESH_FULL_EVALUATION,
+            authorization_is_valid=True,
+        ),
+        remaining_stages_halted=True,
+    )
+
+    assert resumed.next_state is RecommendationState.WATCHING
+    assert not resumed.remaining_stages_halted
+    assert resumed.requires_fresh_full_evaluation
+
+
+def test_action_notified_only_records_notification_intent() -> None:
+    result = _transition(
+        RecommendationState.ACTION_PENDING,
+        RecommendationEvent.DECISION_VALIDATED,
+        guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+    )
+
+    assert result.next_state is RecommendationState.ACTION_NOTIFIED
+    assert result.notification_intent_recorded
+    assert not result.execution_status_changed
+    assert not result.positions_changed
+
+
+@pytest.mark.parametrize(
+    ("state", "event", "guards"),
+    [
+        (
+            RecommendationState.WATCHING,
+            RecommendationEvent.PLAN_ACTIVATED,
+            TransitionGuards(plan_is_valid=True),
+        ),
+        (
+            RecommendationState.NEAR_TRIGGER,
+            RecommendationEvent.NEAR_SIGNAL,
+            TransitionGuards(rule_outcome=RuleOutcome.PASSED),
+        ),
+        (
+            RecommendationState.ACTION_PENDING,
+            RecommendationEvent.ACTION_SIGNAL,
+            TransitionGuards(rule_outcome=RuleOutcome.PASSED),
+        ),
+        (
+            RecommendationState.ACTION_NOTIFIED,
+            RecommendationEvent.DECISION_VALIDATED,
+            TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+        ),
+        (
+            RecommendationState.INVALIDATED,
+            RecommendationEvent.SIGNAL_INVALIDATED,
+            TransitionGuards(rule_outcome=RuleOutcome.PASSED),
+        ),
+        (
+            RecommendationState.PAUSED,
+            RecommendationEvent.PLAN_PAUSED,
+            TransitionGuards(authorization_is_valid=True),
+        ),
+    ],
+)
+def test_duplicate_events_are_deterministic_noops(
+    state: RecommendationState,
+    event: RecommendationEvent,
+    guards: TransitionGuards,
+) -> None:
+    result = _transition(state, event, guards=guards)
+
+    assert result.next_state is state
+    assert result.is_noop
+    assert not result.positions_changed
+
+
+@pytest.mark.parametrize(
+    ("state", "event", "guards"),
+    [
+        (
+            RecommendationState.NEAR_TRIGGER,
+            RecommendationEvent.ACTION_SIGNAL,
+            TransitionGuards(rule_outcome=RuleOutcome.FAILED),
+        ),
+        (
+            RecommendationState.ACTION_PENDING,
+            RecommendationEvent.DECISION_VALIDATED,
+            TransitionGuards(sizing_outcome=SizingOutcome.FAILED),
+        ),
+        (
+            RecommendationState.PARTIALLY_EXECUTED,
+            RecommendationEvent.NEXT_STAGE_ELIGIBLE,
+            TransitionGuards(rule_outcome=RuleOutcome.FAILED),
+        ),
+    ],
+)
+def test_protected_position_is_denied_by_every_sale_or_action_transition_guard(
+    state: RecommendationState,
+    event: RecommendationEvent,
+    guards: TransitionGuards,
+) -> None:
+    with pytest.raises(ProtectedPositionSaleError):
+        _transition(
+            state,
+            event,
+            guards=guards,
+            sale_source_position=_sale_source(role=PositionRole.PROTECTED_CORE),
+        )
+
+
+def test_invalid_edges_are_rejected_with_a_typed_error() -> None:
+    with pytest.raises(TransitionNotAllowed):
+        _transition(RecommendationState.IDLE, RecommendationEvent.ACTION_SIGNAL)
+
+
+def _rotation_plan(*, source_position_ids: tuple[UUID, ...]) -> RotationPlan:
+    return RotationPlan(
+        rotation_plan_id=PLAN_ID,
+        portfolio_id=PORTFOLIO_ID,
+        candidate_group_ids=(INSTRUMENT_ID,),
+        source_position_ids=source_position_ids,
+        protected_position_ids=(PROTECTED_POSITION_ID,),
+        created_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+
+def test_action_signal_rejects_same_portfolio_position_not_authorized_as_source() -> None:
+    request = TransitionRequest(
+        current_state=RecommendationState.NEAR_TRIGGER,
+        event=RecommendationEvent.ACTION_SIGNAL,
+        guards=TransitionGuards(rule_outcome=RuleOutcome.PASSED),
+        plan=_rotation_plan(source_position_ids=()),
+        sale_source_position=_sale_source(),
+    )
+
+    with pytest.raises(UnauthorizedRotationSourceError, match="source"):
+        StateMachine().transition(request)
+
+
+def test_action_signal_rejects_a_closed_listed_source() -> None:
+    source = Position(
+        position_id=SAFE_POSITION_ID,
+        portfolio_id=PORTFOLIO_ID,
+        instrument=InstrumentRef(INSTRUMENT_ID),
+        quantity=Quantity(Decimal("1")),
+        role=PositionRole.NORMAL,
+        status=PositionStatus.CLOSED,
+        opened_at=datetime(2026, 8, 1, tzinfo=UTC),
+        closed_at=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    request = TransitionRequest(
+        current_state=RecommendationState.NEAR_TRIGGER,
+        event=RecommendationEvent.ACTION_SIGNAL,
+        guards=TransitionGuards(rule_outcome=RuleOutcome.PASSED),
+        plan=_rotation_plan(source_position_ids=(SAFE_POSITION_ID,)),
+        sale_source_position=source,
+    )
+
+    with pytest.raises(PositionNotOpenError):
+        StateMachine().transition(request)
+
+
+def test_passed_sizing_transition_requires_positive_sale_quantity() -> None:
+    request = TransitionRequest(
+        current_state=RecommendationState.ACTION_PENDING,
+        event=RecommendationEvent.DECISION_VALIDATED,
+        guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+        plan=_rotation_plan(source_position_ids=(SAFE_POSITION_ID,)),
+        sale_source_position=_sale_source(),
+        sale_quantity=Quantity(Decimal("0")),
+    )
+
+    with pytest.raises(NonPositiveSaleQuantityError):
+        StateMachine().transition(request)
+
+
+def test_passed_sizing_transition_requires_a_sale_quantity() -> None:
+    request = TransitionRequest(
+        current_state=RecommendationState.ACTION_PENDING,
+        event=RecommendationEvent.DECISION_VALIDATED,
+        guards=TransitionGuards(sizing_outcome=SizingOutcome.PASSED),
+        plan=_rotation_plan(source_position_ids=(SAFE_POSITION_ID,)),
+        sale_source_position=_sale_source(),
+    )
+
+    with pytest.raises(TransitionNotAllowed, match="sale quantity"):
+        StateMachine().transition(request)

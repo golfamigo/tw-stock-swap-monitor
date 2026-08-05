@@ -1,0 +1,15 @@
+settings:
+  recommendation_mode: recommendation_only
+  automatic_order_submission_enabled: false
+  broker_mutation_enabled: false
+  position_mutation_enabled: false
+rules:
+  - id: market_data_actionable
+    expression:
+      eq:
+        - var: market.is_actionable
+        - true
+    weight: 1
+keyed_items: []
+extensions: {}
+nullable_note: null

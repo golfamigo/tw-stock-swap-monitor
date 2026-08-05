@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools==75.8.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tw-stock-swap-monitor"
+version = "0.1.0"
+description = "Configuration-driven foundation for Taiwanese stock rotation analysis."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alembic==1.15.2",
+    "fastapi==0.115.12",
+    "jsonschema==4.23.0",
+    "pandas==2.2.3",
+    "pydantic==2.11.3",
+    "psycopg[binary]==3.2.7",
+    "sqlalchemy==2.0.40",
+    "uvicorn==0.34.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "PyYAML==6.0.2",
+    "httpx==0.28.1",
+    "mypy==1.15.0",
+    "pandas-stubs==2.2.3.250308",
+    "pytest==8.3.5",
+    "ruff==0.11.5",
+    "setuptools==75.8.2",
+    "wheel==0.47.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+addopts = ["--strict-config", "--strict-markers"]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["app", "tests"]
+strict = true
+warn_unused_configs = true
