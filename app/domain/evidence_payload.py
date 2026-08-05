@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import datetime
 from decimal import Decimal, DecimalTuple, InvalidOperation
 from enum import Enum
@@ -77,16 +77,18 @@ def preflight_evidence_payload(value: object) -> None:
         if isinstance(current, Enum):
             raise InvalidStrategyRunEvidenceError("evidence Enum values are not supported")
         if isinstance(current, Mapping):
+            _require_container_fits_node_budget(node_count=node_count, container=current)
             _enter_container(current, active_container_ids)
             stack.append((current, depth, True))
             items = tuple(current.items())
             for key, nested in reversed(items):
                 if not isinstance(key, str):
                     raise InvalidStrategyRunEvidenceError("evidence mapping keys must be strings")
-                _require_evidence_string(key, field_name="evidence mapping key")
+                _require_evidence_identifier(key, field_name="evidence mapping key")
                 stack.append((nested, depth + 1, False))
             continue
         if isinstance(current, list | tuple):
+            _require_container_fits_node_budget(node_count=node_count, container=current)
             _enter_container(current, active_container_ids)
             stack.append((current, depth, True))
             for nested in reversed(current):
@@ -116,27 +118,28 @@ def preflight_evidence_payload(value: object) -> None:
 def measure_json_bytes(value: object, *, limit_bytes: int, boundary: str) -> int:
     """Incrementally count canonical JSON UTF-8 bytes without materializing it."""
 
-    _validate_size_limit(limit_bytes=limit_bytes, boundary=boundary)
-    total = 0
-    for chunk in _JSON_ENCODER.iterencode(value):
-        total += len(chunk.encode("utf-8"))
-        if total > limit_bytes:
-            raise CanonicalJsonSizeLimitError(
-                boundary=boundary,
-                limit_bytes=limit_bytes,
-                observed_at_least_bytes=total,
-            )
-    return total
-
-
-def measure_encoded_evidence_bytes(value: object, *, limit_bytes: int, boundary: str) -> int:
-    """Measure the exact reversible envelope written by persistence adapters."""
-
-    return measure_json_bytes(
-        encode_evidence(value),
+    return _measure_json_chunks(
+        _JSON_ENCODER.iterencode(value),
         limit_bytes=limit_bytes,
         boundary=boundary,
     )
+
+
+def measure_encoded_evidence_bytes(value: object, *, limit_bytes: int, boundary: str) -> int:
+    """Measure the exact reversible envelope without constructing its full tree."""
+
+    return _measure_json_chunks(
+        iter_encoded_evidence_json(value),
+        limit_bytes=limit_bytes,
+        boundary=boundary,
+    )
+
+
+def iter_encoded_evidence_json(value: object) -> Iterator[str]:
+    """Yield the same reversible JSON envelope persistence writes, without a tree copy."""
+
+    preflight_evidence_payload(value)
+    yield from _iter_encoded_evidence_json(value)
 
 
 def encode_evidence(value: object) -> object:
@@ -165,6 +168,88 @@ def _encode_evidence(value: object) -> object:
     if isinstance(value, tuple):
         return {_TAG: "tuple", "items": [_encode_evidence(item) for item in value]}
     raise AssertionError("evidence must be preflighted before encoding")
+
+
+def _iter_encoded_evidence_json(value: object) -> Iterator[str]:
+    if value is None or isinstance(value, bool | str | int):
+        yield from _JSON_ENCODER.iterencode(value)
+        return
+    if isinstance(value, Decimal):
+        yield from _iter_tagged_scalar("decimal", str(value))
+        return
+    if isinstance(value, UUID):
+        yield from _iter_tagged_scalar("uuid", str(value))
+        return
+    if isinstance(value, datetime):
+        yield from _iter_tagged_scalar("datetime", value.isoformat())
+        return
+    if isinstance(value, Mapping):
+        yield "{"
+        yield from _JSON_ENCODER.iterencode(_TAG)
+        yield ":"
+        yield from _JSON_ENCODER.iterencode("map")
+        yield ","
+        yield from _JSON_ENCODER.iterencode("entries")
+        yield ":["
+        for index, (key, nested) in enumerate(value.items()):
+            if not isinstance(key, str):
+                raise AssertionError("evidence must be preflighted before streaming")
+            if index:
+                yield ","
+            yield "["
+            yield from _JSON_ENCODER.iterencode(key)
+            yield ","
+            yield from _iter_encoded_evidence_json(nested)
+            yield "]"
+        yield "]}"
+        return
+    if isinstance(value, list | tuple):
+        envelope_type = "list" if isinstance(value, list) else "tuple"
+        yield "{"
+        yield from _JSON_ENCODER.iterencode(_TAG)
+        yield ":"
+        yield from _JSON_ENCODER.iterencode(envelope_type)
+        yield ","
+        yield from _JSON_ENCODER.iterencode("items")
+        yield ":["
+        for index, nested in enumerate(value):
+            if index:
+                yield ","
+            yield from _iter_encoded_evidence_json(nested)
+        yield "]}"
+        return
+    raise AssertionError("evidence must be preflighted before streaming")
+
+
+def _iter_tagged_scalar(tag: str, value: str) -> Iterator[str]:
+    yield "{"
+    yield from _JSON_ENCODER.iterencode(_TAG)
+    yield ":"
+    yield from _JSON_ENCODER.iterencode(tag)
+    yield ","
+    yield from _JSON_ENCODER.iterencode("value")
+    yield ":"
+    yield from _JSON_ENCODER.iterencode(value)
+    yield "}"
+
+
+def _measure_json_chunks(
+    chunks: Iterator[str],
+    *,
+    limit_bytes: int,
+    boundary: str,
+) -> int:
+    _validate_size_limit(limit_bytes=limit_bytes, boundary=boundary)
+    total = 0
+    for chunk in chunks:
+        total += len(chunk.encode("utf-8"))
+        if total > limit_bytes:
+            raise CanonicalJsonSizeLimitError(
+                boundary=boundary,
+                limit_bytes=limit_bytes,
+                observed_at_least_bytes=total,
+            )
+    return total
 
 
 def decode_evidence(value: object) -> object:
@@ -275,6 +360,29 @@ def _require_evidence_string(value: object, *, field_name: str) -> str:
             f"{field_name} exceeds the {MAX_STRING_UTF8_BYTES // 1024} KiB UTF-8 limit"
         )
     return value
+
+
+def _require_evidence_identifier(value: object, *, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise InvalidStrategyRunEvidenceError(f"{field_name} must be a string")
+    byte_length = len(value.encode("utf-8"))
+    if byte_length > MAX_IDENTIFIER_UTF8_BYTES:
+        raise InvalidStrategyRunEvidenceError(
+            f"{field_name} exceeds the {MAX_IDENTIFIER_UTF8_BYTES}-byte UTF-8 identifier limit"
+        )
+    return value
+
+
+def _require_container_fits_node_budget(
+    *,
+    node_count: int,
+    container: Mapping[object, object] | list[object] | tuple[object, ...],
+) -> None:
+    remaining_child_nodes = MAX_STRATEGY_RUN_OUTPUT_NODES - node_count
+    if len(container) > remaining_child_nodes:
+        raise InvalidStrategyRunEvidenceError(
+            f"evidence node count exceeds {MAX_STRATEGY_RUN_OUTPUT_NODES}"
+        )
 
 
 def _require_aware_datetime(value: datetime, *, field_name: str) -> datetime:

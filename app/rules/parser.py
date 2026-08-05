@@ -261,21 +261,34 @@ def _preflight_raw_transport(raw: object) -> int:
         if node_count > MAX_RAW_TRANSPORT_NODES:
             raise RuleSafetyError(f"raw transport node count exceeds {MAX_RAW_TRANSPORT_NODES}")
         if isinstance(node, Mapping):
+            _require_raw_container_fits_node_budget(node_count=node_count, container=node)
             for key, child in reversed(tuple(node.items())):
                 require_rule_text(key, boundary="object key")
                 stack.append((child, depth + 1))
             continue
         if isinstance(node, list):
+            _require_raw_container_fits_node_budget(node_count=node_count, container=node)
             for child in reversed(node):
                 stack.append((child, depth + 1))
             continue
         if isinstance(node, tuple):
+            _require_raw_container_fits_node_budget(node_count=node_count, container=node)
             for child in reversed(node):
                 stack.append((child, depth + 1))
             continue
         if isinstance(node, str):
             require_rule_text(node, boundary="literal")
     return node_count
+
+
+def _require_raw_container_fits_node_budget(
+    *,
+    node_count: int,
+    container: Mapping[object, object] | list[object] | tuple[object, ...],
+) -> None:
+    remaining_child_nodes = MAX_RAW_TRANSPORT_NODES - node_count
+    if len(container) > remaining_child_nodes:
+        raise RuleSafetyError(f"raw transport node count exceeds {MAX_RAW_TRANSPORT_NODES}")
 
 
 def _measure_rule_text(value: object, *, limit_bytes: int, boundary: str) -> int:

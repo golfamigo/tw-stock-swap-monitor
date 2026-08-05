@@ -66,6 +66,12 @@ class RuleInput:
             raise TypeError("purpose must be an EvaluationPurpose")
         if self.protected_source:
             raise ProtectedRuleInputError("a protected source cannot be used for rule evaluation")
+        for path in self.values:
+            require_rule_evidence_text(
+                path,
+                boundary="RuleInput evidence path",
+                identifier=True,
+            )
         normalized_values = M0M1EvidenceRegistry.controlled_values(self.values)
         schema = M0M1EvidenceRegistry.schema()
         evidence_payload: dict[str, object] = {}

@@ -1,5 +1,6 @@
 """Regression coverage for fixed rule-DSL resource and public-AST boundaries."""
 
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -14,6 +15,7 @@ from app.rules.evidence import (
 )
 from app.rules.parser import parse_expression, parse_rules
 from app.rules.schema import (
+    MAX_RAW_TRANSPORT_NODES,
     DecimalResourceLimitError,
     EvidenceKind,
     LiteralExpression,
@@ -118,6 +120,11 @@ def test_runtime_evidence_enforces_string_identifier_and_complete_audit_limits()
     with pytest.raises(RuleEvidenceResourceLimitError, match="RuleInput"):
         RuleInput(values={"market.provider": "p" * 257})
 
+    with pytest.raises(RuleSemanticError, match="not registered"):
+        RuleInput(values={"p" * 256: "value"})
+    with pytest.raises(RuleEvidenceResourceLimitError, match="RuleInput evidence path"):
+        RuleInput(values={"p" * 257: "value"})
+
     records = tuple(
         RuleEvidence(
             rule_id=f"rule_{index}",
@@ -139,6 +146,13 @@ def test_runtime_evidence_enforces_string_identifier_and_complete_audit_limits()
             rule_evidence=records,
             evaluated_at=datetime(2035, 1, 1, tzinfo=UTC),
         )
+
+
+def test_raw_transport_preflight_rejects_wide_containers_before_iteration() -> None:
+    with pytest.raises(RuleSafetyError, match="node count"):
+        parse_expression(_WideList())
+    with pytest.raises(RuleSafetyError, match="node count"):
+        parse_expression(_WideMapping())
 
 
 def test_parse_rules_rejects_aggregate_ruleset_limit_before_rule_parsing() -> None:
@@ -184,3 +198,26 @@ def _binary_and_tree(leaves: list[dict[str, str]]) -> object:
                 paired.append({"and": [current[index], current[index + 1]]})
         current = paired
     return current[0]
+
+
+class _WideList(list[object]):
+    """A container that fails if preflight touches children before its width check."""
+
+    def __len__(self) -> int:
+        return MAX_RAW_TRANSPORT_NODES
+
+    def __reversed__(self) -> Iterator[object]:
+        raise AssertionError("wide list children must not be enqueued")
+
+
+class _WideMapping(Mapping[str, object]):
+    """A mapping that fails if preflight materializes entries before its width check."""
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        raise AssertionError("wide mapping entries must not be materialized")
+
+    def __len__(self) -> int:
+        return MAX_RAW_TRANSPORT_NODES
