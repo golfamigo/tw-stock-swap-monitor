@@ -42,7 +42,7 @@ Pydantic remains at HTTP and persisted-configuration boundaries. `RunCoordinator
 
 M2 uses a database-backed opaque Bearer credential, not password login, cookie sessions, client-supplied identity headers, or unauthenticated proxy headers. The credential is ASCII-only, versioned, contains at least 256 bits of server-generated random secret material, and is accepted only as `Authorization: Bearer <opaque-credential>`.
 
-PostgreSQL stores credential ID, principal/user reference, role, creation/revocation/expiry times, and a versioned keyed digest. It never stores the plaintext credential. The digest key is a Zeabur environment secret such as `HTTP_IDENTITY_DIGEST_KEY`; it is absent from source, logs, responses, audit metadata, examples, and database error output. Parsing and comparison are constant-time over ASCII bytes.
+PostgreSQL stores principal/user references and current roles in the principal table, while a credential row stores its principal reference, creation/revocation/expiry times, and a versioned keyed digest. It never stores the plaintext credential. The digest key is a Zeabur environment secret such as `HTTP_IDENTITY_DIGEST_KEY`; it is absent from source, logs, responses, audit metadata, examples, and database error output. Parsing and comparison are constant-time over ASCII bytes.
 
 M2 includes no public registration or password recovery. Initial administrator bootstrap is a one-time deployment operation using a separate Zeabur-only bootstrap secret and a preselected administrator UUID. It records consumption and disables itself. Administrators provision/revoke opaque credentials for known users; a newly generated plaintext credential is returned once in an uncached HTTPS response and is never retrievable again. A later runbook documents the operation without recording a secret.
 
@@ -59,6 +59,20 @@ This dependency is the sole HTTP source of `AccessContext`. Request body and que
 
 Missing, malformed, non-ASCII, oversized, expired, revoked, or invalid credentials receive the same `401`. A valid caller without access to a private record receives the established non-enumerating `404`. `403` is reserved for verified administrator-only system operations. The legacy `X-Admin-Token` route remains compatible but internally creates the same administrator context and delegates to the same service; it never bypasses repository checks.
 
+### Credential, principal, legacy-admin, and bootstrap contract
+
+The exact M2 credential wire form is `grm1.<credential-id>.<secret>`. `credential-id` is a UUID encoded as unpadded base64url (22 ASCII characters); `secret` is 32 random bytes encoded as unpadded base64url (43 ASCII characters). The complete value therefore matches `^grm1\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$`. The identity provider rejects all other forms, non-ASCII data, and values longer than 512 bytes before database work.
+
+The decoded identifier selects exactly one `api_credentials.credential_id` row. The provider never scans all stored digests. It calculates lowercase hexadecimal `HMAC-SHA-256` using the credential row's `digest_key_version` and this exact preimage: UTF-8 `tw-stock-swap-monitor/http-credential/v1`, one zero byte, 16 UUID bytes, one zero byte, then the ASCII secret bytes. It compares the computed and stored 32-byte digest with a constant-time byte comparison. The row records the derivation format version separately from the digest-key version so a future format is opt-in rather than silently reinterpreting a stored value.
+
+The active identity predicate is evaluated on every request in one bounded lookup: credential is not revoked and not expired; referenced principal is `ACTIVE`; referenced user is `ACTIVE`; and the configured digest-key version is available. Roles live on the principal, not copied into credentials or cached in a token. A role change therefore takes effect on the next request; suspending a principal disables all of its credentials, while revoking a credential disables only that credential. Each role/status/revocation update increments the principal authorization revision and creates an audit event. An unavailable configured digest key is deployment misconfiguration and returns controlled `503`, never a false `401` or a bypass.
+
+Digest-key rotation is explicit: deploy the new key version while retaining the old key; issue replacement credentials under the new active version; revoke every old-version credential; verify no active old-version row remains; then remove the old key. The system cannot re-hash an opaque secret it no longer possesses. Credential creation and verification always state their derivation/key versions, so historical audit evidence remains interpretable.
+
+Database composition enables the legacy `POST /admin/run-once` only if both `ADMIN_API_TOKEN` and `LEGACY_ADMIN_PRINCIPAL_ID` are configured. The latter must resolve to an active database principal whose user is active and whose current role is administrator. On each accepted legacy-token request, the server builds `AccessContext` from that persisted principal and uses `authentication_method="legacy-admin-token"`; it uses no generated stand-in user ID. A missing, invalid, suspended, or non-administrator binding disables the endpoint with `503`. In-memory test composition keeps its existing isolated contract.
+
+Bootstrap is one atomic transaction. `POST /admin/bootstrap-identity` is available only while the separate configured bootstrap secret exists and one `identity_bootstrap_state` row has `consumed_at IS NULL`. It accepts only ASCII `X-Identity-Bootstrap-Token` (maximum 512 bytes) plus a strict, maximum-4-KiB profile body; the administrator UUID comes from `IDENTITY_BOOTSTRAP_ADMIN_USER_ID` and the role is fixed by the server, never supplied by the caller. After constant-time secret verification, the command locks that state row, creates the preconfigured administrator User/principal/credential, appends audit evidence, sets `consumed_at`, and commits. A concurrent winner is the only request that receives the generated credential. Every replay after commit returns a stable consumed result and never returns that secret again. If the network response is lost after commit, replay remains forbidden; an operator must use the documented out-of-band recovery/credential-provisioning procedure rather than reuse the bootstrap secret.
+
 ## Data model and tenancy controls
 
 Existing users, portfolios, positions, instruments, candidate groups and their associations, rotation plans and their associations, configuration layers/snapshots, logical scans/attempts, recommendation states, strategy runs, and child intents remain authoritative. M2 extends rather than replaces them.
@@ -68,17 +82,19 @@ Existing users, portfolios, positions, instruments, candidate groups and their a
 | User | Display profile, status, positive revision; no password column. | Self may read/update safe fields; admin controls status. |
 | Principal/credential | Role, keyed digest, revoked/expired data, bootstrap marker. | Internal lookup; provision/revoke is administrator-only. |
 | Portfolio | Name, base currency, market scope, enabled flag, revision. | One owning user; resolve owner before every access. |
-| Position | No M2 HTTP-write meaning; optional display join to Instrument. | Portfolio-scoped, historical, and read-only over HTTP. |
-| Instrument | Optional display/active SYSTEM metadata only. | Globally readable when otherwise authorized; ordinary users cannot mutate it. |
-| Candidate group | Name, description, enabled flag, revision. | USER-owned and must match the exact plan portfolio owner. |
-| Rotation plan | Name, enabled flag, revision. Ordered associations stay authoritative. | PORTFOLIO-owned; no cross-portfolio reference. |
-| Plan configuration binding | One active immutable snapshot ID plus binding revision. | Snapshot targets exactly the bound plan. |
-| Scan lease | Key, lease ID, plan/portfolio IDs, acquired/expiry timestamps. | Internal adapter reauthorizes plan portfolio. |
+| Position | Positive row revision despite no M2 HTTP write; optional display join to Instrument. | Portfolio-scoped, historical, and read-only over HTTP. |
+| Instrument | Optional display/active SYSTEM metadata plus positive revision. | Globally readable when otherwise authorized; ordinary users cannot mutate it. |
+| Candidate group | Name, description, enabled flag, positive revision; membership replacement increments the same revision. | USER-owned and must match the exact plan portfolio owner. |
+| Rotation plan | Name, enabled flag, positive revision. Ordered associations stay authoritative. | PORTFOLIO-owned; no cross-portfolio reference. |
+| Plan configuration binding | One active immutable snapshot ID plus positive binding revision. | Snapshot targets exactly the bound plan. |
+| Scan lease | Versioned scan key, manifest hash, lease ID, plan/portfolio IDs, acquired/expiry timestamps. | Internal adapter reauthorizes plan portfolio. |
 | API audit event | Actor/principal/request IDs, verb, resource, outcome, bounded metadata. | Immutable, owner/admin readable only. |
 
 Database constraints duplicate material invariants: foreign keys, association uniqueness/order, positive revision, nonblank bounded text, enum checks, active snapshot target matching, credential digest uniqueness, and lease expiry ordering. They complement, not replace, domain invariants.
 
 The authority rules are: SYSTEM records are reference data and admin-mutable only; USER records require exact owner match; PORTFOLIO access first resolves portfolio-to-user (sibling portfolios of one user remain separate); candidate group owner must equal plan portfolio owner; sale-capable sources must be exact plan-listed, same-portfolio, OPEN, and non-protected; and a run uses only the immutable snapshot actively bound to that exact plan—never a “latest snapshot” lookup.
+
+The execution manifest compares exact ordered values, not only IDs: plan ID/revision and enabled state; portfolio ID/revision/enabled state; active binding ID/revision/snapshot ID; immutable snapshot ID plus canonical hash; each source/protected Position ID/revision/instrument/role/status/quantity; each candidate-group ID/revision/enabled state and ordered member Instrument ID/revision/market/symbol/active state. Snapshot ID plus hash is sufficient because snapshots are immutable. A manifest is canonicalized with its own `execution-input-manifest-v1` format and SHA-256; it does not alter configuration canonical v1.
 
 ## API surface
 
@@ -91,6 +107,7 @@ All new routes are `/v1` JSON routes with strict Pydantic models and `extra="for
 | `GET/PATCH /v1/users/{user_id}` | Self or admin; PATCH uses `If-Match`, and only admin changes status. |
 | `POST /v1/users/{user_id}/credentials` | Admin-only; returns a new secret once, with no secret audit/log field. |
 | `POST /v1/credentials/{credential_id}/revoke` | Admin-only, revision/audit protected. |
+| `POST /admin/bootstrap-identity` | One-time deployment-only bootstrap route; unavailable after atomic consumption and never available to ordinary Bearer credentials. |
 | `POST/GET /v1/portfolios`, `GET/PATCH /v1/portfolios/{id}` | Owner/admin; create derives owner from context and PATCH requires `If-Match`. |
 | `GET /v1/portfolios/{id}/positions`, `GET /v1/positions/{id}` | Owner/admin read only. No M2 POST/PATCH/DELETE/import/close/confirmation position route exists. |
 | `POST/GET/PATCH /v1/candidate-groups`, `GET /v1/candidate-groups/{id}` | Owner/admin; mutation requires revision. |
@@ -115,6 +132,8 @@ M2 introduces a typed execution subsection in the resolved configuration schema.
 
 The current `RotationEvaluator` is injectable but has no production default. If the active snapshot lacks complete typed execution settings or no registered deterministic evaluator is available, run-once fails closed before provider I/O. It cannot invent defaults, evaluator output, or ACTION.
 
+M2 introduces `scan-identity-v2`. It preserves every existing v1 component—rotation plan ID, market session date, normalized scan window start, interval, market timezone, and the actual configuration snapshot hash—and adds the `execution_input_manifest_hash` plus its manifest format version. The database stores those raw components alongside the v2 key in the logical-scan and lease records. It never substitutes a synthetic manifest hash for the existing configuration snapshot hash. Existing v1 rows remain readable/recoverable under their recorded format; newly created M2 manual scans use v2. This ensures that an input-graph change in the same wall-clock window does not reuse a completed scan for a different plan state.
+
 ## PostgreSQL-authoritative run-once
 
 `POST /v1/rotation-plans/{id}/run-once` accepts exactly `{"dry_run": true}`. Only literal Boolean `true` is legal; numbers, strings, false, null, omission, and unknown fields fail before command service entry. The path ID identifies a resource but grants no access. M2 accepts no runtime override.
@@ -130,9 +149,34 @@ Before provider I/O, `DatabaseRunOnceCommandService` performs this complete auth
 7. After scan lease acquisition, re-read binding and manifest before provider I/O. A concurrent edit returns typed conflict and calls no provider.
 8. Invoke existing coordinator with SQLAlchemy repositories, PostgreSQL lease, deterministic mock provider/calendar, and registered deterministic evaluator only.
 
+### Manual scan identity derivation
+
+The typed execution subsection defines one market, its IANA timezone, positive `scan_interval`, source-bar interval, `daily_lookback_completed_sessions` in the bounded range 1–250, and maximum data delay. M2 manual run-once supports one market session grid per plan; a mixed-market plan is rejected during configuration/activation rather than silently choosing one timezone. Configuration validation requires every configured regular/special session used by that plan to be an exact multiple of `scan_interval`, and requires the source-bar interval to align with that grid. This guarantees that a manual scan never names a partial closing window.
+
+The server injects one UTC clock value and converts it to the execution market timezone. It asks the mock trading calendar for that local date's sessions and selects only a session containing the instant with left-closed/right-open semantics: `opens_at <= now_market < closes_at`. If there is no such session, no lock or provider call occurs: holiday has code `MARKET_CLOSED`; before open has `MARKET_NOT_OPEN`; a break between sessions has `SESSION_BREAK`; and post-close has `MARKET_CLOSED`. Each is a typed manual-command `409`, not an ACTION or a fabricated old window.
+
+For an active session, let `completed = floor((now_market - opens_at) / scan_interval)`. If `completed < 1`, the code is `SCAN_WINDOW_NOT_COMPLETE` and provider I/O does not occur. Otherwise the normalized scan window is `[opens_at + (completed - 1) * scan_interval, opens_at + completed * scan_interval)`. `market_session_date` is the start date in market timezone, and `scan_window_start` is the normalized left boundary. Intraday request data starts at this current session's `opens_at` and ends at normalized window end, so indicators receive only complete current-session bars and never bridge a break. `daily_end` is that market session date (exclusive, thereby excluding the still-open current day); `daily_start` is the earliest of exactly `daily_lookback_completed_sessions` preceding open-market dates, found by a bounded reverse calendar walk. A configuration whose calendar cannot supply that history produces typed `INSUFFICIENT_DAILY_HISTORY` before provider I/O.
+
+The complete `MarketDataRequest` is deterministic: instruments come from the manifest in canonical order; `requested_at` is normalized window end; and `request_id` is UUIDv5 over the `scan-identity-v2` key with a fixed request-format namespace. Therefore two manual requests with identical manifest/configuration during one completed window construct the same request and scan key, while adjacent windows construct different values. Per-request wall-clock `now`, random UUIDs, and client values never enter the scan identity.
+
+### Transaction topology and coordinator phase boundary
+
+M2 must not hold a database transaction over provider I/O, and it must not allow a RUNNING scan attempt to roll back together with a process crash. It introduces a narrow `CoordinatorPhaseStore` port used by `RunCoordinator` itself. The port owns only committed persistence phases; it does not evaluate rules, choose a recommendation, call a provider, or reproduce coordinator decision logic in an HTTP wrapper.
+
+| Phase | Transaction boundary and required result |
+| --- | --- |
+| A. Authoritative load | Short read transaction loads plan, active snapshot, execution configuration, and input graph; it builds manifest and v2 identity, then commits/closes. |
+| B. Lease acquire | Separate short PostgreSQL transaction atomically acquires/reclaims the exact v2 scan lease and commits it before any provider work. Failure returns duplicate/conflict with no provider call. |
+| C. Begin attempt | `CoordinatorPhaseStore.begin_attempt` starts a fresh transaction, locks/reloads the execution graph, compares it exactly with Phase A manifest, creates/recover logical scan, persists RUNNING `ScanAttempt`, and commits. A mismatch returns `409 EXECUTION_INPUT_CHANGED`, releases lease, and performs no provider I/O. |
+| D. Provider work | The existing coordinator invokes deterministic mock provider outside a database transaction, using the committed attempt handle. |
+| E. Finalize | `CoordinatorPhaseStore.finalize_attempt` starts a fresh transaction, locks the logical scan/attempt/recommendation-state rows, rechecks manifest/binding, records terminal attempt, strategy run, recommendation transition, child intent, and final scan attachment with compare-and-swap checks, then commits one durable outcome. |
+| F. Lease release | A short transaction deletes only the exact `(scan_key, lease_id)` in a `finally` path. |
+
+If Phase D succeeds but a process dies before Phase E, Phase C's committed RUNNING evidence remains available to the existing recovery rules. If manifest/binding changed before or during Phase E, Phase E records a non-actionable terminal `EXECUTION_INPUT_CHANGED` outcome and never creates an ACTION recommendation. Finalization compares expected logical-scan RUNNING state, attempt RUNNING state, manifest hash/version, active-binding revision, and recommendation-state revision. A failed compare-and-swap returns the existing duplicate/superseded result; it never applies a second transition. This preserves one coordinator decision path while making its durable phases explicit.
+
 The route never deserializes a coordinator request, template, position, snapshot, candidate list, market request, or evaluator output from caller JSON. Its response is the existing safe coordinator summary only.
 
-Existing logical scans/strategy runs remain durable idempotency records. M2 adds `scan_leases` only for the pre-provider `LockProvider`: acquire/reclaim an unexpired key atomically in a committed short transaction; record key/lease/plan/portfolio/acquired/expiry; release only exact `(key, lease_id)`; reclaim expired lease then use existing logical-scan recovery; failed acquire returns duplicate/conflict with no provider I/O. Lease acquisition is visible before data work, repository writes remain in a command unit of work, and `finally` releases lease. This is manual serialization, not a scheduler or distributed job system.
+Existing logical scans/strategy runs remain durable idempotency records. M2 adds `scan_leases` only for the pre-provider `LockProvider`: acquire/reclaim an unexpired v2 key atomically in a committed short transaction; record key, identity/manifest format versions, raw identity components, manifest hash, lease, plan/portfolio, acquired/expiry; release only exact `(key, lease_id)`; reclaim expired lease then use existing logical-scan recovery; failed acquire returns duplicate/conflict with no provider I/O. This is manual serialization, not a scheduler or distributed job system.
 
 ## Input and resource limits
 
@@ -151,6 +195,7 @@ A streaming ASGI policy rejects oversized body bytes before JSON parsing. Strict
 | Resource command body | User/portfolio/group/plan up to 64 KiB. |
 | Configuration command body | Layer/snapshot selection up to 192 KiB plus existing 16 KiB string, 128 KiB DSL/ruleset/input/evidence, and 256 KiB output boundaries. |
 | Run-once body | Existing pre-parse 16 KiB ceiling; legal body only literal true. |
+| Bootstrap body | Deployment-only strict profile body up to 4 KiB; bootstrap header follows authorization-header ASCII/512-byte limit. |
 | Evidence response | Snapshot/API evidence at most 256 KiB canonical payload, never truncated. |
 | Database work | Positive configured statement/lock limits; bounded joins/pages only. |
 
@@ -160,7 +205,7 @@ All relevant text and JSON limits are UTF-8 bytes. Unknown fields, coercions, no
 
 Accepted and rejected sensitive commands write immutable bounded audit events in the outcome transaction where possible: `event_id`, `occurred_at`, `actor_user_id`, `principal_id`, `request_id`, `operation`, `resource_type`, `resource_id`, `result_code`, and bounded metadata. Metadata contains IDs/revisions/error classes only; never Bearer tokens, digests, headers, secrets, raw market data, full personal data, or position updates. Strategy-run evidence remains the sole coordinator evidence record.
 
-Migrations start after `0005_legacy_finalization_claims` and are additive: (1) principal/credential/audit tables plus nullable profile/revision metadata; (2) explicit legacy backfill (`revision=1`) plus incomplete-profile marker without inventing name/e-mail/market values; (3) exact active plan-snapshot binding and execution-manifest support; (4) PostgreSQL scan lease table with expiry/index constraints; (5) route activation only after migration and database-readiness checks.
+Migrations start after `0005_legacy_finalization_claims` and are additive: (1) principal/credential/bootstrap-state/audit tables plus nullable profile and positive revision metadata for User, Portfolio, Position, Instrument, CandidateGroup, and RotationPlan; (2) explicit legacy backfill (`revision=1`) plus incomplete-profile marker without inventing name/e-mail/market values; (3) exact active plan-snapshot binding with its own revision plus canonical execution-manifest storage; (4) v2 logical-scan raw identity/manifest columns and PostgreSQL scan-lease table with expiry/index constraints; (5) route activation only after migration and database-readiness checks.
 
 Fresh PostgreSQL and upgrade-from-`0005` databases must both pass. The last M0/M1 application remains compatible with expanded but inactive schema. Production rollback is application/route disablement while retaining schema and immutable evidence. Alembic downgrade is tested only before activation or on disposable databases; a production downgrade that drops credential, audit, binding, or lease evidence requires backup and explicit operator approval.
 
@@ -181,12 +226,12 @@ These are review gates, not an implementation task list. A separately approved i
 
 | Test layer | Required evidence |
 | --- | --- |
-| Unit/application | Principal/context conversion, bounded parsing, revisions, snapshot binding, typed failures, fail-closed evaluator. |
-| Repository contract | Every operation takes context; absent/non-owned same outcome; SYSTEM Instrument read-only; sibling portfolios isolated. |
-| PostgreSQL | Fresh and upgrade-from-0005 migrations; disposable downgrade/upgrade; UUID/JSON/timezone, partial OPEN index, revisions, bindings, leases, concurrency. |
-| API | Invalid/expired/revoked/non-ASCII credentials; identity spoofing; 401/404/403; body/cursor limits; no secret response. |
-| Run-once | Only literal true; authority graph from DB; client inputs forbidden; stale manifest/lock conflict no provider; invalid data cannot ACTION. |
+| Unit/application | Wire-format parser, direct credential-row lookup, HMAC preimage/version, key rotation, active predicate, role/status invalidation, legacy principal binding, atomic bootstrap replay, context conversion, revisions, snapshot binding, and fail-closed evaluator. |
+| Repository contract | Every operation takes context; absent/non-owned same outcome; SYSTEM Instrument read-only; sibling portfolios isolated; position/group/plan/binding/instrument revision and manifest equality exact. |
+| PostgreSQL | Fresh and upgrade-from-0005 migrations; disposable downgrade/upgrade; UUID/JSON/timezone, partial OPEN index, revisions, binding, v2 identity raw fields, lease acquire/reclaim/release, bootstrap unique winner, and concurrent CAS finalization. |
+| API | Invalid/expired/revoked/non-ASCII credentials; identity spoofing; 401/404/403/503; legacy token with invalid principal; body/cursor limits; no secret response. |
+| Run-once | Only literal true; authority graph from DB; client inputs forbidden; session/break/holiday/pre-open/unfinished-window responses; same-window equality and adjacent-window difference; committed RUNNING attempt survives simulated crash; stale manifest/lock conflict no provider; invalid data cannot ACTION. |
 | Safety regression | Protected/NORMAL/foreign/CLOSED position cannot be sale source; no API calls position-write ports; no live provider/broker/notification/LLM/scheduler is constructed. |
 | Quality | Focused tests, full `pytest`, `mypy app tests`, Ruff check/format, diff check, Ubuntu/Windows/PostgreSQL-contract/runtime-PostgreSQL-smoke CI. |
 
-M2 is accepted only when database composition preserves safe import behaviour; all API identity is server-derived; tenant records and snapshots cannot leak; positions remain HTTP read-only; run-once rebuilds inputs from PostgreSQL and reaches existing idempotency before mock provider I/O; all inputs are bounded; migrations/rollback are rehearsed; and the final diff contains no prohibited M3+ capability.
+M2 is accepted only when database composition preserves safe import behaviour; credential lookup, rotation, bootstrap, and legacy admin identity are deterministic and auditable; all API identity is server-derived; tenant records and snapshots cannot leak; positions remain HTTP read-only; run-once rebuilds inputs from PostgreSQL, commits RUNNING evidence before mock provider I/O, uses stable v2 manual scan identity, and reaches existing idempotency; all inputs are bounded; migrations/rollback are rehearsed; and the final diff contains no prohibited M3+ capability.

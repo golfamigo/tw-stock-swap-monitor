@@ -107,6 +107,34 @@ mentions them in later milestones:
    records with `NotFoundForActor`.  M2 list, get, update, and run-once paths
    must keep the same non-enumerating response behaviour.
 
+## Design corrections required before M2 implementation planning
+
+The M2 design now makes the following contracts explicit.  They are necessary
+because the merged M0/M1 structures intentionally did not yet model HTTP
+identity, transaction-phase commits, mutable platform revisions, or a manual
+scan clock.
+
+1. An opaque credential must carry a bounded public lookup identifier and a
+   secret.  The server looks up exactly one credential row by identifier and
+   then verifies a versioned keyed digest; it never scans credential rows.
+   The legacy administrative token can operate in database mode only when it
+   is mapped to one configured, active database administrator principal.
+2. A running scan attempt must be committed before provider work.  M2 therefore
+   gives the coordinator a narrow persistence-phase boundary rather than
+   placing the full coordinator call in one request transaction.
+3. Execution-relevant rows receive positive revisions.  This includes
+   Position despite positions being HTTP read-only, candidate-group membership,
+   rotation plan, active snapshot binding, and SYSTEM Instrument.  An immutable
+   snapshot remains identified by its existing ID plus canonical hash.
+4. M2 manual scan identity is versioned.  Its v2 key includes the existing
+   plan/date/window/interval/timezone/snapshot fields plus a canonical
+   execution-input-manifest hash.  This prevents an edited group, position, or
+   plan from reusing a completed scan of the same clock window.
+5. Server time is converted to the configured market IANA timezone and aligned
+   to a fully completed, session-local interval.  Calls outside a session,
+   holiday, break, or before a complete interval fail before provider I/O;
+   they never use raw per-request `now` as the scan window.
+
 ## M2 outcome
 
 At M2 acceptance, an authenticated principal can safely manage the permitted
