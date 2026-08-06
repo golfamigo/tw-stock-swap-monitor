@@ -12,15 +12,21 @@
 
 ## Authority, baseline, and non-goals
 
-Implementation begins only after this plan is approved.  The implementation base is
-`d872a6a6e5fd4c99abc95a4e3bcac892a46a1da3`, the approved M2 design head on
-`feature/m2-platform-design`; the implementer records it immediately before the
-first code change:
+`m2DesignBase` is `d872a6a6e5fd4c99abc95a4e3bcac892a46a1da3`, the approved
+M2 design-only head.  It is a review reference, not the implementation diff base.
+Implementation begins only after this plan is approved.  Immediately before the
+first code change, the implementer records the then-current, final approved plan
+head as the separate `$m2ImplementationBase`:
 
 ```powershell
 $m2ImplementationBase = git rev-parse HEAD
 git status --short
 ```
+
+`$m2ImplementationBase` therefore includes all approved design and plan commits,
+but excludes every application, migration, dependency, and test implementation
+commit.  All final `git log` and `git diff` range checks start at this dynamic
+value, never at `$m2DesignBase` or a hard-coded earlier plan revision.
 
 Every checkpoint below is one independently reviewable commit.  Do not squash,
 rebase, or amend an approved checkpoint.  At each stop point, push the same Draft
@@ -87,7 +93,8 @@ and repository code continue to accept the contained `AccessContext`.
 - [ ] Define frozen application records in `app/application/platform_models.py`:
   `PrincipalRole` (`USER`, `ADMINISTRATOR`), `PrincipalStatus` (`ACTIVE`,
   `SUSPENDED`), `UserStatus` (`ACTIVE`, `SUSPENDED`), `Principal`,
-  `ApiCredential`, `AuditEvent`, and `AuthenticatedRequest`.
+  `ApiCredential`, `AuditEvent`, `AuthenticatedRequest`, and
+  `BootstrapCommandContext`.
 - [ ] Define `AuthenticatedRequest` exactly as a server-created envelope:
 
   ```python
@@ -103,11 +110,32 @@ and repository code continue to accept the contained `AccessContext`.
 - [ ] Define `IdentityRepository` methods with exact credential lookup and no
   collection scan: `get_credential(credential_id)`, `get_active_principal`,
   `create_credential`, `revoke_credential`, `revoke_all_credentials`,
-  `change_principal_role`, and `consume_bootstrap_once`.  Every mutation accepts
+  and `change_principal_role`.  Each of those authenticated mutations accepts an
   `AuthenticatedRequest` and returns the persisted revision/audit facts.
+- [ ] Define the bootstrap-only command separately because no authenticated
+  principal exists yet:
+
+  ```python
+  @dataclass(frozen=True, slots=True)
+  class BootstrapCommandContext:
+      configured_admin_user_id: UUID
+      request_id: UUID
+      authentication_method: Literal["bootstrap-configuration"]
+  ```
+
+  `IdentityRepository.consume_bootstrap_once(context, profile, secret)` accepts
+  this server-created context only after the bootstrap-header verifier succeeds;
+  it never accepts an `AuthenticatedRequest`, a caller-supplied actor, or a
+  caller-supplied target UUID.
 - [ ] Define `AuditEventRepository.append(event)` as append-only.  Its metadata
   type is `Mapping[str, str | int | bool | UUID]`; reject credentials, hashes,
   headers, raw request bodies, raw market data, and nested arbitrary evidence.
+  Audit records have `actor_kind` of either `AUTHENTICATED_PRINCIPAL` or
+  `BOOTSTRAP_CONFIGURATION`.  The former requires verified `actor_user_id` and
+  `principal_id`; the latter requires both to be null and records the configured
+  target only as the resource ID.  A database check constraint enforces this
+  distinction, so bootstrap audit does not pretend an unauthenticated deploy
+  secret is a user principal.
 
 ### Test-first steps
 
@@ -130,7 +158,9 @@ and repository code continue to accept the contained `AccessContext`.
 - [ ] Add bootstrap race tests with two transactions.  Exactly one row consumes
   `identity_bootstrap_state`; the winner receives a credential exactly once;
   replay returns a stable consumed result without a credential; losers cannot
-  create a second administrator.
+  create a second administrator.  Test a pre-existing configured User ID returns
+  a typed bootstrap conflict without consumption or role elevation, while a fresh
+  configured User ID creates one administrator principal.
 
 ### Migration and persistence steps
 
@@ -141,11 +171,14 @@ and repository code continue to accept the contained `AccessContext`.
   PostgreSQL `BYTEA` with `octet_length(digest) = 32`; it stores raw HMAC bytes,
   never hex text.  Add indexed `(credential_id)`, `(principal_id, revoked_at)`,
   key/format-version, and expiry predicates needed for bounded lookup.
-- [ ] In the same migration add nullable profile/status fields and positive
-  `revision` columns to the existing User, Portfolio, Position, Instrument,
+- [ ] In the same migration add nullable profile fields, a non-null User status
+  with server default `ACTIVE`, and positive `revision` columns to the existing
+  User, Portfolio, Position, Instrument,
   CandidateGroup, and RotationPlan tables.  Backfill every existing row to
-  `revision = 1` without inventing name, e-mail, locale, market, or enabled
-  values.  Add positive-revision checks after backfill.
+  `revision = 1` and every existing User to `status = ACTIVE`, without inventing
+  name, e-mail, locale, market, or enabled values.  Add positive-revision checks
+  after backfill.  The active identity predicate accepts only explicit `ACTIVE`;
+  it never treats null legacy status as active.
 - [ ] **Required legacy-user backfill:** select every existing `users.user_id`,
   generate one fresh principal UUID per row, insert exactly one
   `principals(user_id, role='USER', status='ACTIVE', authorization_revision=1)`
@@ -153,7 +186,10 @@ and repository code continue to accept the contained `AccessContext`.
   duplicate on retry.  Do not infer an administrator from prior data, an
   environment variable, a portfolio, or a historical strategy run.  The only
   administrator created by M2 is the separately configured, one-time bootstrap
-  operation.
+  operation.  The bootstrap UUID must identify a User that does not yet exist;
+  if it already exists (including as a backfilled legacy User), bootstrap returns
+  `409 BOOTSTRAP_USER_ALREADY_EXISTS`, consumes nothing, and never promotes that
+  User's sole principal.
 - [ ] Make migration upgrade idempotence explicit only through normal Alembic
   single application: test fresh installation and `0005 -> 0006`, and test that
   upgrade data contains exactly one non-administrator principal for each legacy
@@ -193,9 +229,12 @@ and repository code continue to accept the contained `AccessContext`.
   import of `app.main` opens a database connection.
 - [ ] Add `/admin/bootstrap-identity` with only the 4 KiB strict profile body
   and 512-byte ASCII bootstrap header.  It is never available to Bearer callers.
-  It atomically creates the preselected administrator User/principal/credential,
-  writes an audit event, records consumption, returns the secret once with
-  `Cache-Control: no-store`, and never logs it.
+  It constructs `BootstrapCommandContext` from server configuration, atomically
+  creates a *new* preselected administrator User/principal/credential, writes a
+  `BOOTSTRAP_CONFIGURATION` audit event, records consumption, returns the secret
+  once with `Cache-Control: no-store`, and never logs it.  A configured UUID that
+  already exists is a controlled conflict, not an opportunity to elevate a
+  legacy user.
 
 ### Verification and commit
 
@@ -270,9 +309,13 @@ configuration is unavailable.
   result; SYSTEM Instrument write is administrator-only at the repository
   boundary even though no M2 API route publishes it.
 - [ ] Write cross-tenant API cases with two Users and two portfolios owned by the
-  same User.  The same user must not use one portfolio's group/plan/position as
-  another portfolio's plan input.  A foreign User must receive `404` for private
-  user, portfolio, position, group, plan, binding, and snapshot records.
+  same User.  A CandidateGroup is USER-scoped: its owner may reference the same
+  group from rotation plans in either sibling portfolio, provided each plan still
+  belongs to that owner.  In contrast, Position, RotationPlan, active binding,
+  snapshot target, run, and every plan-listed Position remain portfolio-scoped
+  and cannot cross sibling portfolios.  A foreign User must receive `404` for
+  every private user, portfolio, position, group, plan, binding, and snapshot
+  record.
 - [ ] Write resource-limit tests that exceed each byte/count limit by one and
   prove no service/repository mutation happens.  Test invalid UTF-8-equivalent
   identifiers, blank/control-only names, duplicate IDs, source/protected overlap,
