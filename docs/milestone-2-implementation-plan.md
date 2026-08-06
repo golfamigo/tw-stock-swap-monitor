@@ -19,7 +19,16 @@ first code change, the implementer records the then-current, final approved plan
 head as the separate `$m2ImplementationBase`:
 
 ```powershell
-$m2ImplementationBase = git rev-parse HEAD
+$m2ImplementationBase = (git rev-parse HEAD).Trim()
+if ($m2ImplementationBase -notmatch '^[0-9a-f]{40}$') {
+    throw 'M2 implementation base must be one full lowercase commit SHA'
+}
+$currentPrBody = gh api repos/golfamigo/tw-stock-swap-monitor/pulls/3 --jq .body
+if ($currentPrBody -match '<!-- m2-implementation-base:') {
+    throw 'M2 implementation base marker already exists; do not replace it'
+}
+$updatedPrBody = "$currentPrBody`n`n<!-- m2-implementation-base: $m2ImplementationBase -->"
+gh api --method PATCH repos/golfamigo/tw-stock-swap-monitor/pulls/3 -f body=$updatedPrBody
 git status --short
 ```
 
@@ -27,6 +36,30 @@ git status --short
 but excludes every application, migration, dependency, and test implementation
 commit.  All final `git log` and `git diff` range checks start at this dynamic
 value, never at `$m2DesignBase` or a hard-coded earlier plan revision.
+Writing or reading this PR checkpoint record follows the repository GitHub
+identity procedure: switch to `golfamigo` only for the write, immediately switch
+back to `jctixtw-star`, and verify the restored identity.
+
+The hidden PR-body marker is the durable checkpoint record, not a shell-local
+convenience variable.  Before every checkpoint commit and again before M2-C5
+verification, reload and validate the *same* marker; never run `git rev-parse
+HEAD` again to obtain a new base:
+
+```powershell
+$checkpointPrBody = gh api repos/golfamigo/tw-stock-swap-monitor/pulls/3 --jq .body
+$markerMatches = [regex]::Matches(
+    $checkpointPrBody,
+    '<!-- m2-implementation-base: ([0-9a-f]{40}) -->'
+)
+if ($markerMatches.Count -ne 1) {
+    throw 'Expected exactly one persisted M2 implementation base marker'
+}
+$m2ImplementationBase = $markerMatches[0].Groups[1].Value
+$resolvedBase = (git rev-parse "$m2ImplementationBase^{commit}").Trim()
+if ($resolvedBase -ne $m2ImplementationBase) {
+    throw 'Persisted M2 implementation base is not the expected commit'
+}
+```
 
 Every checkpoint below is one independently reviewable commit.  Do not squash,
 rebase, or amend an approved checkpoint.  At each stop point, push the same Draft
@@ -94,7 +127,9 @@ and repository code continue to accept the contained `AccessContext`.
   `PrincipalRole` (`USER`, `ADMINISTRATOR`), `PrincipalStatus` (`ACTIVE`,
   `SUSPENDED`), `UserStatus` (`ACTIVE`, `SUSPENDED`), `Principal`,
   `ApiCredential`, `AuditEvent`, `AuthenticatedRequest`, and
-  `BootstrapCommandContext`.
+  `BootstrapCommandContext`.  The M2 User projection also has a server-managed
+  `profile_complete: bool`; it is a data-completeness marker, not an identity,
+  authorization, administrator, or login flag.
 - [ ] Define `AuthenticatedRequest` exactly as a server-created envelope:
 
   ```python
@@ -123,10 +158,16 @@ and repository code continue to accept the contained `AccessContext`.
       authentication_method: Literal["bootstrap-configuration"]
   ```
 
-  `IdentityRepository.consume_bootstrap_once(context, profile, secret)` accepts
-  this server-created context only after the bootstrap-header verifier succeeds;
-  it never accepts an `AuthenticatedRequest`, a caller-supplied actor, or a
-  caller-supplied target UUID.
+  The header verifier returns this server-created context and then discards the
+  bootstrap-header bytes.  A separate CSPRNG credential factory produces a
+  one-time response wire value plus a `PendingCredentialRecord` containing only
+  credential ID, raw 32-byte digest, digest key/format version, and expiry.
+  `IdentityRepository.consume_bootstrap_once(context, profile,
+  pending_credential_record)` accepts that persisted-record shape only; it never
+  receives the bootstrap header, plaintext API credential, `AuthenticatedRequest`,
+  caller-supplied actor, or caller-supplied target UUID.  The application service
+  retains the newly generated plaintext solely long enough to build the one-time
+  `no-store` response and never places it in audit metadata or a repository call.
 - [ ] Define `AuditEventRepository.append(event)` as append-only.  Its metadata
   type is `Mapping[str, str | int | bool | UUID]`; reject credentials, hashes,
   headers, raw request bodies, raw market data, and nested arbitrary evidence.
@@ -144,6 +185,10 @@ and repository code continue to accept the contained `AccessContext`.
   base64url secret>`, ASCII/512-byte rejection, exact HMAC preimage, raw digest
   length `32`, constant-time raw-byte comparison, and a missing digest key
   returning typed unavailable rather than false authentication.
+- [ ] Add profile-completeness tests: legacy migration rows are `ACTIVE` and
+  `profile_complete = false`; a complete bootstrap or newly created User is true;
+  a partial profile remains false; and either value has no effect on credential
+  verification, role checks, status checks, or administrator capability.
 - [ ] Add test cases proving a User has one and only one principal; role changes
   affect the next request without invalidating credentials; principal suspension
   disables all credentials; individual revoke disables one; revoke-all disables
@@ -161,6 +206,10 @@ and repository code continue to accept the contained `AccessContext`.
   create a second administrator.  Test a pre-existing configured User ID returns
   a typed bootstrap conflict without consumption or role elevation, while a fresh
   configured User ID creates one administrator principal.
+- [ ] Add a repository-spy test proving the bootstrap header secret is consumed
+  by the verifier only.  The repository sees a freshly generated credential ID
+  and raw digest record, never either plaintext secret; the database persists only
+  the 32-byte digest and the response exposes the new credential exactly once.
 
 ### Migration and persistence steps
 
@@ -172,13 +221,15 @@ and repository code continue to accept the contained `AccessContext`.
   never hex text.  Add indexed `(credential_id)`, `(principal_id, revoked_at)`,
   key/format-version, and expiry predicates needed for bounded lookup.
 - [ ] In the same migration add nullable profile fields, a non-null User status
-  with server default `ACTIVE`, and positive `revision` columns to the existing
-  User, Portfolio, Position, Instrument,
+  with server default `ACTIVE`, a non-null `profile_complete` marker with server
+  default `false`, and positive `revision` columns to the existing User,
+  Portfolio, Position, Instrument,
   CandidateGroup, and RotationPlan tables.  Backfill every existing row to
-  `revision = 1` and every existing User to `status = ACTIVE`, without inventing
-  name, e-mail, locale, market, or enabled values.  Add positive-revision checks
-  after backfill.  The active identity predicate accepts only explicit `ACTIVE`;
-  it never treats null legacy status as active.
+  `revision = 1`, every existing User to `status = ACTIVE`, and every legacy User
+  to `profile_complete = false`, without inventing name, e-mail, locale, market,
+  or enabled values.  Add positive-revision checks after backfill.  The active
+  identity predicate accepts only explicit `ACTIVE`; it never treats null legacy
+  status as active, and it does not read `profile_complete`.
 - [ ] **Required legacy-user backfill:** select every existing `users.user_id`,
   generate one fresh principal UUID per row, insert exactly one
   `principals(user_id, role='USER', status='ACTIVE', authorization_revision=1)`
@@ -192,9 +243,10 @@ and repository code continue to accept the contained `AccessContext`.
   User's sole principal.
 - [ ] Make migration upgrade idempotence explicit only through normal Alembic
   single application: test fresh installation and `0005 -> 0006`, and test that
-  upgrade data contains exactly one non-administrator principal for each legacy
-  User.  Downgrade tests run only on disposable databases; production rollback
-  is route/application disablement, not evidence deletion.
+  upgrade data contains exactly one non-administrator principal, `ACTIVE` status,
+  and an incomplete profile marker for each legacy User.  Downgrade tests run
+  only on disposable databases; production rollback is route/application
+  disablement, not evidence deletion.
 - [ ] Add SQLAlchemy models/mappers/repository implementations.  Preserve UTC
   restoration, use `SELECT ... FOR UPDATE` for credential revocation, role
   change, bootstrap consumption, and authorization-revision increments.  Do not
@@ -230,11 +282,12 @@ and repository code continue to accept the contained `AccessContext`.
 - [ ] Add `/admin/bootstrap-identity` with only the 4 KiB strict profile body
   and 512-byte ASCII bootstrap header.  It is never available to Bearer callers.
   It constructs `BootstrapCommandContext` from server configuration, atomically
-  creates a *new* preselected administrator User/principal/credential, writes a
-  `BOOTSTRAP_CONFIGURATION` audit event, records consumption, returns the secret
-  once with `Cache-Control: no-store`, and never logs it.  A configured UUID that
-  already exists is a controlled conflict, not an opportunity to elevate a
-  legacy user.
+  creates a *new* preselected administrator User/principal/credential, calculates
+  `profile_complete` from the normalized supplied profile fields, writes a
+  `BOOTSTRAP_CONFIGURATION` audit event, records consumption, returns the newly
+  generated API credential once with `Cache-Control: no-store`, and never logs
+  either secret.  A configured UUID that already exists is a controlled conflict,
+  not an opportunity to elevate a legacy user.
 
 ### Verification and commit
 
@@ -259,9 +312,10 @@ and repository code continue to accept the contained `AccessContext`.
   runtime PostgreSQL-smoke jobs, then stop at **M2-C1 review**.
 
 **Acceptance:** a database-backed request receives a verified envelope and a
-fresh scoped context; no plaintext credential is stored; every pre-existing User
-has exactly one default non-admin principal after `0005 -> 0006`; bootstrap is
-single-use; the app remains import-safe and fails closed when database identity
+fresh scoped context; no plaintext credential or bootstrap-header material is
+stored; every pre-existing User has exactly one default non-admin principal,
+`ACTIVE` status, and an incomplete-profile marker after `0005 -> 0006`; bootstrap
+is single-use; the app remains import-safe and fails closed when database identity
 configuration is unavailable.
 
 ## M2-C2 — Tenancy-safe resource APIs and revisions
@@ -285,7 +339,7 @@ configuration is unavailable.
 
   | Resource | Permitted M2 operations |
   | --- | --- |
-  | User | self/admin read; self profile patch; administrator status patch; administrator credential/role/revoke-all operations |
+  | User | administrator create; verified `GET /v1/me`; self/admin read; self profile patch; administrator status patch; administrator credential/role/revoke-all operations |
   | Portfolio | owner/admin create, list, get, revision-protected patch |
   | Position | owner/admin list and get only |
   | Instrument | global read/list only; no ordinary-user mutation route |
@@ -308,6 +362,19 @@ configuration is unavailable.
   change and produces `409`; missing/non-owned resource produces the same safe
   result; SYSTEM Instrument write is administrator-only at the repository
   boundary even though no M2 API route publishes it.
+- [ ] Add tests for `POST /v1/users`: only an administrator may create a User;
+  JSON cannot set role, principal ID, authorization revision, status, or
+  `profile_complete`; one transaction creates the User plus exactly one ACTIVE
+  USER-role principal; a primary-key/unique-principal conflict rolls back both
+  records; and concurrent same-ID creation leaves neither duplicate principal nor
+  orphan User.  The service calculates `profile_complete` from the normalized
+  profile (nonblank display name, valid e-mail, IANA timezone, and locale), never
+  from a client boolean.
+- [ ] Add `GET /v1/me` tests.  A verified envelope returns only
+  `user_id`, `principal_id`, `role`, `user_status`, `principal_status`,
+  `authorization_revision`, `profile_complete`, and server-generated `request_id`;
+  it never returns a credential, digest, arbitrary user selected by path/query, or
+  other-user profile.  Invalid credentials do not enter the service.
 - [ ] Write cross-tenant API cases with two Users and two portfolios owned by the
   same User.  A CandidateGroup is USER-scoped: its owner may reference the same
   group from rotation plans in either sibling portfolio, provided each plan still
@@ -337,6 +404,12 @@ configuration is unavailable.
   `AuthenticatedRequest`, passes its `access_context` to repositories, rechecks
   reference ownership in the same transaction, increments the affected revision
   once, appends bounded audit evidence, and commits atomically.
+- [ ] Implement administrator-only `POST /v1/users` as a single UoW command that
+  creates the User and sole default `USER` principal together.  The service owns
+  the `ACTIVE` initial status and derived profile-completeness marker; it never
+  accepts role/status/principal fields from the body.  Implement `GET /v1/me`
+  directly from `AuthenticatedRequest` plus the authoritative User/principal row,
+  not from a client-selected user ID.
 - [ ] Implement CandidateGroup membership as a set, not an ordered input list.
   Validate all global Instrument IDs in one bounded query; reject duplicates;
   normalize by canonical UUID ordering in repository results, API responses,
@@ -372,9 +445,11 @@ configuration is unavailable.
 - [ ] Push, wait for all four CI jobs, and stop at **M2-C2 review**.
 
 **Acceptance:** all permitted resources are tenancy-safe, revision-protected and
-bounded; candidate membership is UUID-sorted unordered-set evidence; positions
-remain read-only over HTTP; private resources cannot be enumerated across users
-or sibling portfolios.
+bounded; candidate membership is UUID-sorted unordered-set evidence and may be
+shared by sibling portfolios of its one User owner; positions remain read-only
+over HTTP.  PORTFOLIO-scoped Position, RotationPlan, Binding, plan-targeted
+Snapshot/Run, and plan associations cannot cross sibling portfolios, while no
+private resource can be enumerated by a different User.
 
 ## M2-C3 — Immutable configuration snapshots and plan binding
 
