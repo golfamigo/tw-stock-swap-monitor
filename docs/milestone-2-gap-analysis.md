@@ -134,6 +134,17 @@ scan clock.
    to a fully completed, session-local interval.  Calls outside a session,
    holiday, break, or before a complete interval fail before provider I/O;
    they never use raw per-request `now` as the scan window.
+6. Credentials use a fixed `grm1.<id>.<secret>` wire form, direct row lookup,
+   raw `BYTEA(32)` HMAC storage, explicit key rotation, one principal per user,
+   and a trusted authenticated-request envelope that supplies audit principal
+   identity without changing M0/M1 repository contracts.
+7. Candidate-group membership is an unordered set.  M2 does not add an ordinal
+   to the existing association table; API, repository, manifest, and hash
+   normalize membership by canonical Instrument UUID sort.
+8. Every expected failure after a committed RUNNING attempt receives a new
+   terminal-outcome transaction.  An unrecoverable persistence failure leaves
+   the attempt RUNNING for durable recovery, while a post-finalization lease
+   crash must return the completed durable result without another provider call.
 
 ## M2 outcome
 
